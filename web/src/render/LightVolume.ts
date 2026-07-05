@@ -30,7 +30,8 @@ export class LightVolume {
   private readonly ny: number;
   private readonly nz: number;
   private readonly step: number;
-  private readonly data: Uint8Array;
+  // ArrayBuffer-backed (not ArrayBufferLike) so the type matches Data3DTexture.
+  private readonly data: Uint8Array<ArrayBuffer>;
 
   constructor(min: THREE.Vector3, max: THREE.Vector3, step = 2) {
     this.min = min.clone();
