@@ -218,6 +218,14 @@ let pulseCenter = new THREE.Vector3();
 const pmrem = new THREE.PMREMGenerator(renderer);
 scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
 
+// The moon as a faint global wash: a dim, cool hemisphere light that lifts the
+// whole map *remotely* under a fuller/clearer moon and goes pitch black at new
+// moon. Its intensity is driven each frame by moonI (phase + cloud cover), so
+// flora catch a bare hint of moonlight but stay dark otherwise. (Terrain uses
+// its own moon term in the shader; this is for the standard-material flora/orb.)
+const moonAmbient = new THREE.HemisphereLight(0x9fb4ff, 0x0a1018, 0);
+scene.add(moonAmbient);
+
 const orbGroup = new THREE.Group();
 const orbCore = new THREE.Mesh(
   new THREE.SphereGeometry(0.48, 48, 32),
@@ -1176,7 +1184,7 @@ function makeSporeTree(x: number, y: number, z: number, h: number): void {
   const canopyMat = new THREE.MeshStandardMaterial({
     color: 0x0d1d18,
     emissive: glow.clone().lerp(new THREE.Color(0.5, 0.5, 0.5), 0.3),
-    emissiveIntensity: 0.05,
+    emissiveIntensity: 0, // trees aren't bioluminescent — black until a light hits them
     roughness: 0.92,
     metalness: 0,
     envMapIntensity: 0.03,
@@ -2099,6 +2107,7 @@ function frame(): void {
   uniforms.uMoonDir.value.copy(moonDir);
   uniforms.uMoonI.value = moonI;
   grassField.uniforms.uMoonI.value = moonI;
+  moonAmbient.intensity = moonI * 0.35; // faint moon wash on flora/orb (dim even at full)
 
   // God-rays: project the moon to screen; rays fire only when it's ahead of
   // the camera and the clouds are open (moonI already folds in phase + cover).
