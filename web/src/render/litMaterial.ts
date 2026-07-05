@@ -36,12 +36,6 @@ export interface LitUniforms {
   /** Moonlight: direction + strength (0 when clouds cover the moon). */
   uMoonDir: { value: THREE.Vector3 };
   uMoonI: { value: number };
-  /** Charged flora as point lights: the N nearest glowing caps cast a soft
-   *  colored pool on the ground. Intensity scales with a cap's charge, so a
-   *  grove lit by the pulse actually radiates onto its surroundings. */
-  uFloraPos: { value: THREE.Vector3[] };
-  uFloraColor: { value: THREE.Color[] };
-  uFloraInt: { value: Float32Array };
 }
 
 export function createLitMaterial(): { material: THREE.ShaderMaterial; uniforms: LitUniforms } {
@@ -59,9 +53,6 @@ export function createLitMaterial(): { material: THREE.ShaderMaterial; uniforms:
     uVoxelDetail: { value: 1 }, // blocky terrain default — full voxel texturing
     uMoonDir: { value: new THREE.Vector3(0.3, 0.8, 0.2).normalize() },
     uMoonI: { value: 0 },
-    uFloraPos: { value: Array.from({ length: 24 }, () => new THREE.Vector3()) },
-    uFloraColor: { value: Array.from({ length: 24 }, () => new THREE.Color()) },
-    uFloraInt: { value: new Float32Array(24) }, // 0 = off; >0 scales the glow
   };
 
   const material = new THREE.ShaderMaterial({
@@ -102,11 +93,6 @@ export function createLitMaterial(): { material: THREE.ShaderMaterial; uniforms:
       uniform float uVoxelDetail;
       uniform vec3 uMoonDir;
       uniform float uMoonI;
-      #define FLORA_N 24      // slots: enough that lights don't pop in/out of the set
-      #define FLORA_R 14.0    // reach: gentle, wide falloff — fades to dark, no hard edge
-      uniform vec3 uFloraPos[FLORA_N];
-      uniform vec3 uFloraColor[FLORA_N];
-      uniform float uFloraInt[FLORA_N];
 
       varying vec3 vWorld;
       varying vec3 vNormal;
@@ -259,23 +245,8 @@ export function createLitMaterial(): { material: THREE.ShaderMaterial; uniforms:
         held = held * held * 1.6; // quadratic response: bright cores, fast falloff into dark
         vec3 dyn = (bubble + pulse) * uOrbColor * vAO;
 
-        // Charged flora: the nearest glowing caps cast a soft colored pool of
-        // real light on the ground around them — radiance, not just self-glow.
-        // Tight radius + quadratic falloff keeps it a subtle halo, never a lamp.
-        vec3 flora = vec3(0.0);
-        for (int i = 0; i < FLORA_N; i++) {
-          float fi = uFloraInt[i];
-          if (fi <= 0.001) continue;
-          float fd = distance(p, uFloraPos[i]);
-          float fb = 1.0 - clamp(fd / FLORA_R, 0.0, 1.0);
-          fb = fb * fb * fi;
-          vec3 toF = normalize(uFloraPos[i] - vWorld + 1e-4);
-          fb *= 0.5 + 0.5 * clamp(dot(bumpN, toF), 0.0, 1.0); // facing-aware
-          flora += fb * uFloraColor[i];
-        }
-
         vec3 lit = albedo * (uAmbient * sky * vAO) + albedo * held * uHeldColor
-                 + albedo * dyn + albedo * flora * vAO;
+                 + albedo * dyn;
 
         // Subtle emissive rim (ART.md §1.3, locked "subtle"): where a LIT
         // surface silhouettes against the dark, its edge catches a faint

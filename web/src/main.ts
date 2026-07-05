@@ -1499,26 +1499,6 @@ function frame(): void {
     }
   }
 
-  // Charged flora → real light on the ground: feed the nearest glowing caps
-  // (same distance sort) into the terrain shader as tight point lights. A cap's
-  // fog intensity already tracks its charge, so a grove lit by the pulse now
-  // radiates a soft colored pool onto the floor around it. Gain keeps the
-  // subtle pool readable on near-black ground; the shader's tight falloff caps it.
-  const FLORA_GAIN = 2.2; // tune this ↑/↓ for stronger/subtler ground radiance
-  const floraPos = uniforms.uFloraPos.value;
-  const floraColor = uniforms.uFloraColor.value;
-  const floraInt = uniforms.uFloraInt.value;
-  for (let i = 0; i < floraInt.length; i++) {
-    const entry = sorted[i];
-    if (entry) {
-      floraPos[i].copy(entry.l.pos);
-      floraColor[i].copy(entry.l.color);
-      floraInt[i] = entry.l.intensity * tideDim * FLORA_GAIN;
-    } else {
-      floraInt[i] = 0;
-    }
-  }
-
   updateTrail(dt);
   updateSpores(dt, clock.elapsedTime);
   // The grass field: wind + parts around the orb + ripples with the pulse.
