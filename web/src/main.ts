@@ -178,9 +178,12 @@ const orbCore = new THREE.Mesh(
     sheenColor: new THREE.Color(0x2a3a55),
   }),
 );
-// Aura layer 1: tight rim glow hugging the black core.
+// Aura layer 1: tight rim glow hugging the black core. Its radius is the ONE
+// source of truth for the orb's soft-contact hitbox — the band of glowing space
+// that immediately surrounds the body is exactly what brushes the flora.
+const ORB_HALO_RADIUS = 0.62;
 const orbHalo = new THREE.Mesh(
-  new THREE.SphereGeometry(0.62, 32, 18),
+  new THREE.SphereGeometry(ORB_HALO_RADIUS, 32, 18),
   new THREE.MeshBasicMaterial({
     color: 0x50d8ff,
     transparent: true,
@@ -620,7 +623,80 @@ style.textContent = `
 document.head.appendChild(style);
 
 // --- Smooth flora (hybrid art rule: voxel world, smooth LIFE) ---
-const glowcapSway: { group: THREE.Group; phase: number }[] = [];
+// Everything the orb touches now REACTS: shrooms bob stiffly on their stalks,
+// trees bend ropily toward the crown, and the pulse washes through them all.
+
+// Thick-stalked glowcaps. Two coupled springs so head and stalk read as one
+// living thing but respond separately: a stiff BASE lean (barely moves) and a
+// springy CAP wobble on top. High stiffness + near-critical damping = small
+// motion, quick rebound. Crowded caps lean apart to make room.
+interface ShroomFlora {
+  group: THREE.Group; // leaned about the base by (lx,lz)
+  cap: THREE.Object3D; // wobbles by (cx,cz) atop the stalk
+  gills: THREE.Object3D; // rides with the cap
+  capBaseY: number; // cap's rest height (wobble offsets from here)
+  x: number;
+  z: number;
+  h: number;
+  capR: number;
+  stalkR: number;
+  phase: number;
+  lx: number; // stalk lean + velocity
+  lz: number;
+  lvx: number;
+  lvz: number;
+  cx: number; // cap wobble + velocity
+  cz: number;
+  cvx: number;
+  cvz: number;
+}
+const shroomFlora: ShroomFlora[] = [];
+// Spacing registry — caps claim ground so new ones don't spawn interpenetrating.
+const shroomBodies: { x: number; z: number; r: number }[] = [];
+
+// Spore-trees: the trunk is an upright Verlet rope shape-matched to its own rest
+// curve, so it bends progressively (base rigid, crown loose) and is far stiffer
+// than the mycelium. Branches + canopy ride the crown; the canopy can ripple.
+interface TreeFlora {
+  group: THREE.Group;
+  crown: THREE.Group; // branches + canopy; follows the top node's pose
+  n: number;
+  nodes: Float32Array; // n×3 LOCAL (anchor-relative)
+  prev: Float32Array;
+  rest: Float32Array; // rest pose the shape-match springs pull back to
+  kShape: Float32Array; // per-node shape stiffness (base high → tip low)
+  radii: Float32Array;
+  segLen: number;
+  radial: number;
+  tubePos: THREE.BufferAttribute;
+  tubeNrm: THREE.BufferAttribute;
+  anchor: THREE.Vector3;
+  restTop: THREE.Vector3; // crown's rest position (local)
+  canopies: { mesh: THREE.Mesh; base: Float32Array; seed: number }[]; // mode-B ripple
+  leafInst: THREE.InstancedMesh | null; // mode-A leaf cards (one draw call)
+  leafBase: Float32Array; // 7 per leaf: px,py,pz, nx,ny,nz, phase (crown-local)
+  leafCount: number;
+  phase: number;
+}
+const treeFlora: TreeFlora[] = [];
+
+// Canopy A/B (toggle with the L key): true = leaf cards flutter, false = the
+// blob surface ripples. Both react to the pulse; flip to compare.
+let canopyLeafMode = true;
+window.addEventListener('keydown', (e) => {
+  if (e.code !== 'KeyL') return;
+  canopyLeafMode = !canopyLeafMode;
+  for (const t of treeFlora) {
+    if (t.leafInst) t.leafInst.visible = canopyLeafMode;
+    if (canopyLeafMode) {
+      // Leaves take over → restore the blobs to their pristine (unrippled) shape.
+      for (const c of t.canopies) {
+        (c.mesh.geometry.attributes.position.array as Float32Array).set(c.base);
+        c.mesh.geometry.attributes.position.needsUpdate = true;
+      }
+    }
+  }
+});
 
 // (Spot textures retired — John's call: clean satin surfaces, color from glow.)
 
@@ -808,30 +884,79 @@ function makeGlowcap(x: number, y: number, z: number, h: number): void {
   });
   const gills = new THREE.Mesh(new THREE.CircleGeometry(capR * 0.9, 18), gillMat);
   gills.rotation.x = -Math.PI / 2;
-  gills.position.y = h - 0.04;
 
-  g.add(stem, cap, gills);
-  g.rotation.z = (Math.sin(tseed) % 1) * 0.14;
-  g.position.set(x + 0.5, y, z + 0.5);
+  // Head = cap + gills as one body so it can wobble on the stalk on its own.
+  const head = new THREE.Group();
+  head.position.y = h;
+  cap.position.y = 0;
+  gills.position.y = -0.04;
+  head.add(cap, gills);
+
+  // Spacing: claim ground the size of the cap and shove off any earlier cap so
+  // they don't spawn interpenetrating (worldgen stays untouched).
+  let px = x + 0.5;
+  let pz = z + 0.5;
+  const bodyR = capR * 0.8;
+  for (let iter = 0; iter < 6; iter++) {
+    let moved = false;
+    for (const b of shroomBodies) {
+      const ddx = px - b.x;
+      const ddz = pz - b.z;
+      const min = bodyR + b.r;
+      const d2 = ddx * ddx + ddz * ddz;
+      if (d2 < min * min) {
+        const d = Math.sqrt(d2) || 1e-3;
+        const push = (min - d) * 0.5 + 1e-3;
+        px += (ddx / d) * push;
+        pz += (ddz / d) * push;
+        moved = true;
+      }
+    }
+    if (!moved) break;
+  }
+  shroomBodies.push({ x: px, z: pz, r: bodyR });
+
+  g.add(stem, head);
+  g.position.set(px, y, pz);
   scene.add(g);
   registerFlora(g);
-  glowcapSway.push({ group: g, phase: x * 0.7 + z * 0.31 });
+  shroomFlora.push({
+    group: g,
+    cap: head,
+    gills,
+    capBaseY: h,
+    x: px,
+    z: pz,
+    h,
+    capR,
+    stalkR: stemR * 1.6,
+    phase: px * 0.7 + pz * 0.31,
+    lx: 0,
+    lz: 0,
+    lvx: 0,
+    lvz: 0,
+    cx: 0,
+    cz: 0,
+    cvx: 0,
+    cvz: 0,
+  });
   const fogIdx =
     fogLightRegistry.push({
-      pos: new THREE.Vector3(x + 0.5, y + h + 0.8, z + 0.5),
+      pos: new THREE.Vector3(px, y + h + 0.8, pz),
       color: glow.clone().multiplyScalar(1 / Math.max(glow.r, glow.g, glow.b)),
       intensity: 0.04, // dark until charged
     }) - 1;
   shrooms.push({
-    pos: new THREE.Vector3(x + 0.5, y + h, z + 0.5),
+    pos: new THREE.Vector3(px, y + h, pz),
     capMat,
     gillMat,
     fogIdx,
     charge: 0.15, // a faint residual charge at world-start
   });
-  // Hitboxes: the stem you bump, the cap you can land on.
-  addFloraCollider(x + 0.5, z + 0.5, y, y + h - 0.3, stemR * 1.5);
-  addFloraCollider(x + 0.5, z + 0.5, y + h - 0.35, y + h + capR * 0.45, capR * 0.8);
+  // Hitboxes, SEPARATE so the head and stalk read as different things: the stem
+  // you bump, and the cap you can land on / brush.
+  addFloraCollider(px, pz, y, y + h - 0.3, stemR * 1.5);
+  addFloraCollider(px, pz, y + h - 0.35, y + h + capR * 0.45, capR * 0.8);
 }
 
 // --- Spore-trees: tall curved trunks, freckled canopy near the roof ---
@@ -840,6 +965,18 @@ const barkMat = new THREE.MeshStandardMaterial({
   roughness: 0.95,
   metalness: 0,
   envMapIntensity: 0.1,
+});
+// Leaf cards (canopy mode A): a small double-sided frond, shared across trees.
+const leafGeo = new THREE.PlaneGeometry(0.5, 0.72);
+leafGeo.translate(0, 0.36, 0); // pivot at the stem end so it flutters about its base
+const leafMat = new THREE.MeshStandardMaterial({
+  color: 0x142a1e,
+  emissive: 0x0a1f14,
+  emissiveIntensity: 0.15,
+  roughness: 0.85,
+  metalness: 0,
+  side: THREE.DoubleSide,
+  envMapIntensity: 0.05,
 });
 
 /** A lumpy organic canopy blob: displaced icosphere, dark and moody. */
@@ -864,7 +1001,9 @@ function makeSporeTree(x: number, y: number, z: number, h: number): void {
   const g = new THREE.Group();
   const tseed = Math.abs(Math.sin(x * 3.7 + z * 7.1));
 
-  // Trunk: ONE continuous tube along a gentle S-curve — a grown thing.
+  // Trunk: ONE continuous S-curve — but sampled into a Verlet rope so it can
+  // bend. Rest pose IS this curve; shape-match springs (rigid at the base,
+  // loose at the crown) pull it home, so it bends progressively and stiffly.
   const lean = 0.5 + tseed * 0.8;
   const dirA = tseed * Math.PI * 2;
   const curve = new THREE.CatmullRomCurve3([
@@ -873,13 +1012,48 @@ function makeSporeTree(x: number, y: number, z: number, h: number): void {
     new THREE.Vector3(Math.cos(dirA + 0.9) * lean * 0.7, h * 0.72, Math.sin(dirA + 0.9) * lean * 0.6),
     new THREE.Vector3(Math.cos(dirA + 1.4) * lean, h, Math.sin(dirA + 1.4) * lean * 0.9),
   ]);
-  const trunk = new THREE.Mesh(new THREE.TubeGeometry(curve, 10, 0.3, 7), barkMat);
+  const n = 9;
+  const radial = 7;
+  const pts = curve.getSpacedPoints(n - 1); // arc-length-even → equal links
+  const nodes = new Float32Array(n * 3);
+  const prev = new Float32Array(n * 3);
+  const rest = new Float32Array(n * 3);
+  const radii = new Float32Array(n);
+  const kShape = new Float32Array(n);
+  let segAcc = 0;
+  for (let i = 0; i < n; i++) {
+    const f = i / (n - 1);
+    nodes[i * 3] = pts[i].x;
+    nodes[i * 3 + 1] = pts[i].y;
+    nodes[i * 3 + 2] = pts[i].z;
+    prev[i * 3] = pts[i].x;
+    prev[i * 3 + 1] = pts[i].y;
+    prev[i * 3 + 2] = pts[i].z;
+    rest[i * 3] = pts[i].x;
+    rest[i * 3 + 1] = pts[i].y;
+    rest[i * 3 + 2] = pts[i].z;
+    radii[i] = 0.34 - 0.2 * f; // thick trunk tapering to a slim crown-neck
+    // Per-FRAME return toward the rest curve (applied once, not per iteration):
+    // strong at the base, weak at the crown → bends more up top, springs home.
+    kShape[i] = 0.22 * (1 - f) * (1 - f) + 0.015;
+    if (i > 0) segAcc += pts[i].distanceTo(pts[i - 1]);
+  }
+  const segLen = segAcc / (n - 1);
+
+  const tubeGeom = new THREE.BufferGeometry();
+  const tubePos = new THREE.BufferAttribute(new Float32Array(n * radial * 3), 3);
+  const tubeNrm = new THREE.BufferAttribute(new Float32Array(n * radial * 3), 3);
+  tubeGeom.setAttribute('position', tubePos);
+  tubeGeom.setAttribute('normal', tubeNrm);
+  tubeGeom.setIndex(ropeIndices(n, radial));
+  const trunk = new THREE.Mesh(tubeGeom, barkMat);
+  trunk.frustumCulled = false;
   // Root flare so it grips the ground instead of poking it.
   const flare = new THREE.Mesh(new THREE.CylinderGeometry(0.32, 0.85, 1.1, 9), barkMat);
   flare.position.y = 0.55;
   g.add(trunk, flare);
 
-  // Two branch tubes reaching up-and-out from the upper trunk.
+  // Two branch tubes reaching up-and-out from the upper trunk (static bark).
   for (let b = 0; b < 2; b++) {
     const bt = 0.55 + b * 0.22;
     const start = curve.getPoint(bt);
@@ -892,8 +1066,8 @@ function makeSporeTree(x: number, y: number, z: number, h: number): void {
     g.add(new THREE.Mesh(new THREE.TubeGeometry(branch, 6, 0.11, 5), barkMat));
   }
 
-  // Canopy: dark, lumpy, desaturated — reads as foliage mass in the gloom,
-  // with the faintest freckle-glow (spores nesting in it).
+  // Crown: canopy blobs + leaf cards, parented to a group that rides the top
+  // node so the whole head leans with the trunk's bend.
   const pal = pickPalette(x, z);
   const glow = new THREE.Color(pal.glow);
   const canopyMat = new THREE.MeshStandardMaterial({
@@ -905,16 +1079,59 @@ function makeSporeTree(x: number, y: number, z: number, h: number): void {
     envMapIntensity: 0.03,
   });
   const top = curve.getPoint(1);
+  const crown = new THREE.Group();
+  crown.position.copy(top);
+  const canopies: { mesh: THREE.Mesh; base: Float32Array; seed: number }[] = [];
   for (let i = 0; i < 3; i++) {
     const cr = 1.9 + tseed * 1.0 + i * 0.3;
-    const blob = makeCanopyBlob(cr, tseed * 7 + i * 3.1, canopyMat);
+    const seed = tseed * 7 + i * 3.1;
+    const blob = makeCanopyBlob(cr, seed, canopyMat);
     blob.position.set(
-      top.x + Math.sin(i * 2.4 + tseed * 9) * cr * 0.45,
-      top.y - 0.6 + i * 0.5,
-      top.z + Math.cos(i * 2.1 + tseed * 5) * cr * 0.4,
+      Math.sin(i * 2.4 + tseed * 9) * cr * 0.45,
+      -0.6 + i * 0.5,
+      Math.cos(i * 2.1 + tseed * 5) * cr * 0.4,
     );
-    g.add(blob);
+    crown.add(blob);
+    // Keep the pristine vertex positions so mode-B ripple can wobble off them.
+    const base = (blob.geometry.attributes.position.array as Float32Array).slice();
+    canopies.push({ mesh: blob, base, seed });
   }
+
+  // Leaf cards (mode A): scattered fronds over the canopy volume, one instanced
+  // draw. Hidden until you flip to leaf mode with L.
+  const leafCount = 22;
+  const leafBase = new Float32Array(leafCount * 7);
+  const leafInst = new THREE.InstancedMesh(leafGeo, leafMat, leafCount);
+  leafInst.frustumCulled = false;
+  const _lm = new THREE.Matrix4();
+  const _lq = new THREE.Quaternion();
+  const _lp = new THREE.Vector3();
+  const _lup = new THREE.Vector3(0, 1, 0);
+  for (let i = 0; i < leafCount; i++) {
+    // A point roughly on the canopy shell, biased outward and downward.
+    const a = i * 2.399963 + tseed * 6.2; // golden-angle spread
+    const yb = Math.cos((i / leafCount) * Math.PI * 0.9) * 1.2 - 0.4;
+    const rr = 1.7 + tseed * 0.9;
+    const px = Math.cos(a) * rr * 0.7;
+    const pz = Math.sin(a) * rr * 0.7;
+    const nlen = Math.hypot(px, yb + 0.2, pz) || 1;
+    leafBase[i * 7] = px;
+    leafBase[i * 7 + 1] = yb;
+    leafBase[i * 7 + 2] = pz;
+    leafBase[i * 7 + 3] = px / nlen;
+    leafBase[i * 7 + 4] = (yb + 0.2) / nlen;
+    leafBase[i * 7 + 5] = pz / nlen;
+    leafBase[i * 7 + 6] = a * 1.7; // per-leaf flutter phase
+    _lp.set(px, yb, pz);
+    _lq.setFromUnitVectors(_lup, _lp.clone().normalize());
+    _lm.compose(_lp, _lq, new THREE.Vector3(1, 1, 1));
+    leafInst.setMatrixAt(i, _lm);
+  }
+  leafInst.instanceMatrix.needsUpdate = true;
+  leafInst.visible = canopyLeafMode;
+  crown.add(leafInst);
+  g.add(crown);
+
   g.position.set(x + 0.5, y, z + 0.5);
   scene.add(g);
   registerFlora(g);
@@ -929,7 +1146,28 @@ function makeSporeTree(x: number, y: number, z: number, h: number): void {
     const sy = y + top.y - 0.7 - Math.abs(Math.sin(sa * 1.9)) * 0.6;
     makeStrandAt(sx, sy, sz, 1.4 + Math.abs(Math.sin(sa * 5.1)) * 2.2);
   }
-  glowcapSway.push({ group: g, phase: x * 0.23 + z * 0.11 });
+  treeFlora.push({
+    group: g,
+    crown,
+    n,
+    nodes,
+    prev,
+    rest,
+    kShape,
+    radii,
+    segLen,
+    radial,
+    tubePos,
+    tubeNrm,
+    anchor: new THREE.Vector3(x + 0.5, y, z + 0.5),
+    restTop: top.clone(),
+    canopies,
+    leafInst,
+    leafBase,
+    leafCount,
+    phase: x * 0.23 + z * 0.11,
+  });
+  updateRopeTube({ nodes, n, radii, radial, tubePos, tubeNrm }); // bake rest shape
   fogLightRegistry.push({
     pos: new THREE.Vector3(x, y + h, z),
     color: glow.clone().multiplyScalar(1 / Math.max(glow.r, glow.g, glow.b)),
@@ -971,21 +1209,97 @@ function makeButtons(x: number, y: number, z: number): void {
   registerFlora(g);
 }
 
-// --- Hanging mycelium strands: gravity-hung, pendulum sway, spore-ball beads.
-// Strands anchor to a point (ceiling OR tree canopy) and hang PLUMB — a
-// near-vertical drop with a slight catenary drift, beads swelling toward the
-// tip. Sway is a pendulum: longer strands swing slower (√(g/L)), tiny angles.
-const strandSway: {
-  group: THREE.Group;
-  phase: number;
-  rate: number;
-  amp: number;
-  // Player-wake spring state: current lean + its velocity (gives them weight).
-  pushX: number;
-  pushZ: number;
-  velX: number;
-  velZ: number;
-}[] = [];
+// --- Hanging mycelium strands: a real ROPE, not a rigid rod on a hinge. Each
+// strand is a Verlet chain of point-masses pinned at the ceiling and hanging
+// under gravity; distance constraints hold the links together, so the thread
+// bends at EVERY point along its length. The orb collides with each node, so a
+// pass drapes the thread over the glow shell and the spore-balls swing on it
+// with real weight. The tube mesh is rebuilt from the node positions each frame.
+interface StrandRope {
+  group: THREE.Group; // sits at the anchor; never rotated — the nodes carry pose
+  anchor: THREE.Vector3;
+  n: number; // node count (node 0 is pinned to the anchor)
+  nodes: Float32Array; // n×3 LOCAL positions (relative to anchor)
+  prev: Float32Array; // n×3 previous positions — Verlet stores velocity as (pos−prev)
+  radii: Float32Array; // per-node tube radius
+  segLen: number; // rest length between adjacent nodes
+  radial: number; // tube cross-section sides
+  tubePos: THREE.BufferAttribute; // rewritten each frame from nodes
+  tubeNrm: THREE.BufferAttribute;
+  beads: THREE.Mesh[]; // spore-balls, each riding a node
+  beadNodes: number[];
+  phase: number; // ambient-breeze phase so nothing hangs perfectly dead-still
+}
+const strandRopes: StrandRope[] = [];
+
+// Triangle indices for an (n-ring, `radial`-sided) tube — built once per shape.
+function ropeIndices(n: number, radial: number): number[] {
+  const idx: number[] = [];
+  for (let i = 0; i < n - 1; i++) {
+    for (let j = 0; j < radial; j++) {
+      const a = i * radial + j;
+      const b = i * radial + ((j + 1) % radial);
+      const c = (i + 1) * radial + j;
+      const d = (i + 1) * radial + ((j + 1) % radial);
+      idx.push(a, c, b, b, c, d);
+    }
+  }
+  return idx;
+}
+
+// Rewrite a tube's vertex ring positions + normals to follow the rope nodes.
+const _rT = new THREE.Vector3();
+const _rN = new THREE.Vector3();
+const _rB = new THREE.Vector3();
+const _rRef = new THREE.Vector3();
+function updateRopeTube(rope: {
+  nodes: Float32Array;
+  n: number;
+  radii: Float32Array;
+  radial: number;
+  tubePos: THREE.BufferAttribute;
+  tubeNrm: THREE.BufferAttribute;
+}): void {
+  const { nodes, n, radii, radial, tubePos, tubeNrm } = rope;
+  const pos = tubePos.array as Float32Array;
+  const nrm = tubeNrm.array as Float32Array;
+  for (let i = 0; i < n; i++) {
+    const i0 = i > 0 ? i - 1 : 0;
+    const i1 = i < n - 1 ? i + 1 : n - 1;
+    _rT.set(
+      nodes[i1 * 3] - nodes[i0 * 3],
+      nodes[i1 * 3 + 1] - nodes[i0 * 3 + 1],
+      nodes[i1 * 3 + 2] - nodes[i0 * 3 + 2],
+    );
+    if (_rT.lengthSq() < 1e-9) _rT.set(0, -1, 0);
+    _rT.normalize();
+    _rRef.set(0, 0, 1);
+    if (Math.abs(_rT.z) > 0.9) _rRef.set(1, 0, 0);
+    _rN.crossVectors(_rT, _rRef).normalize();
+    _rB.crossVectors(_rT, _rN).normalize();
+    const cx = nodes[i * 3];
+    const cy = nodes[i * 3 + 1];
+    const cz = nodes[i * 3 + 2];
+    const r = radii[i];
+    for (let j = 0; j < radial; j++) {
+      const a = (j / radial) * Math.PI * 2;
+      const ca = Math.cos(a);
+      const sa = Math.sin(a);
+      const nx = _rN.x * ca + _rB.x * sa;
+      const ny = _rN.y * ca + _rB.y * sa;
+      const nz = _rN.z * ca + _rB.z * sa;
+      const vi = (i * radial + j) * 3;
+      pos[vi] = cx + nx * r;
+      pos[vi + 1] = cy + ny * r;
+      pos[vi + 2] = cz + nz * r;
+      nrm[vi] = nx;
+      nrm[vi + 1] = ny;
+      nrm[vi + 2] = nz;
+    }
+  }
+  tubePos.needsUpdate = true;
+  tubeNrm.needsUpdate = true;
+}
 
 function makeStrandAt(px: number, py: number, pz: number, len: number): void {
   const g = new THREE.Group();
@@ -993,12 +1307,27 @@ function makeStrandAt(px: number, py: number, pz: number, len: number): void {
   const glow = new THREE.Color(pal.glow);
   const drift = 0.06 + Math.abs(Math.sin(px * 1.7 + pz * 2.3)) * 0.12; // slight lean
   const dirA = Math.abs(Math.sin(px * 3.1 + pz * 1.3)) * Math.PI * 2;
-  // Gravity: straight down, drift growing quadratically (catenary-ish tail).
-  const curve = new THREE.CatmullRomCurve3([
-    new THREE.Vector3(0, 0, 0),
-    new THREE.Vector3(Math.cos(dirA) * drift * 0.25, -len * 0.5, Math.sin(dirA) * drift * 0.25),
-    new THREE.Vector3(Math.cos(dirA) * drift, -len, Math.sin(dirA) * drift),
-  ]);
+
+  // Rope nodes: node count scales with length so segments stay short enough that
+  // the orb (r≈0.62) can't slip between two nodes without touching one.
+  const n = Math.max(6, Math.min(12, Math.round(len / 0.4) + 1));
+  const radial = 5;
+  const segLen = len / (n - 1);
+  const nodes = new Float32Array(n * 3);
+  const prev = new Float32Array(n * 3);
+  const radii = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const f = i / (n - 1); // 0 at anchor → 1 at tip
+    // Rest pose: straight down with the drift growing toward the tip (catenary).
+    nodes[i * 3] = Math.cos(dirA) * drift * f * f;
+    nodes[i * 3 + 1] = -len * f;
+    nodes[i * 3 + 2] = Math.sin(dirA) * drift * f * f;
+    prev[i * 3] = nodes[i * 3];
+    prev[i * 3 + 1] = nodes[i * 3 + 1];
+    prev[i * 3 + 2] = nodes[i * 3 + 2];
+    radii[i] = 0.028 + 0.02 * f; // faint taper, a touch fatter toward the tip
+  }
+
   const strandMat = new THREE.MeshStandardMaterial({
     color: 0x2a3a30,
     emissive: glow,
@@ -1006,9 +1335,19 @@ function makeStrandAt(px: number, py: number, pz: number, len: number): void {
     roughness: 0.9,
     metalness: 0,
     envMapIntensity: 0.03,
+    side: THREE.DoubleSide,
   });
-  g.add(new THREE.Mesh(new THREE.TubeGeometry(curve, 6, 0.03, 4), strandMat));
-  // Spore balls: beads along the strand, swelling toward the tip.
+  const tubeGeom = new THREE.BufferGeometry();
+  const tubePos = new THREE.BufferAttribute(new Float32Array(n * radial * 3), 3);
+  const tubeNrm = new THREE.BufferAttribute(new Float32Array(n * radial * 3), 3);
+  tubeGeom.setAttribute('position', tubePos);
+  tubeGeom.setAttribute('normal', tubeNrm);
+  tubeGeom.setIndex(ropeIndices(n, radial));
+  const tube = new THREE.Mesh(tubeGeom, strandMat);
+  tube.frustumCulled = false; // verts live in the buffer, not the local bounds
+  g.add(tube);
+
+  // Spore balls: beads riding chosen nodes, swelling toward the tip.
   const beadMat = new THREE.MeshStandardMaterial({
     color: 0x0c1512,
     emissive: glow,
@@ -1016,27 +1355,42 @@ function makeStrandAt(px: number, py: number, pz: number, len: number): void {
     roughness: 0.6,
     metalness: 0,
   });
-  const beadTs = [0.45, 0.72, 1.0];
-  for (let i = 0; i < beadTs.length; i++) {
+  const beads: THREE.Mesh[] = [];
+  const beadNodes = [
+    Math.round((n - 1) * 0.45),
+    Math.round((n - 1) * 0.72),
+    n - 1,
+  ];
+  for (let i = 0; i < beadNodes.length; i++) {
     const r = 0.04 + i * 0.035 + len * 0.008; // tip bead is the fattest
     const bead = new THREE.Mesh(new THREE.SphereGeometry(r, 8, 6), beadMat);
-    bead.position.copy(curve.getPoint(beadTs[i]));
+    const ni = beadNodes[i];
+    bead.position.set(nodes[ni * 3], nodes[ni * 3 + 1], nodes[ni * 3 + 2]);
     g.add(bead);
+    beads.push(bead);
   }
+
   g.position.set(px, py, pz);
   scene.add(g);
   registerFlora(g);
-  // Pendulum: ω = √(g/L) scaled way down; longer = slower + smaller angle.
-  strandSway.push({
+
+  const rope: StrandRope = {
     group: g,
+    anchor: new THREE.Vector3(px, py, pz),
+    n,
+    nodes,
+    prev,
+    radii,
+    segLen,
+    radial,
+    tubePos,
+    tubeNrm,
+    beads,
+    beadNodes,
     phase: px * 0.5 + pz * 0.7,
-    rate: Math.sqrt(9.8 / Math.max(len, 0.5)) * 0.35,
-    amp: 0.1 / (0.8 + len * 0.4),
-    pushX: 0,
-    pushZ: 0,
-    velX: 0,
-    velZ: 0,
-  });
+  };
+  updateRopeTube(rope); // bake the rest pose so it's shaped before first sim
+  strandRopes.push(rope);
 }
 
 function makeStrand(x: number, ceilingY: number, z: number, len: number): void {
@@ -1555,42 +1909,470 @@ function frame(): void {
     pulseActive ? pulseRadius : -1,
     pulseActive ? LightConfig.pulse.intensity : 0,
   );
-  // Flora sway: slow, irregular, alive.
-  for (const s of glowcapSway) {
-    s.group.rotation.z =
-      Math.sin(clock.elapsedTime * 0.55 + s.phase) * 0.035 +
-      Math.sin(clock.elapsedTime * 1.3 + s.phase * 2.1) * 0.012;
-  }
-  // Strand pendulums: gravity-true — anchored at the top, swinging with their
-  // own period, PLUS a player wake: the orb shoulders each strand aside as it
-  // passes and it swings back with weight (an underdamped driven spring).
-  const STRAND_STIFF = 34; // spring rate — higher = snappier return
-  const STRAND_DAMP = 5.5; // damping — lower = more overshoot/swing (more weight)
-  const STRAND_R = 3.2; // how close the orb must be to disturb a strand
-  for (const s of strandSway) {
-    const swayZ = Math.sin(clock.elapsedTime * s.rate + s.phase) * s.amp;
-    const swayX = Math.sin(clock.elapsedTime * s.rate * 0.93 + s.phase * 1.7) * s.amp * 0.7;
-
-    // Target lean: away from the orb, stronger the closer it is.
-    const dx = s.group.position.x - orb.pos.x;
-    const dz = s.group.position.z - orb.pos.z;
-    const d2 = dx * dx + dz * dz;
-    let tx = 0;
-    let tz = 0;
-    if (d2 < STRAND_R * STRAND_R) {
-      const d = Math.sqrt(d2) + 1e-3;
-      const push = (1 - d / STRAND_R) * 0.5;
-      tx = (dx / d) * push;
-      tz = (dz / d) * push;
+  // --- Shrooms: stiff, quick-rebounding cap-on-stalk. Head and stalk are two
+  // coupled springs so they respond separately; neighbours lean apart when they
+  // crowd; the orb brushes them and the pulse washes through. High stiffness +
+  // near-critical damping = small motion, snappy return (thick, woody things).
+  const time = clock.elapsedTime;
+  const sdt = dt < 1 / 30 ? dt : 1 / 30;
+  const SH_STALK_STIFF = 120;
+  const SH_STALK_DAMP = 8; // underdamped → a natural rock, not a dead snap-back
+  const SH_CAP_STIFF = 72;
+  const SH_CAP_DAMP = 6;
+  const SH_LEAN_MAX = 0.16; // ~9° — barely bends
+  const SH_CAP_MAX = 0.3;
+  const SH_SIM_R2 = 30 * 30;
+  const SH_PULSE_T = LightConfig.pulse.thickness;
+  // The wave weakens as it spreads: things near the pulse origin get thrown far,
+  // things it reaches late barely stir. Shared by shrooms, trees, and ropes.
+  const pulseFalloff = pulseActive
+    ? Math.max(0.12, 1 - pulseRadius / LightConfig.pulse.maxRadius)
+    : 0;
+  for (const s of shroomFlora) {
+    if (!s.group.visible) continue;
+    const odx = s.x - orb.pos.x;
+    const odz = s.z - orb.pos.z;
+    const baseY = s.group.position.y;
+    let pulseHere = false;
+    let pRad = 0;
+    if (pulseActive) {
+      const px = s.x - pulseCenter.x;
+      const py = baseY + s.h - pulseCenter.y;
+      const pz = s.z - pulseCenter.z;
+      pRad = Math.sqrt(px * px + py * py + pz * pz);
+      pulseHere = Math.abs(pRad - pulseRadius) < SH_PULSE_T + s.capR;
     }
-    // Damped spring toward the target — the velocity term is what gives weight.
-    s.velX += ((tx - s.pushX) * STRAND_STIFF - s.velX * STRAND_DAMP) * dt;
-    s.velZ += ((tz - s.pushZ) * STRAND_STIFF - s.velZ * STRAND_DAMP) * dt;
-    s.pushX += s.velX * dt;
-    s.pushZ += s.velZ * dt;
+    if (odx * odx + odz * odz > SH_SIM_R2 && !pulseHere) continue;
 
-    s.group.rotation.z = swayZ + s.pushX;
-    s.group.rotation.x = swayX - s.pushZ;
+    // Ambient breath so they're never dead-still.
+    let tlx = Math.sin(time * 0.6 + s.phase) * 0.006;
+    let tlz = Math.cos(time * 0.5 + s.phase * 1.3) * 0.006;
+    let tcx = 0;
+    let tcz = 0;
+
+    // Neighbour bend: lean away from any cap crowding this one's footprint.
+    for (const o of shroomFlora) {
+      if (o === s) continue;
+      const dx = s.x - o.x;
+      const dz = s.z - o.z;
+      const min = (s.capR + o.capR) * 0.85;
+      const d2 = dx * dx + dz * dz;
+      if (d2 < min * min && d2 > 1e-4) {
+        const d = Math.sqrt(d2);
+        const over = (min - d) / min;
+        tlx += (dx / d) * over * 0.12;
+        tlz += (dz / d) * over * 0.12;
+      }
+    }
+
+    // Orb brush — the HEAD (its own hitbox) wobbles; the stalk gives a little.
+    const hy = baseY + s.h;
+    const hdx = orb.pos.x - s.x;
+    const hdy = orb.pos.y - hy;
+    const hdz = orb.pos.z - s.z;
+    const hR = ORB_HALO_RADIUS + s.capR * 0.7;
+    const hd2 = hdx * hdx + hdy * hdy + hdz * hdz;
+    if (hd2 < hR * hR) {
+      const hd = Math.sqrt(hd2) || 1e-3;
+      const pen = hR - hd;
+      tcx += (-hdx / hd) * pen * 1.3;
+      tcz += (-hdz / hd) * pen * 1.3;
+      tlx += (-hdx / hd) * pen * 0.18;
+      tlz += (-hdz / hd) * pen * 0.18;
+    }
+    // Orb brush — the STALK (separate hitbox): closest point up its axis.
+    const t = Math.min(1, Math.max(0, (orb.pos.y - baseY) / Math.max(s.h, 0.1)));
+    const sdx = orb.pos.x - s.x;
+    const sdy = orb.pos.y - (baseY + t * s.h);
+    const sdz = orb.pos.z - s.z;
+    const sR = ORB_HALO_RADIUS + s.stalkR;
+    const sd2 = sdx * sdx + sdy * sdy + sdz * sdz;
+    if (sd2 < sR * sR) {
+      const sd = Math.sqrt(sd2) || 1e-3;
+      const pen = sR - sd;
+      tlx += (-sdx / sd) * pen * 0.7 * t;
+      tlz += (-sdz / sd) * pen * 0.7 * t;
+    }
+    // Pulse wash — a small radial shove of head + stalk as the shell passes.
+    if (pulseHere) {
+      const rx = s.x - pulseCenter.x;
+      const rz = s.z - pulseCenter.z;
+      const rl = Math.hypot(rx, rz) || 1e-3;
+      // Away from the pulse, scaled by shell proximity AND distance falloff.
+      const k = (1 - Math.abs(pRad - pulseRadius) / (SH_PULSE_T + s.capR)) * 0.7 * pulseFalloff;
+      tcx += (rx / rl) * k;
+      tcz += (rz / rl) * k;
+      tlx += (rx / rl) * k * 0.5;
+      tlz += (rz / rl) * k * 0.5;
+    }
+
+    // Stiff, near-critically-damped springs → small move, quick rebound.
+    s.lvx += ((tlx - s.lx) * SH_STALK_STIFF - s.lvx * SH_STALK_DAMP) * sdt;
+    s.lvz += ((tlz - s.lz) * SH_STALK_STIFF - s.lvz * SH_STALK_DAMP) * sdt;
+    s.lx += s.lvx * sdt;
+    s.lz += s.lvz * sdt;
+    s.cvx += ((tcx - s.cx) * SH_CAP_STIFF - s.cvx * SH_CAP_DAMP) * sdt;
+    s.cvz += ((tcz - s.cz) * SH_CAP_STIFF - s.cvz * SH_CAP_DAMP) * sdt;
+    s.cx += s.cvx * sdt;
+    s.cz += s.cvz * sdt;
+    // Clamp: these barely move.
+    const ll = Math.hypot(s.lx, s.lz);
+    if (ll > SH_LEAN_MAX) {
+      const c = SH_LEAN_MAX / ll;
+      s.lx *= c;
+      s.lz *= c;
+    }
+    const cl = Math.hypot(s.cx, s.cz);
+    if (cl > SH_CAP_MAX) {
+      const c = SH_CAP_MAX / cl;
+      s.cx *= c;
+      s.cz *= c;
+    }
+
+    // Upright stalk: rotation.z>0 tips the TOP toward −x, so negate to lean the
+    // head toward +x (the "away" direction our targets are built in). This is
+    // the fix for shrooms leaning toward the pulse instead of away from it.
+    s.group.rotation.z = -s.lx;
+    s.group.rotation.x = s.lz;
+    s.cap.position.set(s.cx, s.capBaseY, s.cz);
+    s.cap.rotation.z = -s.cx * 0.7;
+    s.cap.rotation.x = s.cz * 0.7;
+  }
+
+  // --- Trees: the trunk is an upright Verlet rope shape-matched to its rest
+  // curve — rigid at the base, looser toward the crown, so it bends more up top
+  // and is much harder to bend than the mycelium. The orb pressing the trunk
+  // and the pulse shell both push the nodes; the crown (canopy + leaves) rides
+  // the top node, and the canopy either ripples or flutters its leaves.
+  const TREE_DRAG = 0.96; // light damping so a push actually swings the crown
+  const TREE_ITER = 8;
+  const TREE_BREEZE = 1.3;
+  const TREE_MAXSTEP = 0.4;
+  const TREE_CONTACT = 0.5 + ORB_HALO_RADIUS; // trunk collider + glow shell
+  const TREE_PULSE_ACC = 150 * (LightConfig.pulse.intensity / 0.8);
+  const tdtc = dt < 1 / 60 ? dt : 1 / 60;
+  const tdt2 = tdtc * tdtc;
+  const _tCur = new THREE.Vector3();
+  const _tRest = new THREE.Vector3();
+  const _tQuat = new THREE.Quaternion();
+  const _tLeafM = new THREE.Matrix4();
+  const _tLeafQ = new THREE.Quaternion();
+  const _tFlutterQ = new THREE.Quaternion();
+  const _tLeafP = new THREE.Vector3();
+  const _tLeafDir = new THREE.Vector3();
+  const _tUp = new THREE.Vector3(0, 1, 0);
+  const _tOne = new THREE.Vector3(1, 1, 1);
+  for (const tree of treeFlora) {
+    if (!tree.group.visible) continue;
+    const { nodes, prev, rest, kShape, radii, n, radial } = tree;
+    const last = n - 1;
+    const adx = tree.anchor.x - orb.pos.x;
+    const adz = tree.anchor.z - orb.pos.z;
+    const nearOrb = adx * adx + adz * adz < 34 * 34;
+    // Pulse centre in the tree's local frame.
+    const pcx = pulseCenter.x - tree.anchor.x;
+    const pcy = pulseCenter.y - tree.anchor.y;
+    const pcz = pulseCenter.z - tree.anchor.z;
+    let pulseHere = false;
+    if (pulseActive) {
+      const cwx = nodes[last * 3];
+      const cwy = nodes[last * 3 + 1];
+      const cwz = nodes[last * 3 + 2];
+      const dC = Math.sqrt((cwx - pcx) ** 2 + (cwy - pcy) ** 2 + (cwz - pcz) ** 2);
+      pulseHere = Math.abs(dC - pulseRadius) < LightConfig.pulse.thickness + 4;
+    }
+    if (!nearOrb && !pulseHere) continue;
+
+    const olx = orb.pos.x - tree.anchor.x;
+    const oly = orb.pos.y - tree.anchor.y;
+    const olz = orb.pos.z - tree.anchor.z;
+
+    // 1) Integrate free nodes (no gravity — rest curve holds it up).
+    for (let i = 1; i < n; i++) {
+      const k = i * 3;
+      const f = i / last;
+      let sx = (nodes[k] - prev[k]) * TREE_DRAG + Math.sin(time * 0.7 + tree.phase) * TREE_BREEZE * f * tdt2;
+      let sy = (nodes[k + 1] - prev[k + 1]) * TREE_DRAG;
+      let sz = (nodes[k + 2] - prev[k + 2]) * TREE_DRAG + Math.cos(time * 0.6 + tree.phase) * TREE_BREEZE * f * tdt2;
+      if (pulseHere) {
+        const rx = nodes[k] - pcx;
+        const ry = nodes[k + 1] - pcy;
+        const rz = nodes[k + 2] - pcz;
+        const rd = Math.sqrt(rx * rx + ry * ry + rz * rz) || 1e-4;
+        const shell = Math.abs(rd - pulseRadius);
+        if (shell < LightConfig.pulse.thickness) {
+          const a =
+            (TREE_PULSE_ACC * (1 - shell / LightConfig.pulse.thickness) * pulseFalloff * tdt2) / rd;
+          sx += rx * a;
+          sy += ry * a;
+          sz += rz * a;
+        }
+      }
+      const sl = Math.sqrt(sx * sx + sy * sy + sz * sz);
+      if (sl > TREE_MAXSTEP) {
+        const c = TREE_MAXSTEP / sl;
+        sx *= c;
+        sy *= c;
+        sz *= c;
+      }
+      prev[k] = nodes[k];
+      prev[k + 1] = nodes[k + 1];
+      prev[k + 2] = nodes[k + 2];
+      nodes[k] += sx;
+      nodes[k + 1] += sy;
+      nodes[k + 2] += sz;
+    }
+
+    // 2) Relax: hold link lengths and shove nodes out of the orb pressing the
+    //    trunk (both iterated so they converge). Shape-match to the rest curve
+    //    is applied ONCE, after — running it every iteration cancelled every
+    //    push in the same frame, which is why the trees did nothing.
+    for (let it = 0; it < TREE_ITER; it++) {
+      for (let i = 0; i < n - 1; i++) {
+        const a = i * 3;
+        const b = (i + 1) * 3;
+        const rlx = rest[b] - rest[a];
+        const rly = rest[b + 1] - rest[a + 1];
+        const rlz = rest[b + 2] - rest[a + 2];
+        const rl = Math.sqrt(rlx * rlx + rly * rly + rlz * rlz) || 1e-4;
+        const dx = nodes[b] - nodes[a];
+        const dy = nodes[b + 1] - nodes[a + 1];
+        const dz = nodes[b + 2] - nodes[a + 2];
+        const d = Math.sqrt(dx * dx + dy * dy + dz * dz) || 1e-4;
+        const diff = (d - rl) / d;
+        const w0 = i === 0 ? 0 : 0.5;
+        const w1 = i === 0 ? 1 : 0.5;
+        nodes[a] += dx * diff * w0;
+        nodes[a + 1] += dy * diff * w0;
+        nodes[a + 2] += dz * diff * w0;
+        nodes[b] -= dx * diff * w1;
+        nodes[b + 1] -= dy * diff * w1;
+        nodes[b + 2] -= dz * diff * w1;
+      }
+      for (let i = 1; i < n; i++) {
+        const k = i * 3;
+        const dx = nodes[k] - olx;
+        const dy = nodes[k + 1] - oly;
+        const dz = nodes[k + 2] - olz;
+        const d2 = dx * dx + dy * dy + dz * dz;
+        if (d2 < TREE_CONTACT * TREE_CONTACT) {
+          const d = Math.sqrt(d2) || 1e-4;
+          const push = (TREE_CONTACT - d) / d;
+          nodes[k] += dx * push;
+          nodes[k + 1] += dy * push;
+          nodes[k + 2] += dz * push;
+        }
+      }
+    }
+    // Shape-match ONCE per frame: pull each node a little toward its rest-curve
+    // spot. Base kShape is strong (rigid trunk), crown kShape tiny (bends far,
+    // springs home slowly) — so a push registers, then eases back over frames.
+    for (let i = 1; i < n; i++) {
+      const k = i * 3;
+      const ks = kShape[i];
+      nodes[k] += (rest[k] - nodes[k]) * ks;
+      nodes[k + 1] += (rest[k + 1] - nodes[k + 1]) * ks;
+      nodes[k + 2] += (rest[k + 2] - nodes[k + 2]) * ks;
+    }
+
+    updateRopeTube({ nodes, n, radii, radial, tubePos: tree.tubePos, tubeNrm: tree.tubeNrm });
+
+    // Crown rides the top node — position + a tilt matching the crown's bend.
+    tree.crown.position.set(nodes[last * 3], nodes[last * 3 + 1], nodes[last * 3 + 2]);
+    _tCur.set(
+      nodes[last * 3] - nodes[(last - 1) * 3],
+      nodes[last * 3 + 1] - nodes[(last - 1) * 3 + 1],
+      nodes[last * 3 + 2] - nodes[(last - 1) * 3 + 2],
+    );
+    _tRest.set(
+      rest[last * 3] - rest[(last - 1) * 3],
+      rest[last * 3 + 1] - rest[(last - 1) * 3 + 1],
+      rest[last * 3 + 2] - rest[(last - 1) * 3 + 2],
+    );
+    if (_tCur.lengthSq() > 1e-9 && _tRest.lengthSq() > 1e-9) {
+      _tQuat.setFromUnitVectors(_tRest.normalize(), _tCur.normalize());
+      tree.crown.quaternion.copy(_tQuat);
+    }
+
+    // Canopy: leaf cards flutter (mode A) OR the blob surface ripples (mode B),
+    // both driven by the pulse (plus a little ambient life on the leaves).
+    const crownWX = tree.anchor.x + nodes[last * 3];
+    const crownWY = tree.anchor.y + nodes[last * 3 + 1];
+    const crownWZ = tree.anchor.z + nodes[last * 3 + 2];
+    let pulseSwell = 0;
+    if (pulseActive) {
+      const dC = Math.hypot(crownWX - pulseCenter.x, crownWY - pulseCenter.y, crownWZ - pulseCenter.z);
+      const band = LightConfig.pulse.thickness + 3;
+      const shell = Math.abs(dC - pulseRadius);
+      if (shell < band) pulseSwell = 1 - shell / band;
+    }
+
+    if (canopyLeafMode && tree.leafInst) {
+      // Mode A: flutter every frond; the pulse pops them outward along normals.
+      const lb = tree.leafBase;
+      for (let i = 0; i < tree.leafCount; i++) {
+        const b = i * 7;
+        const ph = lb[b + 6];
+        const flick = Math.sin(time * 3.2 + ph) * 0.22 + pulseSwell * 0.6;
+        const pop = pulseSwell * 0.5;
+        // Position: base point, popped outward along its normal by the pulse.
+        _tLeafP.set(lb[b] + lb[b + 3] * pop, lb[b + 1] + lb[b + 4] * pop, lb[b + 2] + lb[b + 5] * pop);
+        // Orient the frond to face outward, then rock it about that axis.
+        _tLeafDir.set(lb[b + 3], lb[b + 4], lb[b + 5]);
+        _tLeafQ.setFromUnitVectors(_tUp, _tLeafDir);
+        _tFlutterQ.setFromAxisAngle(_tUp, flick);
+        _tLeafQ.multiply(_tFlutterQ);
+        _tLeafM.compose(_tLeafP, _tLeafQ, _tOne);
+        tree.leafInst.setMatrixAt(i, _tLeafM);
+      }
+      tree.leafInst.instanceMatrix.needsUpdate = true;
+    } else if (!canopyLeafMode && pulseSwell > 0) {
+      // Mode B: ripple the blob surface outward as the wavefront passes.
+      for (const c of tree.canopies) {
+        const arr = c.mesh.geometry.attributes.position.array as Float32Array;
+        const base = c.base;
+        for (let v = 0; v < arr.length; v += 3) {
+          const wob =
+            1 +
+            pulseSwell *
+              0.12 *
+              (0.5 + 0.5 * Math.sin(base[v] * 3 + base[v + 1] * 3 + base[v + 2] * 3 + time * 12 + c.seed));
+          arr[v] = base[v] * wob;
+          arr[v + 1] = base[v + 1] * wob;
+          arr[v + 2] = base[v + 2] * wob;
+        }
+        c.mesh.geometry.attributes.position.needsUpdate = true;
+      }
+    }
+  }
+  // Hanging strands = Verlet ROPES: a chain of point-masses pinned at the ceiling
+  // and hanging under gravity, so the thread bends at every link, not rigidly
+  // about the anchor. The orb collides with each node (its glow spheroid, radius
+  // ORB_HALO_RADIUS), so a pass drapes the thread over the shell and the
+  // spore-balls swing on it. Momentum is automatic: shoving a node out of the
+  // orb without touching its prev-position IS a velocity kick, so a fast pass
+  // flings the thread and it swings back on its own. The PULSE shell shoves the
+  // same nodes radially as its wavefront washes over them — so a pulse whips the
+  // strands exactly like a physical brush. Only near / pulse-lit ropes simulate.
+  const ROPE_GRAV = 17; //   local down-accel — sets how firmly it hangs plumb
+  const ROPE_DRAG = 0.986; // velocity kept per frame — <1 so swings settle
+  const ROPE_ITER = 12; //   constraint relaxation passes (stiffer thread)
+  const ROPE_BREEZE = 1.6; // faint living drift so nothing hangs dead-still
+  const ROPE_MAXSTEP = 0.5; // per-frame node step cap — kills blow-ups
+  const ROPE_SIM_R2 = 26 * 26; // sim ropes this close to the orb (h-dist²)
+  const PULSE_THICK = LightConfig.pulse.thickness; // shell half-width (voxels)
+  const PULSE_ACC = 78 * (LightConfig.pulse.intensity / 0.8); // wavefront shove
+  const dtc = dt < 1 / 60 ? dt : 1 / 60; // clamp for a stable integrator
+  const dt2 = dtc * dtc;
+  for (const rope of strandRopes) {
+    if (!rope.group.visible) continue;
+    const { nodes, prev, radii, n, segLen } = rope;
+    const ropeLen = (n - 1) * segLen;
+    const rdx = rope.anchor.x - orb.pos.x;
+    const rdz = rope.anchor.z - orb.pos.z;
+    const nearOrb = rdx * rdx + rdz * rdz <= ROPE_SIM_R2;
+    // Pulse centre in the rope's local frame; is the shell currently over us?
+    const pcx = pulseCenter.x - rope.anchor.x;
+    const pcy = pulseCenter.y - rope.anchor.y;
+    const pcz = pulseCenter.z - rope.anchor.z;
+    let pulseHere = false;
+    if (pulseActive) {
+      const dA = Math.sqrt(pcx * pcx + pcy * pcy + pcz * pcz);
+      // Anchor within the shell band, widened by the rope's reach below it.
+      pulseHere = Math.abs(dA - pulseRadius) < PULSE_THICK + ropeLen + 3;
+    }
+    if (!nearOrb && !pulseHere) continue;
+
+    // Orb centre in the rope's local frame (anchor at origin).
+    const olx = orb.pos.x - rope.anchor.x;
+    const oly = orb.pos.y - rope.anchor.y;
+    const olz = orb.pos.z - rope.anchor.z;
+    // A slow breeze, phase-offset per rope, so idle strands still breathe.
+    const bx = Math.sin(clock.elapsedTime * 0.6 + rope.phase) * ROPE_BREEZE;
+    const bz = Math.cos(clock.elapsedTime * 0.5 + rope.phase * 1.3) * ROPE_BREEZE;
+
+    // 1) Verlet integrate every free node (node 0 stays pinned to the anchor).
+    for (let i = 1; i < n; i++) {
+      const k = i * 3;
+      const f = i / (n - 1); // tip drifts more in the breeze than the neck
+      let sx = (nodes[k] - prev[k]) * ROPE_DRAG + bx * f * dt2;
+      let sy = (nodes[k + 1] - prev[k + 1]) * ROPE_DRAG - ROPE_GRAV * dt2;
+      let sz = (nodes[k + 2] - prev[k + 2]) * ROPE_DRAG + bz * f * dt2;
+      // Pulse wavefront: while the expanding shell sits on this node, push it
+      // radially OUTWARD from the pulse centre — same shove the orb gives, so
+      // strands whip when a pulse rolls through and swing back on their own.
+      if (pulseHere) {
+        const rx = nodes[k] - pcx;
+        const ry = nodes[k + 1] - pcy;
+        const rz = nodes[k + 2] - pcz;
+        const rd = Math.sqrt(rx * rx + ry * ry + rz * rz) || 1e-4;
+        const shell = Math.abs(rd - pulseRadius);
+        if (shell < PULSE_THICK) {
+          const a = (PULSE_ACC * (1 - shell / PULSE_THICK) * pulseFalloff * dt2) / rd;
+          sx += rx * a;
+          sy += ry * a;
+          sz += rz * a;
+        }
+      }
+      const sl = Math.sqrt(sx * sx + sy * sy + sz * sz);
+      if (sl > ROPE_MAXSTEP) {
+        const c = ROPE_MAXSTEP / sl;
+        sx *= c;
+        sy *= c;
+        sz *= c;
+      }
+      prev[k] = nodes[k];
+      prev[k + 1] = nodes[k + 1];
+      prev[k + 2] = nodes[k + 2];
+      nodes[k] += sx;
+      nodes[k + 1] += sy;
+      nodes[k + 2] += sz;
+    }
+
+    // 2) Relax: hold each link at rest length, then push nodes out of the orb.
+    for (let it = 0; it < ROPE_ITER; it++) {
+      for (let i = 0; i < n - 1; i++) {
+        const a = i * 3;
+        const b = (i + 1) * 3;
+        const dx = nodes[b] - nodes[a];
+        const dy = nodes[b + 1] - nodes[a + 1];
+        const dz = nodes[b + 2] - nodes[a + 2];
+        const d = Math.sqrt(dx * dx + dy * dy + dz * dz) || 1e-6;
+        const diff = (d - segLen) / d;
+        // Node 0 is pinned: segment 0 moves only its lower end; else split.
+        const w0 = i === 0 ? 0 : 0.5;
+        const w1 = i === 0 ? 1 : 0.5;
+        nodes[a] += dx * diff * w0;
+        nodes[a + 1] += dy * diff * w0;
+        nodes[a + 2] += dz * diff * w0;
+        nodes[b] -= dx * diff * w1;
+        nodes[b + 1] -= dy * diff * w1;
+        nodes[b + 2] -= dz * diff * w1;
+      }
+      // Orb collision: shove any node inside the glow shell back to its surface.
+      for (let i = 1; i < n; i++) {
+        const k = i * 3;
+        const dx = nodes[k] - olx;
+        const dy = nodes[k + 1] - oly;
+        const dz = nodes[k + 2] - olz;
+        const R = ORB_HALO_RADIUS + radii[i];
+        const d2 = dx * dx + dy * dy + dz * dz;
+        if (d2 < R * R) {
+          const d = Math.sqrt(d2) || 1e-4;
+          const push = (R - d) / d;
+          nodes[k] += dx * push;
+          nodes[k + 1] += dy * push;
+          nodes[k + 2] += dz * push;
+        }
+      }
+    }
+
+    // 3) Reshape the visible tube + ride each spore-ball on its node.
+    updateRopeTube(rope);
+    for (let i = 0; i < rope.beads.length; i++) {
+      const ni = rope.beadNodes[i] * 3;
+      rope.beads[i].position.set(nodes[ni], nodes[ni + 1], nodes[ni + 2]);
+    }
   }
   updateFloraCulling();
   updateCamera(dt);

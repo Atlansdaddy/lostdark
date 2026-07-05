@@ -108,17 +108,32 @@ export class SkyDome {
           float md = dot(dir, uMoonDir);
 
           // ---- Painted stars: three size tiers + a faint galactic band ----
+          // Each cell that wins the hash lottery gets ONE round point: a
+          // jittered centre inside the cell + a smooth radial falloff, so
+          // stars read as soft dots instead of filled grid squares.
           vec3 stars = vec3(0.0);
           for (int t = 0; t < 3; t++) {
             float scale = 120.0 + float(t) * 130.0;
-            vec3 sp = floor(dir * scale);
+            vec3 g = dir * scale;
+            vec3 sp = floor(g);
             float h = hash21(sp.xz * 1.7 + sp.y * 13.7);
             float thresh = 0.9975 - float(t) * 0.0004;
             if (h > thresh) {
               float mag = (h - thresh) / (1.0 - thresh);
-              float tw = 0.55 + 0.45 * sin(uTime * (1.5 + float(t)) + h * 51.0);
+              // Jitter the star off the cell centre so it isn't grid-locked.
+              vec3 jit = vec3(hash21(sp.xz + 1.3), hash21(sp.yz + 4.1), hash21(sp.xz + 7.7)) - 0.5;
+              vec3 f = fract(g) - 0.5 - jit * 0.6;
+              float d2 = dot(f, f);
+              // Round point: soft gaussian core → a disc, not a filled cell.
+              // Brighter/bigger stars get a slightly wider glow.
+              float radius = 0.22 + 0.14 * mag;
+              float point = exp(-d2 / (radius * radius));
+              // Twinkle: each star gets its own slow speed + phase so they
+              // shimmer independently (no lockstep groups) and gently.
+              float tSeed = hash21(sp.xz + 2.9);
+              float tw = 0.72 + 0.28 * sin(uTime * (0.4 + 0.8 * tSeed) + tSeed * 63.0);
               vec3 tint = mix(vec3(0.75, 0.85, 1.0), vec3(1.0, 0.9, 0.78), hash21(sp.xz + 5.0));
-              stars += tint * mag * tw * (0.5 + float(t) * 0.45);
+              stars += tint * mag * tw * point * (0.9 + float(t) * 0.55);
             }
           }
           // Milky band: a soft diagonal wash of unresolved starlight.
