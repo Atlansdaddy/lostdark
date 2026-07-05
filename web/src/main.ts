@@ -142,6 +142,9 @@ let smoothTerrain = false;
 const pickups: Pickup[] = [];
 const wards: Ward[] = [];
 const tempVec = new THREE.Vector3();
+// The world light the orb is currently bathed in (summed from nearby glow) —
+// bled onto the black core so the hero reflects the light it moves through.
+const orbWorldLit = new THREE.Color();
 // Reused per-frame culling scratch (no per-frame allocations).
 const cullFrustum = new THREE.Frustum();
 const cullMatrix = new THREE.Matrix4();
@@ -1524,6 +1527,22 @@ function frame(): void {
       fogPass.lightIntensity[i] = 0;
     }
   }
+
+  // The hero reflects the world's light: sum the nearby glow at the orb and
+  // bleed a faint sheen of it onto the black core — teal in a grove, violet by
+  // a crystal, warm inside a ward. Soft reflection on one small object, so it
+  // stays occlusion-agnostic; the aura still carries the orb's own mood.
+  orbWorldLit.setRGB(0, 0, 0);
+  for (let i = 0; i < sorted.length && i < 10; i++) {
+    const e = sorted[i];
+    const fall = 1 - Math.sqrt(e.d) / 16;
+    if (fall <= 0) continue;
+    const w = e.l.intensity * fall * fall * tideDim;
+    orbWorldLit.r += e.l.color.r * w;
+    orbWorldLit.g += e.l.color.g * w;
+    orbWorldLit.b += e.l.color.b * w;
+  }
+  (orbCore.material as THREE.MeshPhysicalMaterial).emissive.copy(orbWorldLit).multiplyScalar(0.3);
 
   updateTrail(dt);
   updateSpores(dt, clock.elapsedTime);
