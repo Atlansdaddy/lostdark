@@ -20,6 +20,9 @@ const MAXL = Light.max;
 type QItem = { x: number; y: number; z: number; l: number };
 
 export class LightGrid {
+  /** Cached static emissive-voxel seeds for reflood() (invalidated on update). */
+  private staticSeeds: QItem[] | null = null;
+
   constructor(private world: VoxelWorld) {}
 
   /** True if any chunk needed re-flooding (renderer then knows to remesh). */
@@ -33,6 +36,8 @@ export class LightGrid {
     }
     if (!anyDirty) return false;
 
+    this.staticSeeds = null; // world changed — reflood()'s static cache is stale
+
     // Global re-flood. For the sandbox this is a handful of chunks; the
     // streaming version will scope this to the dirty region + a bleed margin.
     const queue: QItem[] = [];
@@ -44,6 +49,54 @@ export class LightGrid {
     this.propagate(queue);
     for (const c of this.world.chunks.values()) c.dirty = true;
     return true;
+  }
+
+  /**
+   * Re-flood from static emissive voxels PLUS dynamic point emitters (charged
+   * flora), to drive the sampled light volume so the world light responds to
+   * charge. Does NOT dirty or re-mesh chunks — it only refreshes chunk.light for
+   * the volume to read. Cheap: the dark bounds the BFS, and the static seeds are
+   * collected once and cached (update() invalidates them when the world changes).
+   */
+  reflood(emitters: readonly { x: number; y: number; z: number; level: number }[]): void {
+    if (!this.staticSeeds) {
+      const seeds: QItem[] = [];
+      for (const c of this.world.chunks.values()) {
+        for (let ly = 0; ly < CS; ly++) {
+          for (let lz = 0; lz < CS; lz++) {
+            for (let lx = 0; lx < CS; lx++) {
+              const em = MATERIALS[c.voxels[Chunk.index(lx, ly, lz)] as Mat].emission;
+              if (em > 0) {
+                seeds.push({ x: c.cx * CS + lx, y: c.cy * CS + ly, z: c.cz * CS + lz, l: em });
+              }
+            }
+          }
+        }
+      }
+      this.staticSeeds = seeds;
+    }
+
+    const queue: QItem[] = [];
+    for (const c of this.world.chunks.values()) c.light.fill(0);
+    for (const s of this.staticSeeds) this.seedAt(s.x, s.y, s.z, s.l, queue);
+    for (const e of emitters) {
+      if (e.level > 0) this.seedAt(e.x, e.y, e.z, Math.min(MAXL, Math.round(e.level)), queue);
+    }
+    this.propagate(queue);
+  }
+
+  /** Force a light level at a world voxel and queue it for propagation. */
+  private seedAt(x: number, y: number, z: number, level: number, queue: QItem[]): void {
+    const c = this.world.getChunk(Math.floor(x / CS), Math.floor(y / CS), Math.floor(z / CS));
+    if (!c) return;
+    const lx = ((x % CS) + CS) % CS;
+    const ly = ((y % CS) + CS) % CS;
+    const lz = ((z % CS) + CS) % CS;
+    const i = Chunk.index(lx, ly, lz);
+    if (level > c.light[i]) {
+      c.light[i] = level;
+      queue.push({ x, y, z, l: level });
+    }
   }
 
   private seedChunk(c: Chunk, queue: QItem[]): void {
@@ -111,6 +164,34 @@ export class LightGrid {
       Math.floor(y / CS),
       Math.floor(z / CS),
     );
+    if (!c) return 0;
+    const lx = ((x % CS) + CS) % CS;
+    const ly = ((y % CS) + CS) % CS;
+    const lz = ((z % CS) + CS) % CS;
+    return c.light[Chunk.index(lx, ly, lz)];
+  }
+
+  private fastChunk: Chunk | null = null;
+  private fastGX = NaN;
+  private fastGY = NaN;
+  private fastGZ = NaN;
+
+  /** Like sample() but caches the last chunk — fast for the spatially-coherent
+   *  sweep that repacks the light volume (avoids a map lookup per texel). */
+  sampleFast(x: number, y: number, z: number): number {
+    x = Math.floor(x);
+    y = Math.floor(y);
+    z = Math.floor(z);
+    const gx = Math.floor(x / CS);
+    const gy = Math.floor(y / CS);
+    const gz = Math.floor(z / CS);
+    if (gx !== this.fastGX || gy !== this.fastGY || gz !== this.fastGZ) {
+      this.fastChunk = this.world.getChunk(gx, gy, gz) ?? null;
+      this.fastGX = gx;
+      this.fastGY = gy;
+      this.fastGZ = gz;
+    }
+    const c = this.fastChunk;
     if (!c) return 0;
     const lx = ((x % CS) + CS) % CS;
     const ly = ((y % CS) + CS) % CS;

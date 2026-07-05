@@ -153,7 +153,14 @@ const clock = new THREE.Clock();
 
 let spores = 0;
 let objective = 'Awaken in The Reek';
-let tide = 0;
+// The Dark Tide runs on a timeline, not a quick swell: blackness sweeps IN
+// from far to close (onset), holds total black for a long dread (sustain),
+// then lifts (release). tideT is seconds since it began, −1 when none runs.
+let tideT = -1;
+const TIDE_ONSET = 7; // s — the dark rolls in from the horizon, closing inward
+const TIDE_SUSTAIN = 16; // s — held near-total black; the world is swallowed
+const TIDE_RELEASE = 6; // s — the world breathes back to its dim night
+const TIDE_TOTAL = TIDE_ONSET + TIDE_SUSTAIN + TIDE_RELEASE;
 let pulseRadius = -1;
 let pulseActive = false;
 let pulseCenter = new THREE.Vector3();
@@ -975,8 +982,38 @@ const barkMat = new THREE.MeshStandardMaterial({
   envMapIntensity: 0.1,
 });
 // Leaf cards (canopy mode A): a small double-sided frond, shared across trees.
-const leafGeo = new THREE.PlaneGeometry(0.62, 0.92);
-leafGeo.translate(0, 0.46, 0); // pivot at the stem end so it flutters about its base
+// A real leaf, not a billboard: a lance blade tapering to a point with a raised
+// MIDRIB crease, so the surface folds down its length and catches light from any
+// angle instead of going edge-on to a paper sliver. Pivot at the stem (y=0).
+function makeLeafGeometry(): THREE.BufferGeometry {
+  const stations = [0, 0.14, 0.3, 0.47, 0.64, 0.82, 1];
+  const L = 1.0;
+  const W = 0.26; // half-width at the widest
+  const ridge = 0.5; // how far the midrib lifts out of the blade plane
+  const curl = 0.18; // lengthwise curl toward the tip
+  const pos: number[] = [];
+  for (const t of stations) {
+    const y = t * L;
+    const w = W * Math.sin(Math.PI * Math.min(0.999, Math.max(0.001, t))); // lance taper
+    const zc = curl * t * t; // the whole blade curls forward toward the tip
+    pos.push(-w, y, zc); // left edge
+    pos.push(0, y, zc + ridge * w); // midrib ridge (lifted)
+    pos.push(w, y, zc); // right edge
+  }
+  const idx: number[] = [];
+  for (let s = 0; s < stations.length - 1; s++) {
+    const a = s * 3;
+    const b = (s + 1) * 3;
+    idx.push(a, a + 1, b, b, a + 1, b + 1); // left half-panel
+    idx.push(a + 1, a + 2, b + 1, b + 1, a + 2, b + 2); // right half-panel
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  geo.setIndex(idx);
+  geo.computeVertexNormals();
+  return geo;
+}
+const leafGeo = makeLeafGeometry();
 const leafMat = new THREE.MeshStandardMaterial({
   color: 0x1c3a26,
   emissive: 0x1a7a4a, // faint phosphor-green so fronds read in the gloom
@@ -1113,6 +1150,7 @@ function makeSporeTree(x: number, y: number, z: number, h: number): void {
   leafInst.frustumCulled = false;
   const _lm = new THREE.Matrix4();
   const _lq = new THREE.Quaternion();
+  const _lqRoll = new THREE.Quaternion();
   const _lp = new THREE.Vector3();
   const _ldir = new THREE.Vector3();
   const _lup = new THREE.Vector3(0, 1, 0);
@@ -1139,6 +1177,9 @@ function makeSporeTree(x: number, y: number, z: number, h: number): void {
     leafBase[i * 7 + 6] = a * 1.7; // per-leaf flutter phase
     _lp.set(px, yb, pz);
     _lq.setFromUnitVectors(_lup, _ldir);
+    // Static per-leaf twist about the stem so fronds aren't co-planar cards.
+    _lqRoll.setFromAxisAngle(_lup, Math.sin(a * 1.7 * 0.7) * 1.0);
+    _lq.multiply(_lqRoll);
     _lm.compose(_lp, _lq, _lone);
     leafInst.setMatrixAt(i, _lm);
   }
@@ -1536,6 +1577,46 @@ console.info(
     ` (${lightVol.dim.x}x${lightVol.dim.y}x${lightVol.dim.z} voxels)`,
 );
 
+// Flora were built as standard materials lit by the RoomEnvironment IBL, so
+// they glowed in the open dark (trees/caps visible everywhere). Strip the
+// environment off every flora material — now they're BLACK until a real light
+// (the orb, and next the volume) reaches them; their own bioluminescent
+// emissive still shows. Done as a post-creation sweep so the flora factory
+// functions (the other window's domain) are left untouched.
+for (const f of floraCull) {
+  f.group.traverse((o) => {
+    const mesh = o as THREE.Mesh;
+    const mat = mesh.material as THREE.MeshStandardMaterial | undefined;
+    if (mat && 'envMapIntensity' in mat) mat.envMapIntensity = 0;
+  });
+}
+
+// Dynamic light: a few times a second, re-flood the grid using the charged caps
+// as extra light sources and repack the volume — so the world light brightens
+// where flora are charged and fades as they decay, all occlusion-shaped. Only
+// runs while the volume is actually in use (toggle on), so it costs nothing off.
+let lightVolTimer = 0;
+const chargedEmitters: { x: number; y: number; z: number; level: number }[] = [];
+function updateLightVolume(dt: number): void {
+  if (uniforms.uLightVolMix.value <= 0) return;
+  lightVolTimer += dt;
+  if (lightVolTimer < 0.3) return;
+  lightVolTimer = 0;
+  chargedEmitters.length = 0;
+  for (const s of shrooms) {
+    if (s.charge > 0.12) {
+      chargedEmitters.push({
+        x: Math.round(s.pos.x),
+        y: Math.round(s.pos.y),
+        z: Math.round(s.pos.z),
+        level: Math.round(4 + s.charge * 10),
+      });
+    }
+  }
+  lightGrid.reflood(chargedEmitters);
+  lightVol.rebuild((x, y, z) => lightGrid.sampleFast(x, y, z));
+}
+
 // Grass builds AFTER the light flood so each tuft bakes its held light.
 const grassField = new GrassField();
 for (const [gx0, gy0, gz0] of grassSpots) {
@@ -1545,6 +1626,24 @@ const bladeCount = grassField.build(scene);
 console.info(`[grass] ${bladeCount} blades`);
 orb.spawn(reek.spawn[0], reek.spawn[1], reek.spawn[2]);
 if (boot) boot.remove();
+
+// Dev handle: inspect/teleport for tuning flora up close.
+(window as unknown as { waiver: unknown }).waiver = {
+  orb,
+  camera,
+  scene,
+  treeFlora,
+  shroomFlora,
+  strandRopes,
+  /** Warp the orb next to a tree so its canopy fills the view. */
+  toTree(i = 0) {
+    const t = treeFlora[i];
+    if (!t) return 'no tree';
+    orb.pos.set(t.anchor.x + 6, t.anchor.y + 9, t.anchor.z + 6);
+    orb.vel.set(0, 0, 0);
+    return t.anchor.toArray();
+  },
+};
 
 function box(x: number, y: number, z: number, w: number, h: number, d: number, m: Mat): void {
   for (let ix = x; ix < x + w; ix++) {
@@ -1624,7 +1723,7 @@ function placeWard(): void {
 }
 
 function startTide(): void {
-  tide = 1;
+  tideT = 0; // begin the timeline — onset → sustain → release
   mood.event('fear'); // heard-before-seen — the orb goes cold before you do
   objective = 'The first Dark Tide is here. Stay near held light.';
 }
@@ -1799,38 +1898,57 @@ function frame(): void {
     pulseShell.visible = false;
   }
 
-  if (tide > 0) {
-    tide = Math.max(0, tide - dt * 0.08);
-    mood.setThreat(Math.sin(Math.min(1, tide) * Math.PI)); // sustained dread
+  // --- The Dark Tide envelope: darkness sweeps in from far to close (onset),
+  // holds total black (sustain), then lifts (release). tidePress is the 0→1→0
+  // darkness level; every tide effect rides it so they black out as one wave.
+  let tidePress = 0;
+  if (tideT >= 0) {
+    tideT += dt;
+    if (tideT >= TIDE_TOTAL) {
+      tideT = -1; // the tide has passed
+    } else if (tideT < TIDE_ONSET) {
+      const u = tideT / TIDE_ONSET; // 0→1: the dark rolls in
+      tidePress = u * u * (3 - 2 * u); // smoothstep
+    } else if (tideT < TIDE_ONSET + TIDE_SUSTAIN) {
+      tidePress = 1; // total black, held — the long dread
+    } else {
+      const u = (tideT - TIDE_ONSET - TIDE_SUSTAIN) / TIDE_RELEASE; // 0→1
+      tidePress = 1 - u * u * (3 - 2 * u); // smoothstep back to night
+    }
+  }
+  const tideActive = tideT >= 0;
+
+  if (tideActive) {
+    mood.setThreat(tidePress); // sustained dread rides the darkness
     const protectedByWard = nearestWardDistance() < WARD_RADIUS;
     if (!protectedByWard) {
-      orb.lumen = Math.max(0, orb.lumen - dt * 10);
+      orb.lumen = Math.max(0, orb.lumen - dt * 10 * tidePress);
       objective = 'The dark drains fast away from held light.';
-    } else if (tide < 0.35) {
+    } else if (tideT > TIDE_ONSET + TIDE_SUSTAIN) {
       objective = 'The tide breaks against the ward. The loop is alive.';
     }
   } else {
     orb.lumen = Math.min(100, orb.lumen + dt * (nearestWardDistance() < WARD_RADIUS ? 8 : 2));
   }
 
-  // A single 0→1→0 swell for the whole tide: silent at the edges, peak dark at
-  // mid-tide. Every tide effect — sky, air, ambient, phosphor drain — rides it,
-  // so the world blacks out and lifts back together.
-  const tidePress = tide > 0 ? Math.sin(Math.min(1, tide) * Math.PI) : 0;
-
-  // The Dark Tide brings total blackness: the dark swallows EVERYTHING outside
-  // held light. uTideDark drives the baked world light + ambient toward zero;
-  // the orb's carried bubble and placed wards are the only things that survive.
-  uniforms.uTideDark.value = 1 - 0.98 * tidePress;
+  // Total blackness outside held light. uTideDark drives the baked world light
+  // + ambient to near-zero; the orb's carried bubble and placed wards are the
+  // ONLY terrain light that survives — everything else goes black.
+  uniforms.uTideDark.value = 1 - 0.995 * tidePress;
   uniforms.uWardCount.value = Math.min(wards.length, uniforms.uWardPos.value.length);
   for (let i = 0; i < uniforms.uWardCount.value; i++) {
     uniforms.uWardPos.value[i].copy(wards[i].pos);
   }
-  // The flora (trees, shrooms — MeshStandardMaterials) are lit globally by the
-  // room-environment image. That's what keeps distant groves visible, so the
-  // tide has to kill it too: with the env gone, only the orb's PointLight and
-  // the ward lights reach the flora — everything beyond them drops to black.
+  // Flora (trees, shrooms) are lit globally by the room-environment image —
+  // kill it and only the orb + ward point lights reach them.
   scene.environmentIntensity = uniforms.uTideDark.value;
+  // The fog thickens and blackens as the tide rolls in, dissolving DISTANT
+  // flora into the dark first — this is the wave you watch consume the horizon
+  // and close toward your immediate sphere of light. At peak it's a tight,
+  // near-black shroud: nothing beyond the orb's own pool survives.
+  const tideFog = scene.fog as THREE.FogExp2;
+  tideFog.density = 0.024 + 0.085 * tidePress; // calm 0.024 → tight ~0.11
+  tideFog.color.setRGB(0.02 * (1 - tidePress), 0.031 * (1 - tidePress), 0.039 * (1 - tidePress));
 
   // --- Phosphorescence: glowcaps charge under light, glow as they fade. ---
   // Orb proximity trickle-charges; the PULSE charges hard as its shell passes
@@ -1874,10 +1992,9 @@ function frame(): void {
     // The dome breathes faintly; when a tide presses and you shelter inside,
     // it flares — you SEE the ward holding the dark off.
     const domeMat = ward.dome.material as THREE.MeshBasicMaterial;
-    const sheltering = tide > 0 && ward.pos.distanceTo(orb.pos) < WARD_RADIUS;
-    const press = tide > 0 ? Math.sin(Math.min(1, tide) * Math.PI) : 0;
+    const sheltering = tideActive && ward.pos.distanceTo(orb.pos) < WARD_RADIUS;
     domeMat.opacity = sheltering
-      ? 0.1 + 0.1 * press + 0.03 * Math.sin(clock.elapsedTime * 6)
+      ? 0.1 + 0.1 * tidePress + 0.03 * Math.sin(clock.elapsedTime * 6)
       : 0.03 + 0.02 * breathe;
   }
 
@@ -2336,7 +2453,8 @@ function frame(): void {
       for (let i = 0; i < tree.leafCount; i++) {
         const b = i * 7;
         const ph = lb[b + 6];
-        const flick = Math.sin(time * 3.2 + ph) * 0.22 + pulseSwell * 0.6;
+        // Static per-leaf twist (so fronds aren't co-planar) + flutter + pulse.
+        const flick = Math.sin(ph * 0.7) * 1.0 + Math.sin(time * 3.2 + ph) * 0.22 + pulseSwell * 0.6;
         const pop = pulseSwell * 0.5;
         // Position: base point, popped outward along its normal by the pulse.
         _tLeafP.set(lb[b] + lb[b + 3] * pop, lb[b + 1] + lb[b + 4] * pop, lb[b + 2] + lb[b + 5] * pop);
@@ -2498,6 +2616,7 @@ function frame(): void {
     }
   }
   updateFloraCulling();
+  updateLightVolume(dt);
   updateCamera(dt);
   updateHud();
   renderer.info.reset();
