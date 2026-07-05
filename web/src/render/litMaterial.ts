@@ -36,6 +36,14 @@ export interface LitUniforms {
   /** Moonlight: direction + strength (0 when clouds cover the moon). */
   uMoonDir: { value: THREE.Vector3 };
   uMoonI: { value: number };
+  // --- Dark Tide: the dark swallows everything outside held light. uTideDark
+  // (1 = normal, →0 = total black) dims the baked "held" world light; placed
+  // wards are re-added as explicit lights that emerge exactly as it dies. ---
+  uTideDark: { value: number };
+  uWardCount: { value: number };
+  uWardPos: { value: THREE.Vector3[] };
+  uWardColor: { value: THREE.Color };
+  uWardRadius: { value: number };
   // --- Sampled light volume (LightVolume 2D atlas). uLightVolMix blends it
   // against the per-vertex baked light: 0 = today's look, 1 = volume-driven. ---
   uLightAtlas: { value: THREE.Texture | null };
@@ -61,6 +69,12 @@ export function createLitMaterial(): { material: THREE.ShaderMaterial; uniforms:
     uVoxelDetail: { value: 1 }, // blocky terrain default — full voxel texturing
     uMoonDir: { value: new THREE.Vector3(0.3, 0.8, 0.2).normalize() },
     uMoonI: { value: 0 },
+    uTideDark: { value: 1 }, // 1 = normal night; the tide drives it toward 0
+    uWardCount: { value: 0 },
+    uWardPos: { value: Array.from({ length: 12 }, () => new THREE.Vector3()) },
+    uWardColor: { value: new THREE.Color(0.5, 1.0, 0.82) }, // ward teal
+    uWardRadius: { value: 15 }, // soft glow that fills the ward's dome
+
     uLightAtlas: { value: null },
     uLightMin: { value: new THREE.Vector3(-128, -14, -128) },
     uLightStep: { value: 2 },
@@ -107,6 +121,14 @@ export function createLitMaterial(): { material: THREE.ShaderMaterial; uniforms:
       uniform float uVoxelDetail;
       uniform vec3 uMoonDir;
       uniform float uMoonI;
+
+      // Dark Tide: baked light dims toward black; wards persist as point lights.
+      #define MAX_WARDS 12
+      uniform float uTideDark;
+      uniform int uWardCount;
+      uniform vec3 uWardPos[MAX_WARDS];
+      uniform vec3 uWardColor;
+      uniform float uWardRadius;
 
       // Sampled light volume (2D atlas of the flood-fill; see LightVolume.ts).
       uniform sampler2D uLightAtlas;
@@ -298,10 +320,32 @@ export function createLitMaterial(): { material: THREE.ShaderMaterial; uniforms:
           volHeld = volHeld * volHeld * 1.6;
           held = mix(held, volHeld, uLightVolMix);
         }
+        // Dark Tide: the dark swallows the baked "held" world light — groves,
+        // ambient glow, everything — leaving only what you carry or have warded.
+        held *= uTideDark;
         vec3 dyn = (bubble + pulse) * uOrbColor * vAO;
 
-        vec3 lit = albedo * (uAmbient * sky * vAO) + albedo * held * uHeldColor
-                 + albedo * dyn;
+        // Placed wards hold their circle of light against the tide. They emerge
+        // as explicit point lights exactly as the baked light dies (1 - uTideDark),
+        // so there's no double-lighting on a calm night — only during the dark.
+        vec3 wardLit = vec3(0.0);
+        float wardKeep = 1.0 - uTideDark;
+        if (wardKeep > 0.001) {
+          float wsum = 0.0;
+          for (int i = 0; i < MAX_WARDS; i++) {
+            if (i >= uWardCount) break;
+            float wd = distance(vWorld, uWardPos[i]);
+            float wb = 1.0 - clamp(wd / uWardRadius, 0.0, 1.0);
+            wb = wb * wb;
+            vec3 toW = normalize(uWardPos[i] - vWorld + 1e-4);
+            float wf = 0.45 + 0.55 * clamp(dot(bumpN, toW), 0.0, 1.0);
+            wsum += wb * wf;
+          }
+          wardLit = albedo * wsum * uWardColor * vAO * wardKeep;
+        }
+
+        vec3 lit = albedo * (uAmbient * sky * vAO) * uTideDark + albedo * held * uHeldColor
+                 + albedo * dyn + wardLit;
 
         // Subtle emissive rim (ART.md §1.3, locked "subtle"): where a LIT
         // surface silhouettes against the dark, its edge catches a faint

@@ -51,6 +51,8 @@ export class SkyDome {
     uMoonDir: { value: new THREE.Vector3(0.3, 0.6, 0.2).normalize() },
     uBiteDir: { value: new THREE.Vector3(0.3, 0.6, 0.2).normalize() },
     uMoonBright: { value: 1.0 },
+    // Dark Tide: 1 = normal night, →0 = the sky itself is smothered black.
+    uDark: { value: 1.0 },
   };
 
   constructor() {
@@ -73,6 +75,7 @@ export class SkyDome {
         uniform vec3 uMoonDir;
         uniform vec3 uBiteDir;
         uniform float uMoonBright;
+        uniform float uDark;
         varying vec3 vDir;
 
         float hash21(vec2 p) {
@@ -161,6 +164,9 @@ export class SkyDome {
           vec3 moon = moonCol * (moonFace * 2.2 + halo) * moonVis;
 
           vec3 col = mix(sky + stars, cloudCol, cover) + moon;
+          // The Dark Tide smothers the whole vault — stars, clouds, and moon
+          // all sink toward black as the tide swells.
+          col *= uDark;
           gl_FragColor = vec4(col, 1.0);
         }
       `,
@@ -171,9 +177,16 @@ export class SkyDome {
     this.mesh.layers.set(1); // skipped by the depth prepass
   }
 
-  update(t: number, camPos: THREE.Vector3, moonDir: THREE.Vector3, phase: number): void {
+  update(
+    t: number,
+    camPos: THREE.Vector3,
+    moonDir: THREE.Vector3,
+    phase: number,
+    dark = 1,
+  ): void {
     this.mesh.position.copy(camPos); // the sky never parallaxes
     this.uniforms.uTime.value = t;
+    this.uniforms.uDark.value = dark;
     this.uniforms.uMoonDir.value.copy(moonDir);
     // Phase: a dark disc slides across the face. 0 = new, 0.5 = full, 1 = new.
     const bite = Math.cos(phase * Math.PI * 2); // 1 covered … -1 clear

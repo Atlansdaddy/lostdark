@@ -975,13 +975,13 @@ const barkMat = new THREE.MeshStandardMaterial({
   envMapIntensity: 0.1,
 });
 // Leaf cards (canopy mode A): a small double-sided frond, shared across trees.
-const leafGeo = new THREE.PlaneGeometry(0.5, 0.72);
-leafGeo.translate(0, 0.36, 0); // pivot at the stem end so it flutters about its base
+const leafGeo = new THREE.PlaneGeometry(0.62, 0.92);
+leafGeo.translate(0, 0.46, 0); // pivot at the stem end so it flutters about its base
 const leafMat = new THREE.MeshStandardMaterial({
-  color: 0x142a1e,
-  emissive: 0x0a1f14,
-  emissiveIntensity: 0.15,
-  roughness: 0.85,
+  color: 0x1c3a26,
+  emissive: 0x1a7a4a, // faint phosphor-green so fronds read in the gloom
+  emissiveIntensity: 0.32,
+  roughness: 0.8,
   metalness: 0,
   side: THREE.DoubleSide,
   envMapIntensity: 0.05,
@@ -1107,32 +1107,39 @@ function makeSporeTree(x: number, y: number, z: number, h: number): void {
 
   // Leaf cards (mode A): scattered fronds over the canopy volume, one instanced
   // draw. Hidden until you flip to leaf mode with L.
-  const leafCount = 22;
+  const leafCount = 44;
   const leafBase = new Float32Array(leafCount * 7);
   const leafInst = new THREE.InstancedMesh(leafGeo, leafMat, leafCount);
   leafInst.frustumCulled = false;
   const _lm = new THREE.Matrix4();
   const _lq = new THREE.Quaternion();
   const _lp = new THREE.Vector3();
+  const _ldir = new THREE.Vector3();
   const _lup = new THREE.Vector3(0, 1, 0);
+  const _lone = new THREE.Vector3(1, 1, 1);
+  const canopyShell = 2.5 + tseed * 0.8; // sit fronds ON the foliage surface
   for (let i = 0; i < leafCount; i++) {
-    // A point roughly on the canopy shell, biased outward and downward.
-    const a = i * 2.399963 + tseed * 6.2; // golden-angle spread
-    const yb = Math.cos((i / leafCount) * Math.PI * 0.9) * 1.2 - 0.4;
-    const rr = 1.7 + tseed * 0.9;
-    const px = Math.cos(a) * rr * 0.7;
-    const pz = Math.sin(a) * rr * 0.7;
-    const nlen = Math.hypot(px, yb + 0.2, pz) || 1;
+    // Fibonacci-sphere point so fronds wrap the whole canopy, then bias down a
+    // touch (fronds droop) and jitter the radius so it isn't a clean shell.
+    const yUnit = 1 - (i + 0.5) / leafCount * 1.7; // 1 → -0.7 (mostly upper half)
+    const rad = Math.sqrt(Math.max(0, 1 - yUnit * yUnit));
+    const a = i * 2.399963 + tseed * 6.2; // golden angle
+    const jitter = 0.85 + 0.3 * Math.abs(Math.sin(a * 3.1));
+    const rr = canopyShell * jitter;
+    const px = Math.cos(a) * rad * rr;
+    const yb = yUnit * rr - 0.5;
+    const pz = Math.sin(a) * rad * rr;
+    _ldir.set(px, yb + 0.6, pz).normalize(); // outward+slightly up = frond facing
     leafBase[i * 7] = px;
     leafBase[i * 7 + 1] = yb;
     leafBase[i * 7 + 2] = pz;
-    leafBase[i * 7 + 3] = px / nlen;
-    leafBase[i * 7 + 4] = (yb + 0.2) / nlen;
-    leafBase[i * 7 + 5] = pz / nlen;
+    leafBase[i * 7 + 3] = _ldir.x;
+    leafBase[i * 7 + 4] = _ldir.y;
+    leafBase[i * 7 + 5] = _ldir.z;
     leafBase[i * 7 + 6] = a * 1.7; // per-leaf flutter phase
     _lp.set(px, yb, pz);
-    _lq.setFromUnitVectors(_lup, _lp.clone().normalize());
-    _lm.compose(_lp, _lq, new THREE.Vector3(1, 1, 1));
+    _lq.setFromUnitVectors(_lup, _ldir);
+    _lm.compose(_lp, _lq, _lone);
     leafInst.setMatrixAt(i, _lm);
   }
   leafInst.instanceMatrix.needsUpdate = true;
@@ -1806,6 +1813,25 @@ function frame(): void {
     orb.lumen = Math.min(100, orb.lumen + dt * (nearestWardDistance() < WARD_RADIUS ? 8 : 2));
   }
 
+  // A single 0→1→0 swell for the whole tide: silent at the edges, peak dark at
+  // mid-tide. Every tide effect — sky, air, ambient, phosphor drain — rides it,
+  // so the world blacks out and lifts back together.
+  const tidePress = tide > 0 ? Math.sin(Math.min(1, tide) * Math.PI) : 0;
+
+  // The Dark Tide brings total blackness: the dark swallows EVERYTHING outside
+  // held light. uTideDark drives the baked world light + ambient toward zero;
+  // the orb's carried bubble and placed wards are the only things that survive.
+  uniforms.uTideDark.value = 1 - 0.98 * tidePress;
+  uniforms.uWardCount.value = Math.min(wards.length, uniforms.uWardPos.value.length);
+  for (let i = 0; i < uniforms.uWardCount.value; i++) {
+    uniforms.uWardPos.value[i].copy(wards[i].pos);
+  }
+  // The flora (trees, shrooms — MeshStandardMaterials) are lit globally by the
+  // room-environment image. That's what keeps distant groves visible, so the
+  // tide has to kill it too: with the env gone, only the orb's PointLight and
+  // the ward lights reach the flora — everything beyond them drops to black.
+  scene.environmentIntensity = uniforms.uTideDark.value;
+
   // --- Phosphorescence: glowcaps charge under light, glow as they fade. ---
   // Orb proximity trickle-charges; the PULSE charges hard as its shell passes
   // — so pulsing through a grove paints a lit path to travel by.
@@ -1818,9 +1844,11 @@ function frame(): void {
     }
     // Held light keeps flora charged: inside a ward's dome, caps stay topped up
     // (a ward is permanent light, so its grove is always lit).
+    let insideWard = false;
     for (const ward of wards) {
       if (s.pos.distanceToSquared(ward.pos) < WARD_RADIUS * WARD_RADIUS) {
         s.charge += dt * 0.6;
+        insideWard = true;
         break;
       }
     }
@@ -1829,7 +1857,11 @@ function frame(): void {
     // sliver does. (Cave caps, below the sky, get none.)
     if (s.pos.y > -4) s.charge += dt * moonI * 0.01;
     if (s.charge > 1) s.charge = 1;
-    s.charge *= Math.exp(-dt / 30); // ~30s afterglow, like real phosphor paint
+    // Afterglow ~30s normally. The Dark Tide leaches stored light far faster —
+    // charged caps gutter out — but NOT inside a ward: there the darkness can't
+    // reach, so the tide doesn't corrupt and the grove keeps its glow.
+    const leech = insideWard ? 1 : 1 + 5 * tidePress; // up to ~5s afterglow at peak
+    s.charge *= Math.exp((-dt / 30) * leech); // ~30s afterglow, like phosphor paint
     s.capMat.emissiveIntensity = 0.05 + s.charge * 0.85;
     s.gillMat.emissiveIntensity = 0.04 + s.charge * 0.6;
     fogLightRegistry[s.fogIdx].intensity = 0.04 + s.charge * 0.65;
@@ -1856,8 +1888,11 @@ function frame(): void {
   uniforms.uPulseRadius.value = pulseActive ? pulseRadius : -1;
   uniforms.uPulseIntensity.value = pulseActive ? LightConfig.pulse.intensity : 0;
 
+  // A soft dark tint closing in with the tide. Kept gentle now that the world
+  // itself blacks out through lighting — enough to press, not to smother the
+  // orb's own bubble (the refuge must stay legible).
   const veilMaterial = tideVeil.material as THREE.MeshBasicMaterial;
-  veilMaterial.opacity = tide > 0 ? 0.48 * Math.sin(tide * Math.PI) : 0;
+  veilMaterial.opacity = 0.22 * tidePress;
   tideVeil.position.copy(orb.pos);
 
   // --- The sky: moon orbits slowly, phases over ~8 min, and its light only
@@ -1867,12 +1902,15 @@ function frame(): void {
   const el = 0.55 + 0.3 * Math.sin(skyT * 0.004);
   moonDir.set(Math.cos(az) * Math.cos(el), Math.sin(el), Math.sin(az) * Math.cos(el)).normalize();
   const moonPhase = (skyT / 480) % 1; // full cycle every 8 minutes
-  sky.update(skyT, camera.position, moonDir, moonPhase);
+  // The Dark Tide smothers the whole vault — stars, clouds, and moon sink
+  // toward black. The sky is global, so nothing shelters it: this is the tide
+  // you SEE coming, above the ward's circle of held light.
+  const skyDark = 1 - 0.98 * tidePress;
+  sky.update(skyT, camera.position, moonDir, moonPhase, skyDark);
   const phaseBright = 0.25 + 0.75 * (0.5 - 0.5 * Math.cos(moonPhase * Math.PI * 2));
   const moonClear = 1 - cloudCoverAt(moonDir, skyT);
-  // The Dark Tide smothers even the moon — the sky itself goes hostile.
-  const moonTarget =
-    moonClear * phaseBright * 0.42 * (tide > 0 ? 1 - 0.85 * Math.sin(Math.min(1, tide) * Math.PI) : 1);
+  // The moon's light on the world dies with the sky — near-total at peak tide.
+  const moonTarget = moonClear * phaseBright * 0.42 * (1 - 0.97 * tidePress);
   moonI += (moonTarget - moonI) * Math.min(1, dt * 0.8); // clouds drift, light eases
   uniforms.uMoonDir.value.copy(moonDir);
   uniforms.uMoonI.value = moonI;
@@ -1897,10 +1935,13 @@ function frame(): void {
   // tide the mist itself recoils — the air dims with the world. And when a
   // pulse fires, the whole atmosphere blooms for a breath.
   fogPass.setBoost(1 + 0.45 * pulseFlash); // a breath of bloom, not a floodlight
-  const tideDim = tide > 0 ? 1 - 0.7 * Math.sin(tide * Math.PI) : 1;
+  // The mist recoils with the world — the lit air goes near-black at peak tide.
+  const tideDim = 1 - 0.9 * tidePress;
   fogPass.lightPos[0].copy(orb.pos);
   fogPass.lightColor[0].copy(mood.color); // even the air takes the orb's mood
-  fogPass.lightIntensity[0] = 1.15 * orb.breathGlow * flashBoost * tideDim * mood.brightness;
+  // The orb's own air-glow is NOT dimmed by the tide — it's the carried light
+  // the dark can't swallow; its bubble stays bright while the world goes black.
+  fogPass.lightIntensity[0] = 1.15 * orb.breathGlow * flashBoost * mood.brightness;
   const sorted = fogLightRegistry
     .map((l) => ({ l, d: l.pos.distanceToSquared(orb.pos) }))
     .sort((a, b) => a.d - b.d);
@@ -2083,11 +2124,18 @@ function frame(): void {
   const TREE_MAXSTEP = 0.4;
   const TREE_CONTACT = 0.5 + ORB_HALO_RADIUS; // trunk collider + glow shell
   const TREE_PULSE_ACC = 150 * (LightConfig.pulse.intensity / 0.8);
+  // Boughs = the crown's own springy mass (second hitbox): softer + swingier
+  // than the trunk, so brushing the foliage sways it on its own.
+  const CROWN_STIFF = 4; // loose — the boughs swing freely
+  const CROWN_DAMP = 0.35; // barely damped → long, lazy sway before it settles
+  const CROWN_MAX = 1.7;
   const tdtc = dt < 1 / 60 ? dt : 1 / 60;
   const tdt2 = tdtc * tdtc;
   const _tCur = new THREE.Vector3();
   const _tRest = new THREE.Vector3();
   const _tQuat = new THREE.Quaternion();
+  const _tWobQ = new THREE.Quaternion();
+  const _tWobEuler = new THREE.Euler();
   const _tLeafM = new THREE.Matrix4();
   const _tLeafQ = new THREE.Quaternion();
   const _tFlutterQ = new THREE.Quaternion();
@@ -2214,13 +2262,60 @@ function frame(): void {
 
     updateRopeTube({ nodes, n, radii, radial, tubePos: tree.tubePos, tubeNrm: tree.tubeNrm });
 
-    // Crown rides the top node — position + a tilt matching the crown's bend.
-    tree.crown.position.set(nodes[last * 3], nodes[last * 3 + 1], nodes[last * 3 + 2]);
-    _tCur.set(
-      nodes[last * 3] - nodes[(last - 1) * 3],
-      nodes[last * 3 + 1] - nodes[(last - 1) * 3 + 1],
-      nodes[last * 3 + 2] - nodes[(last - 1) * 3 + 2],
-    );
+    // --- BOUGHS: the crown is its own hitbox. It rides the top trunk node but
+    // ALSO carries a softer, swingier spring, so a brush of the foliage (or the
+    // pulse washing the canopy) sways the boughs independently of the trunk.
+    const topX = nodes[last * 3];
+    const topY = nodes[last * 3 + 1];
+    const topZ = nodes[last * 3 + 2];
+    const crownWX = tree.anchor.x + topX;
+    const crownWY = tree.anchor.y + topY;
+    const crownWZ = tree.anchor.z + topZ;
+    let tcwx = 0; // crown-wobble target
+    let tcwz = 0;
+    let pulseSwell = 0;
+    // Orb brushing the boughs (their own hitbox radius) shoves them aside.
+    const cbx = orb.pos.x - crownWX;
+    const cby = orb.pos.y - crownWY;
+    const cbz = orb.pos.z - crownWZ;
+    const cbR = ORB_HALO_RADIUS + tree.canopyR;
+    const cb2 = cbx * cbx + cby * cby + cbz * cbz;
+    if (cb2 < cbR * cbR) {
+      const cbd = Math.sqrt(cb2) || 1e-3;
+      const pen = cbR - cbd;
+      tcwx += (-cbx / cbd) * pen;
+      tcwz += (-cbz / cbd) * pen;
+    }
+    // Pulse washing the canopy → sway outward + feed the foliage ripple/flutter.
+    if (pulseActive) {
+      const dC = Math.hypot(crownWX - pulseCenter.x, crownWY - pulseCenter.y, crownWZ - pulseCenter.z);
+      const band = LightConfig.pulse.thickness + 3;
+      const shell = Math.abs(dC - pulseRadius);
+      if (shell < band) {
+        pulseSwell = 1 - shell / band;
+        const rx = crownWX - pulseCenter.x;
+        const rz = crownWZ - pulseCenter.z;
+        const rl = Math.hypot(rx, rz) || 1e-3;
+        tcwx += (rx / rl) * pulseSwell * pulseFalloff * 1.4;
+        tcwz += (rz / rl) * pulseSwell * pulseFalloff * 1.4;
+      }
+    }
+    // Soft, underdamped crown spring — the boughs swing and settle on their own.
+    tree.cwvx += ((tcwx - tree.cwx) * CROWN_STIFF - tree.cwvx * CROWN_DAMP) * tdtc;
+    tree.cwvz += ((tcwz - tree.cwz) * CROWN_STIFF - tree.cwvz * CROWN_DAMP) * tdtc;
+    tree.cwx += tree.cwvx * tdtc;
+    tree.cwz += tree.cwvz * tdtc;
+    const cwl = Math.hypot(tree.cwx, tree.cwz);
+    if (cwl > CROWN_MAX) {
+      const c = CROWN_MAX / cwl;
+      tree.cwx *= c;
+      tree.cwz *= c;
+    }
+
+    // Crown transform: follow the top node + wobble offset; tilt = trunk bend +
+    // a lean from the wobble so the boughs read as a hinged, swinging mass.
+    tree.crown.position.set(topX + tree.cwx, topY, topZ + tree.cwz);
+    _tCur.set(topX - nodes[(last - 1) * 3], topY - nodes[(last - 1) * 3 + 1], topZ - nodes[(last - 1) * 3 + 2]);
     _tRest.set(
       rest[last * 3] - rest[(last - 1) * 3],
       rest[last * 3 + 1] - rest[(last - 1) * 3 + 1],
@@ -2228,21 +2323,12 @@ function frame(): void {
     );
     if (_tCur.lengthSq() > 1e-9 && _tRest.lengthSq() > 1e-9) {
       _tQuat.setFromUnitVectors(_tRest.normalize(), _tCur.normalize());
-      tree.crown.quaternion.copy(_tQuat);
+    } else {
+      _tQuat.identity();
     }
-
-    // Canopy: leaf cards flutter (mode A) OR the blob surface ripples (mode B),
-    // both driven by the pulse (plus a little ambient life on the leaves).
-    const crownWX = tree.anchor.x + nodes[last * 3];
-    const crownWY = tree.anchor.y + nodes[last * 3 + 1];
-    const crownWZ = tree.anchor.z + nodes[last * 3 + 2];
-    let pulseSwell = 0;
-    if (pulseActive) {
-      const dC = Math.hypot(crownWX - pulseCenter.x, crownWY - pulseCenter.y, crownWZ - pulseCenter.z);
-      const band = LightConfig.pulse.thickness + 3;
-      const shell = Math.abs(dC - pulseRadius);
-      if (shell < band) pulseSwell = 1 - shell / band;
-    }
+    _tWobEuler.set(tree.cwz * 0.16, 0, -tree.cwx * 0.16);
+    _tWobQ.setFromEuler(_tWobEuler);
+    tree.crown.quaternion.copy(_tQuat).multiply(_tWobQ);
 
     if (canopyLeafMode && tree.leafInst) {
       // Mode A: flutter every frond; the pulse pops them outward along normals.
