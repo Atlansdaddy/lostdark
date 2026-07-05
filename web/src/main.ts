@@ -135,6 +135,53 @@ let landSquash = 0; // landing squash impulse, decays fast
 let wasGrounded = true;
 const { material: worldMaterial, uniforms } = createLitMaterial();
 
+// Flora (trees, shrooms, crystals) are MeshStandardMaterials — the terrain's
+// echolocation pulse is a custom-shader effect that never touches them, so in
+// the dark of a tide they'd read as flat black silhouettes. Patch each flora
+// material to catch the SAME pulse ring: as the wavefront sweeps a grove it
+// paints the flora in their own albedo, not just shadow. Injected into the
+// linear-HDR light (before tonemapping) using the shared pulse uniforms so it
+// stays in lockstep with the terrain. Instancing-aware for the leaf cards.
+function addPulseReveal(mat: THREE.MeshStandardMaterial): void {
+  mat.onBeforeCompile = (shader) => {
+    shader.uniforms.uPulseCenter = uniforms.uPulseCenter;
+    shader.uniforms.uPulseRadius = uniforms.uPulseRadius;
+    shader.uniforms.uPulseThickness = uniforms.uPulseThickness;
+    shader.uniforms.uPulseIntensity = uniforms.uPulseIntensity;
+    shader.uniforms.uPulseColor = uniforms.uOrbColor; // pulse takes the orb's mood
+    shader.vertexShader =
+      'varying vec3 vPulseWP;\n' +
+      shader.vertexShader.replace(
+        '#include <begin_vertex>',
+        `#include <begin_vertex>
+         vec4 pulseWP = vec4(transformed, 1.0);
+         #ifdef USE_INSTANCING
+           pulseWP = instanceMatrix * pulseWP;
+         #endif
+         vPulseWP = (modelMatrix * pulseWP).xyz;`,
+      );
+    shader.fragmentShader =
+      `uniform vec3 uPulseCenter;
+       uniform float uPulseRadius;
+       uniform float uPulseThickness;
+       uniform float uPulseIntensity;
+       uniform vec3 uPulseColor;
+       varying vec3 vPulseWP;\n` +
+      shader.fragmentShader.replace(
+        '#include <opaque_fragment>',
+        `if (uPulseIntensity > 0.0 && uPulseRadius >= 0.0) {
+           float pd = distance(vPulseWP, uPulseCenter);
+           float ring = 1.0 - clamp(abs(pd - uPulseRadius) / uPulseThickness, 0.0, 1.0);
+           ring = ring * ring * uPulseIntensity;
+           outgoingLight += diffuseColor.rgb * ring * uPulseColor * 1.7;
+         }
+         #include <opaque_fragment>`,
+      );
+  };
+  // All patched flora share one program — constant cache key, no variant blowup.
+  mat.customProgramCacheKey = () => 'pulseReveal';
+}
+
 const chunkMeshes = new Map<Chunk, THREE.Mesh>();
 // Terrain skin: BLOCKY voxels (John's call after the surface-nets test read
 // as "tunnels" — invest in voxel texturing instead). The smooth path stays
@@ -833,6 +880,17 @@ const FLORA_VIEW2 = 130 * 130; // culling radius² — safely past the fog wall
 let floraCullCursor = 0;
 
 function registerFlora(group: THREE.Group): void {
+  // Give every flora material the pulse-reveal patch so the echolocation ring
+  // lights them in the dark (see addPulseReveal). Runs at gen time, before the
+  // first frame, so no recompile is needed.
+  group.traverse((o) => {
+    const m = (o as THREE.Mesh).material;
+    if (Array.isArray(m)) {
+      for (const sub of m) if (sub instanceof THREE.MeshStandardMaterial) addPulseReveal(sub);
+    } else if (m instanceof THREE.MeshStandardMaterial) {
+      addPulseReveal(m);
+    }
+  });
   floraCull.push({ group, x: group.position.x, z: group.position.z });
 }
 
@@ -1918,6 +1976,14 @@ function frame(): void {
   }
   const tideActive = tideT >= 0;
 
+  // Keep the orb ~25% brighter THROUGH the tide so it stays clearly visible as
+  // the world blacks out — it's your anchor in the dark. (The orb visuals were
+  // already set above; scale them up here now that tidePress is known.)
+  const orbTideBoost = 1 + 0.25 * tidePress;
+  orbLight.intensity *= orbTideBoost;
+  (orbHalo.material as THREE.MeshBasicMaterial).opacity *= orbTideBoost;
+  (orbAura.material as THREE.SpriteMaterial).opacity *= orbTideBoost;
+
   if (tideActive) {
     mood.setThreat(tidePress); // sustained dread rides the darkness
     const protectedByWard = nearestWardDistance() < WARD_RADIUS;
@@ -2000,7 +2066,8 @@ function frame(): void {
 
   uniforms.uOrbPos.value.copy(orb.pos);
   uniforms.uOrbColor.value.copy(mood.color); // the orb's mood paints the world
-  uniforms.uOrbIntensity.value = LightConfig.orbIntensity * orb.breathGlow * flashBoost * mood.brightness;
+  uniforms.uOrbIntensity.value =
+    LightConfig.orbIntensity * orb.breathGlow * flashBoost * mood.brightness * orbTideBoost;
   uniforms.uPulseCenter.value.copy(pulseCenter);
   uniforms.uPulseRadius.value = pulseActive ? pulseRadius : -1;
   uniforms.uPulseIntensity.value = pulseActive ? LightConfig.pulse.intensity : 0;
@@ -2058,7 +2125,7 @@ function frame(): void {
   fogPass.lightColor[0].copy(mood.color); // even the air takes the orb's mood
   // The orb's own air-glow is NOT dimmed by the tide — it's the carried light
   // the dark can't swallow; its bubble stays bright while the world goes black.
-  fogPass.lightIntensity[0] = 1.15 * orb.breathGlow * flashBoost * mood.brightness;
+  fogPass.lightIntensity[0] = 1.15 * orb.breathGlow * flashBoost * mood.brightness * orbTideBoost;
   const sorted = fogLightRegistry
     .map((l) => ({ l, d: l.pos.distanceToSquared(orb.pos) }))
     .sort((a, b) => a.d - b.d);

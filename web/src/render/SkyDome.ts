@@ -106,7 +106,8 @@ export class SkyDome {
           float up = clamp(dir.y, 0.0, 1.0);
 
           // Night gradient: faint teal-charcoal horizon sinking into black.
-          vec3 sky = mix(vec3(0.018, 0.028, 0.044), vec3(0.002, 0.003, 0.008), pow(up, 0.55));
+          // Kept dim — the vault reads as deep night, not a lit dome.
+          vec3 sky = mix(vec3(0.011, 0.017, 0.027), vec3(0.001, 0.002, 0.006), pow(up, 0.55));
 
           float md = dot(dir, uMoonDir);
 
@@ -164,6 +165,8 @@ export class SkyDome {
           vec3 moon = moonCol * (moonFace * 2.2 + halo) * moonVis;
 
           vec3 col = mix(sky + stars, cloudCol, cover) + moon;
+          // Overall night dim — the sky was reading too luminous.
+          col *= 0.78;
           // The Dark Tide smothers the whole vault — stars, clouds, and moon
           // all sink toward black as the tide swells.
           col *= uDark;
