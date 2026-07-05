@@ -271,7 +271,7 @@ orbAura.scale.setScalar(3.4);
 orbGroup.add(orbAura, orbHalo, orbCore);
 scene.add(orbGroup);
 
-const orbLight = new THREE.PointLight(0x8defff, 2.8, 18, 1.7);
+const orbLight = new THREE.PointLight(0x8defff, 2.8, 10, 1.9);
 scene.add(orbLight);
 
 // --- Orb trail: drifting light-motes in the orb's wake (secondary motion —
@@ -736,8 +736,7 @@ interface TreeFlora {
   anchor: THREE.Vector3;
   restTop: THREE.Vector3; // crown's rest position (local)
   canopies: { mesh: THREE.Mesh; base: Float32Array; seed: number }[]; // mode-B ripple
-  leafInst: THREE.InstancedMesh | null; // mode-A leaf cards (one draw call)
-  leafBase: Float32Array; // 7 per leaf: px,py,pz, nx,ny,nz, phase (crown-local)
+  leafInst: THREE.InstancedMesh | null; // mode-A leaf clusters (one draw call)
   leafCount: number;
   // BOUGHS hitbox: the canopy is its own springy mass on the crown, so brushing
   // the foliage sways it independently of the trunk's bend (a second hitbox).
@@ -1047,66 +1046,114 @@ const barkMat = new THREE.MeshStandardMaterial({
   metalness: 0,
   envMapIntensity: 0.1,
 });
-// Leaf cards (canopy mode A): a small double-sided frond, shared across trees.
-// A real leaf, not a billboard: a lance blade tapering to a point with a raised
-// MIDRIB crease, so the surface folds down its length and catches light from any
-// angle instead of going edge-on to a paper sliver. Pivot at the stem (y=0).
-function makeLeafGeometry(): THREE.BufferGeometry {
-  const stations = [0, 0.14, 0.3, 0.47, 0.64, 0.82, 1];
-  const L = 1.0;
-  const W = 0.26; // half-width at the widest
-  const ridge = 0.5; // how far the midrib lifts out of the blade plane
-  const curl = 0.18; // lengthwise curl toward the tip
-  const pos: number[] = [];
-  for (const t of stations) {
-    const y = t * L;
-    const w = W * Math.sin(Math.PI * Math.min(0.999, Math.max(0.001, t))); // lance taper
-    const zc = curl * t * t; // the whole blade curls forward toward the tip
-    pos.push(-w, y, zc); // left edge
-    pos.push(0, y, zc + ridge * w); // midrib ridge (lifted)
-    pos.push(w, y, zc); // right edge
+// Leaf clusters (canopy mode A). The billboard cards read as paper; the modern
+// game-foliage recipe (EZ-Tree / Codrops 2025, Cyan's foliage shader) is:
+//   • each instance is a CLUSTER of intersecting quads (never edge-on),
+//   • textured with an alpha-cut leaf-clump image (shape comes from the alpha),
+//   • shaded with SPHERICAL normals (normal = dir from clump centre) so the
+//     clump lights like a soft round bush, not flat faces,
+//   • wind done entirely in the vertex shader (layered sines, tip-weighted).
+
+// Procedurally paint a soft leaf-clump alpha texture (no external asset).
+function makeLeafTexture(): THREE.CanvasTexture {
+  const s = 128;
+  const cv = document.createElement('canvas');
+  cv.width = cv.height = s;
+  const ctx = cv.getContext('2d')!;
+  ctx.clearRect(0, 0, s, s);
+  for (let i = 0; i < 11; i++) {
+    const a = i * 2.399963;
+    const rad = 0.14 + 0.3 * ((i * 7) % 5) / 5;
+    const cx = s * (0.5 + Math.cos(a) * rad);
+    const cy = s * (0.5 + Math.sin(a) * rad);
+    const rr = s * (0.11 + 0.05 * ((i * 3) % 4) / 4);
+    const hue = 108 + ((i * 5) % 3) * 12;
+    const light = 24 + ((i * 11) % 4) * 6;
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(a * 1.7);
+    const g = ctx.createRadialGradient(0, 0, 0, 0, 0, rr * 1.5);
+    g.addColorStop(0, `hsla(${hue},48%,${light + 6}%,0.98)`);
+    g.addColorStop(0.65, `hsla(${hue},46%,${light}%,0.85)`);
+    g.addColorStop(1, `hsla(${hue},46%,${light - 6}%,0)`);
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.ellipse(0, 0, rr * 0.62, rr * 1.4, 0, 0, Math.PI * 2); // leaf-ish teardrop
+    ctx.fill();
+    ctx.restore();
   }
+  const tex = new THREE.CanvasTexture(cv);
+  tex.needsUpdate = true;
+  return tex;
+}
+
+// One cluster = 3 intersecting vertical quads (a star), centred at the origin so
+// spherical normals work. uv.y (0 base → 1 top) drives the tip-weighted wind.
+function makeLeafClusterGeometry(): THREE.BufferGeometry {
+  const planes = 3;
+  const w = 1.4;
+  const h = 1.4;
+  const pos: number[] = [];
+  const uv: number[] = [];
   const idx: number[] = [];
-  for (let s = 0; s < stations.length - 1; s++) {
-    const a = s * 3;
-    const b = (s + 1) * 3;
-    idx.push(a, a + 1, b, b, a + 1, b + 1); // left half-panel
-    idx.push(a + 1, a + 2, b + 1, b + 1, a + 2, b + 2); // right half-panel
+  let v = 0;
+  for (let p = 0; p < planes; p++) {
+    const a = (p / planes) * Math.PI;
+    const ca = Math.cos(a);
+    const sa = Math.sin(a);
+    const cx = [-w / 2, w / 2, w / 2, -w / 2];
+    const cy = [-h / 2, -h / 2, h / 2, h / 2];
+    const cu = [0, 1, 1, 0];
+    const cvv = [0, 0, 1, 1];
+    for (let k = 0; k < 4; k++) {
+      pos.push(cx[k] * ca, cy[k], cx[k] * sa);
+      uv.push(cu[k], cvv[k]);
+    }
+    idx.push(v, v + 1, v + 2, v, v + 2, v + 3);
+    v += 4;
   }
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  geo.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
   geo.setIndex(idx);
   geo.computeVertexNormals();
   return geo;
 }
-const leafGeo = makeLeafGeometry();
+
+const leafGeo = makeLeafClusterGeometry();
+let leafTimeUniform: { value: number } | null = null;
 const leafMat = new THREE.MeshStandardMaterial({
-  color: 0x1c3a26,
-  emissive: 0x1a7a4a, // faint phosphor-green so fronds read in the gloom
-  emissiveIntensity: 0.32,
-  roughness: 0.8,
+  map: makeLeafTexture(),
+  alphaTest: 0.42, // cut the soft texture into organic leaf edges (opaque, cheap)
+  color: 0xffffff, // let the texture carry the green
+  emissive: 0x123a20,
+  emissiveIntensity: 0.16, // faint self-glow so foliage reads in the gloom
+  roughness: 0.85,
   metalness: 0,
   side: THREE.DoubleSide,
   envMapIntensity: 0.05,
 });
-
-/** A lumpy organic canopy blob: displaced icosphere, dark and moody. */
-function makeCanopyBlob(r: number, seed: number, mat: THREE.Material): THREE.Mesh {
-  const geo = new THREE.IcosahedronGeometry(r, 2);
-  const posAttr = geo.attributes.position;
-  const v = new THREE.Vector3();
-  for (let i = 0; i < posAttr.count; i++) {
-    v.set(posAttr.getX(i), posAttr.getY(i), posAttr.getZ(i));
-    const n =
-      1 +
-      Math.sin(v.x * 2.1 + seed) * Math.cos(v.z * 1.8 + seed * 1.3) * 0.18 +
-      Math.sin(v.y * 3.2 + seed * 2.1) * 0.1;
-    v.multiplyScalar(n);
-    posAttr.setXYZ(i, v.x, v.y * 0.55, v.z); // flattened, wind-carved
-  }
-  geo.computeVertexNormals();
-  return new THREE.Mesh(geo, mat);
-}
+leafMat.onBeforeCompile = (shader) => {
+  shader.uniforms.uLeafTime = { value: 0 };
+  leafTimeUniform = shader.uniforms.uLeafTime;
+  shader.vertexShader = 'uniform float uLeafTime;\n' + shader.vertexShader;
+  // Spherical normals: light the cluster as a soft round bush, not flat quads.
+  shader.vertexShader = shader.vertexShader.replace(
+    '#include <beginnormal_vertex>',
+    '#include <beginnormal_vertex>\n objectNormal = normalize(position + vec3(0.0, 0.0015, 0.0));',
+  );
+  // Wind: layered sines, tip-weighted by uv.y, phased per instance. GPU-only.
+  shader.vertexShader = shader.vertexShader.replace(
+    '#include <begin_vertex>',
+    `#include <begin_vertex>
+     float lph = instanceMatrix[3].x * 0.7 + instanceMatrix[3].z * 0.5;
+     float sway = uv.y * (0.12 * sin(uLeafTime * 1.3 + lph)
+                        + 0.06 * sin(uLeafTime * 3.1 + lph * 1.7)
+                        + 0.03 * sin(uLeafTime * 6.7 + lph * 2.3));
+     transformed.x += sway;
+     transformed.z += sway * 0.6;`,
+  );
+};
 
 function makeSporeTree(x: number, y: number, z: number, h: number): void {
   const g = new THREE.Group();
@@ -1181,72 +1228,39 @@ function makeSporeTree(x: number, y: number, z: number, h: number): void {
   // node so the whole head leans with the trunk's bend.
   const pal = pickPalette(x, z);
   const glow = new THREE.Color(pal.glow);
-  const canopyMat = new THREE.MeshStandardMaterial({
-    color: 0x0d1d18,
-    emissive: glow.clone().lerp(new THREE.Color(0.5, 0.5, 0.5), 0.3),
-    emissiveIntensity: 0, // trees aren't bioluminescent — black until a light hits them
-    roughness: 0.92,
-    metalness: 0,
-    envMapIntensity: 0.03,
-  });
   const top = curve.getPoint(1);
   const crown = new THREE.Group();
   crown.position.copy(top);
+  // The lumpy icosphere blobs are gone — the leaf clusters ARE the foliage now.
   const canopies: { mesh: THREE.Mesh; base: Float32Array; seed: number }[] = [];
-  for (let i = 0; i < 3; i++) {
-    const cr = 1.9 + tseed * 1.0 + i * 0.3;
-    const seed = tseed * 7 + i * 3.1;
-    const blob = makeCanopyBlob(cr, seed, canopyMat);
-    blob.position.set(
-      Math.sin(i * 2.4 + tseed * 9) * cr * 0.45,
-      -0.6 + i * 0.5,
-      Math.cos(i * 2.1 + tseed * 5) * cr * 0.4,
-    );
-    crown.add(blob);
-    // Keep the pristine vertex positions so mode-B ripple can wobble off them.
-    const base = (blob.geometry.attributes.position.array as Float32Array).slice();
-    canopies.push({ mesh: blob, base, seed });
-  }
 
-  // Leaf cards (mode A): scattered fronds over the canopy volume, one instanced
-  // draw. Hidden until you flip to leaf mode with L.
-  const leafCount = 44;
-  const leafBase = new Float32Array(leafCount * 7);
+  // Leaf clusters: intersecting-quad clumps filling the whole crown volume, one
+  // instanced draw. Wind is GPU-side; these matrices are static (the crown
+  // carries them as it sways).
+  const leafCount = 30;
   const leafInst = new THREE.InstancedMesh(leafGeo, leafMat, leafCount);
   leafInst.frustumCulled = false;
   const _lm = new THREE.Matrix4();
   const _lq = new THREE.Quaternion();
-  const _lqRoll = new THREE.Quaternion();
   const _lp = new THREE.Vector3();
-  const _ldir = new THREE.Vector3();
-  const _lup = new THREE.Vector3(0, 1, 0);
-  const _lone = new THREE.Vector3(1, 1, 1);
-  const canopyShell = 2.5 + tseed * 0.8; // sit fronds ON the foliage surface
+  const _leuler = new THREE.Euler();
+  const _lscale = new THREE.Vector3();
+  const canopyShell = 2.2 + tseed * 0.8; // sit clumps in the foliage volume
   for (let i = 0; i < leafCount; i++) {
-    // Fibonacci-sphere point so fronds wrap the whole canopy, then bias down a
-    // touch (fronds droop) and jitter the radius so it isn't a clean shell.
-    const yUnit = 1 - (i + 0.5) / leafCount * 1.7; // 1 → -0.7 (mostly upper half)
+    // Fibonacci-sphere point through the canopy volume, jittered so it's organic.
+    const yUnit = 1 - ((i + 0.5) / leafCount) * 1.7; // 1 → -0.7 (mostly upper half)
     const rad = Math.sqrt(Math.max(0, 1 - yUnit * yUnit));
     const a = i * 2.399963 + tseed * 6.2; // golden angle
-    const jitter = 0.85 + 0.3 * Math.abs(Math.sin(a * 3.1));
+    const jitter = 0.7 + 0.5 * Math.abs(Math.sin(a * 3.1));
     const rr = canopyShell * jitter;
-    const px = Math.cos(a) * rad * rr;
-    const yb = yUnit * rr - 0.5;
-    const pz = Math.sin(a) * rad * rr;
-    _ldir.set(px, yb + 0.6, pz).normalize(); // outward+slightly up = frond facing
-    leafBase[i * 7] = px;
-    leafBase[i * 7 + 1] = yb;
-    leafBase[i * 7 + 2] = pz;
-    leafBase[i * 7 + 3] = _ldir.x;
-    leafBase[i * 7 + 4] = _ldir.y;
-    leafBase[i * 7 + 5] = _ldir.z;
-    leafBase[i * 7 + 6] = a * 1.7; // per-leaf flutter phase
-    _lp.set(px, yb, pz);
-    _lq.setFromUnitVectors(_lup, _ldir);
-    // Static per-leaf twist about the stem so fronds aren't co-planar cards.
-    _lqRoll.setFromAxisAngle(_lup, Math.sin(a * 1.7 * 0.7) * 1.0);
-    _lq.multiply(_lqRoll);
-    _lm.compose(_lp, _lq, _lone);
+    _lp.set(Math.cos(a) * rad * rr, yUnit * rr - 0.4, Math.sin(a) * rad * rr);
+    // Random tilt + roll; the crossed quads read from any angle so this just
+    // breaks up uniformity. Scale varies the clump size.
+    _leuler.set(Math.sin(a * 1.3) * 0.5, a, Math.cos(a * 0.7) * 0.4);
+    _lq.setFromEuler(_leuler);
+    const sc = 1.5 + 0.8 * Math.abs(Math.sin(a * 2.1));
+    _lscale.set(sc, sc * (1.05 + 0.2 * Math.sin(a)), sc);
+    _lm.compose(_lp, _lq, _lscale);
     leafInst.setMatrixAt(i, _lm);
   }
   leafInst.instanceMatrix.needsUpdate = true;
@@ -1285,7 +1299,6 @@ function makeSporeTree(x: number, y: number, z: number, h: number): void {
     restTop: top.clone(),
     canopies,
     leafInst,
-    leafBase,
     leafCount,
     canopyR: 2.4 + tseed * 1.0, // matches the boughs collider footprint
     cwx: 0,
@@ -2107,7 +2120,7 @@ function frame(): void {
   uniforms.uMoonDir.value.copy(moonDir);
   uniforms.uMoonI.value = moonI;
   grassField.uniforms.uMoonI.value = moonI;
-  moonAmbient.intensity = moonI * 0.35; // faint moon wash on flora/orb (dim even at full)
+  moonAmbient.intensity = moonI * 0.1; // barest moon hint — the dark stays the default
 
   // God-rays: project the moon to screen; rays fire only when it's ahead of
   // the camera and the clouds are open (moonI already folds in phase + cover).
@@ -2181,6 +2194,7 @@ function frame(): void {
   // crowd; the orb brushes them and the pulse washes through. High stiffness +
   // near-critical damping = small motion, snappy return (thick, woody things).
   const time = clock.elapsedTime;
+  if (leafTimeUniform) leafTimeUniform.value = time; // GPU leaf wind clock
   const sdt = dt < 1 / 30 ? dt : 1 / 30;
   const SH_STALK_STIFF = 120;
   const SH_STALK_DAMP = 8; // underdamped → a natural rock, not a dead snap-back
@@ -2329,13 +2343,6 @@ function frame(): void {
   const _tQuat = new THREE.Quaternion();
   const _tWobQ = new THREE.Quaternion();
   const _tWobEuler = new THREE.Euler();
-  const _tLeafM = new THREE.Matrix4();
-  const _tLeafQ = new THREE.Quaternion();
-  const _tFlutterQ = new THREE.Quaternion();
-  const _tLeafP = new THREE.Vector3();
-  const _tLeafDir = new THREE.Vector3();
-  const _tUp = new THREE.Vector3(0, 1, 0);
-  const _tOne = new THREE.Vector3(1, 1, 1);
   for (const tree of treeFlora) {
     if (!tree.group.visible) continue;
     const { nodes, prev, rest, kShape, radii, n, radial } = tree;
@@ -2523,28 +2530,10 @@ function frame(): void {
     _tWobQ.setFromEuler(_tWobEuler);
     tree.crown.quaternion.copy(_tQuat).multiply(_tWobQ);
 
-    if (canopyLeafMode && tree.leafInst) {
-      // Mode A: flutter every frond; the pulse pops them outward along normals.
-      const lb = tree.leafBase;
-      for (let i = 0; i < tree.leafCount; i++) {
-        const b = i * 7;
-        const ph = lb[b + 6];
-        // Static per-leaf twist (so fronds aren't co-planar) + flutter + pulse.
-        const flick = Math.sin(ph * 0.7) * 1.0 + Math.sin(time * 3.2 + ph) * 0.22 + pulseSwell * 0.6;
-        const pop = pulseSwell * 0.5;
-        // Position: base point, popped outward along its normal by the pulse.
-        _tLeafP.set(lb[b] + lb[b + 3] * pop, lb[b + 1] + lb[b + 4] * pop, lb[b + 2] + lb[b + 5] * pop);
-        // Orient the frond to face outward, then rock it about that axis.
-        _tLeafDir.set(lb[b + 3], lb[b + 4], lb[b + 5]);
-        _tLeafQ.setFromUnitVectors(_tUp, _tLeafDir);
-        _tFlutterQ.setFromAxisAngle(_tUp, flick);
-        _tLeafQ.multiply(_tFlutterQ);
-        _tLeafM.compose(_tLeafP, _tLeafQ, _tOne);
-        tree.leafInst.setMatrixAt(i, _tLeafM);
-      }
-      tree.leafInst.instanceMatrix.needsUpdate = true;
-    } else if (!canopyLeafMode && pulseSwell > 0) {
-      // Mode B: ripple the blob surface outward as the wavefront passes.
+    // Mode A leaves need no CPU work — wind runs in their vertex shader and the
+    // crown already carries + sways them. Mode B ripples the blob surface as the
+    // wavefront passes (only while the shell is on the canopy).
+    if (!canopyLeafMode && pulseSwell > 0) {
       for (const c of tree.canopies) {
         const arr = c.mesh.geometry.attributes.position.array as Float32Array;
         const base = c.base;
