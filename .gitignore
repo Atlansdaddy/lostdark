@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+*.local
+
+# Vite / dev caches
+.vite/
+*.tsbuildinfo
+
+# Python (legacy prototype)
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# Logs / misc
+*.log
+npm-debug.log*
+
+# Accidental Windows reserved-name file
+nul

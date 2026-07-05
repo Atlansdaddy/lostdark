@@ -1,0 +1,124 @@
+/**
+ * Voxel flood-fill light propagation (GDD §5j Phase-1).
+ *
+ * Minecraft-style block-light BFS: emissive voxels seed a level, light spreads
+ * one step per cell through open space, attenuating by 1 each hop. This is the
+ * cheap, destructible-safe GI workhorse — "built light holds back the dark."
+ * We re-flood only when a chunk's contents changed (lightDirty).
+ *
+ * The orb's carried bubble and the echolocation pulse are *dynamic* and handled
+ * in the shader instead — this grid is the static, cached layer.
+ */
+
+import { World, Light } from '../config';
+import { Mat, MATERIALS, isSolid } from '../world/Materials';
+import { VoxelWorld, Chunk } from '../world/VoxelWorld';
+
+const CS = World.chunkSize;
+const MAXL = Light.max;
+
+type QItem = { x: number; y: number; z: number; l: number };
+
+export class LightGrid {
+  constructor(private world: VoxelWorld) {}
+
+  /** True if any chunk needed re-flooding (renderer then knows to remesh). */
+  update(): boolean {
+    let anyDirty = false;
+    for (const c of this.world.chunks.values()) {
+      if (c.lightDirty) {
+        anyDirty = true;
+        break;
+      }
+    }
+    if (!anyDirty) return false;
+
+    // Global re-flood. For the sandbox this is a handful of chunks; the
+    // streaming version will scope this to the dirty region + a bleed margin.
+    const queue: QItem[] = [];
+    for (const c of this.world.chunks.values()) {
+      c.light.fill(0);
+      this.seedChunk(c, queue);
+      c.lightDirty = false;
+    }
+    this.propagate(queue);
+    for (const c of this.world.chunks.values()) c.dirty = true;
+    return true;
+  }
+
+  private seedChunk(c: Chunk, queue: QItem[]): void {
+    for (let ly = 0; ly < CS; ly++) {
+      for (let lz = 0; lz < CS; lz++) {
+        for (let lx = 0; lx < CS; lx++) {
+          const m = c.voxels[Chunk.index(lx, ly, lz)] as Mat;
+          const emission = MATERIALS[m].emission;
+          if (emission > 0) {
+            const i = Chunk.index(lx, ly, lz);
+            if (emission > c.light[i]) {
+              c.light[i] = emission;
+              queue.push({ x: c.cx * CS + lx, y: c.cy * CS + ly, z: c.cz * CS + lz, l: emission });
+            }
+          }
+        }
+      }
+    }
+  }
+
+  private propagate(queue: QItem[]): void {
+    let head = 0;
+    while (head < queue.length) {
+      const { x, y, z, l } = queue[head++];
+      if (l <= 1) continue;
+      const next = l - 1;
+      this.spread(x + 1, y, z, next, queue);
+      this.spread(x - 1, y, z, next, queue);
+      this.spread(x, y + 1, z, next, queue);
+      this.spread(x, y - 1, z, next, queue);
+      this.spread(x, y, z + 1, next, queue);
+      this.spread(x, y, z - 1, next, queue);
+    }
+  }
+
+  private spread(x: number, y: number, z: number, level: number, queue: QItem[]): void {
+    // Light only travels through open (non-opaque) space. Opaque solids stop it,
+    // but their air-facing neighbours are what the mesher samples, so faces of a
+    // wall next to a lit cell still read as lit.
+    const m = this.world.get(x, y, z);
+    if (isSolid(m) && m !== Mat.Glass) return;
+    const c = this.world.getChunk(
+      Math.floor(x / CS),
+      Math.floor(y / CS),
+      Math.floor(z / CS),
+    );
+    if (!c) return;
+    const lx = ((x % CS) + CS) % CS;
+    const ly = ((y % CS) + CS) % CS;
+    const lz = ((z % CS) + CS) % CS;
+    const i = Chunk.index(lx, ly, lz);
+    if (c.light[i] >= level) return;
+    c.light[i] = level;
+    queue.push({ x, y, z, l: level });
+  }
+
+  /** Light level (0..MAX) at a cell — used by meshers and flora baking.
+   *  Accepts fractional coords (flora sits on fractional surface heights). */
+  sample(x: number, y: number, z: number): number {
+    x = Math.floor(x);
+    y = Math.floor(y);
+    z = Math.floor(z);
+    const c = this.world.getChunk(
+      Math.floor(x / CS),
+      Math.floor(y / CS),
+      Math.floor(z / CS),
+    );
+    if (!c) return 0;
+    const lx = ((x % CS) + CS) % CS;
+    const ly = ((y % CS) + CS) % CS;
+    const lz = ((z % CS) + CS) % CS;
+    return c.light[Chunk.index(lx, ly, lz)];
+  }
+
+  static normalize(level: number): number {
+    return level / MAXL;
+  }
+}
