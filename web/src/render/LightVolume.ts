@@ -1,90 +1,91 @@
 import * as THREE from 'three';
 
 /**
- * The world's light as a sampled 3D volume — the foundation of the light-driven
- * renderer (RESEARCH_lighting.md §TL;DR-2). The voxel flood-fill is packed into
- * a Data3DTexture that ANY material can sample at a world position, so terrain,
- * flora, the orb and dust all read the SAME propagating, geometry-shaped light
- * instead of each faking their own.
+ * The world's flood-fill light as a sampled volume the shader can read at ANY
+ * world position — the foundation of the light-driven renderer
+ * (RESEARCH_lighting.md). So terrain, flora, orb and dust can all read the SAME
+ * propagating, geometry-shaped light instead of each faking their own.
+ *
+ * WebGL2 3D textures need a newer shader version (a blind rewrite of the whole
+ * terrain shader — a black-screen risk), so the volume is packed into a 2D
+ * ATLAS: the Y layers are tiled across one DataTexture and the shader does the
+ * trilinear blend itself. This keeps the proven GLSL1 terrain shader intact —
+ * we only ADD sampling code, guarded by a mix that defaults to 0.
  *
  * Half voxel resolution (2 world units / texel) by default: flood-fill light is
- * soft and low-frequency, so trilinear filtering reads smooth while the texture
- * stays small enough (~1 MB) to re-upload cheaply when charge re-floods it.
+ * soft and low-frequency, so bilinear + the manual layer blend read smooth while
+ * the texture stays tiny (~1 MB) for cheap re-uploads when charge re-floods it.
  *
- * Shader side — map a world position into the volume and sample it:
- *   uniform highp sampler3D uLightVol;
- *   uniform vec3 uLightMin;      // world-space min corner
- *   uniform vec3 uLightInvSize;  // 1 / (max - min)
- *   vec3 c = (worldPos - uLightMin) * uLightInvSize;   // -> 0..1
- *   vec3 worldLight = texture(uLightVol, c).rgb;       // 0..1 per channel
- * (Sampling outside 0..1 clamps to the edge — dark, which is correct.)
+ * Shader side (GLSL1) — see litMaterial's sampleLightVol():
+ *   uniform sampler2D uLightAtlas;  uniform vec3 uLightMin;  uniform float uLightStep;
+ *   uniform vec3 uLightDim;         uniform vec2 uLightTiles;
  */
 export class LightVolume {
-  readonly texture: THREE.Data3DTexture;
-  /** World-space min corner (shader uniform `uLightMin`). */
+  readonly texture: THREE.DataTexture;
+  /** World-space min corner (uniform `uLightMin`). */
   readonly min: THREE.Vector3;
-  /** 1 / world extent (shader uniform `uLightInvSize`). */
-  readonly invSize: THREE.Vector3;
+  /** World units per texel (uniform `uLightStep`). */
+  readonly step: number;
+  /** Layer counts nx, ny, nz (uniform `uLightDim`). */
+  readonly dim: THREE.Vector3;
+  /** Atlas tile grid tilesX, tilesY (uniform `uLightTiles`). */
+  readonly tiles: THREE.Vector2;
 
   private readonly nx: number;
   private readonly ny: number;
   private readonly nz: number;
-  private readonly step: number;
-  // ArrayBuffer-backed (not ArrayBufferLike) so the type matches Data3DTexture.
+  private readonly tx: number;
+  private readonly aw: number; // atlas width in texels
   private readonly data: Uint8Array<ArrayBuffer>;
 
   constructor(min: THREE.Vector3, max: THREE.Vector3, step = 2) {
     this.min = min.clone();
     this.step = step;
-    const sx = max.x - min.x;
-    const sy = max.y - min.y;
-    const sz = max.z - min.z;
-    this.invSize = new THREE.Vector3(1 / sx, 1 / sy, 1 / sz);
-    this.nx = Math.max(1, Math.ceil(sx / step));
-    this.ny = Math.max(1, Math.ceil(sy / step));
-    this.nz = Math.max(1, Math.ceil(sz / step));
+    this.nx = Math.max(1, Math.ceil((max.x - min.x) / step));
+    this.ny = Math.max(1, Math.ceil((max.y - min.y) / step));
+    this.nz = Math.max(1, Math.ceil((max.z - min.z) / step));
+    this.dim = new THREE.Vector3(this.nx, this.ny, this.nz);
 
-    // RGBA8: RGB = colored light, A reserved (solidity for the shadow pass).
-    // Explicit ArrayBuffer backing so the type matches Data3DTexture's source.
-    this.data = new Uint8Array(new ArrayBuffer(this.nx * this.ny * this.nz * 4));
-    const tex = new THREE.Data3DTexture(this.data, this.nx, this.ny, this.nz);
-    tex.format = THREE.RGBAFormat;
-    tex.type = THREE.UnsignedByteType;
+    // Tile the ny Y-layers into a near-square atlas grid.
+    this.tx = Math.ceil(Math.sqrt(this.ny));
+    const ty = Math.ceil(this.ny / this.tx);
+    this.tiles = new THREE.Vector2(this.tx, ty);
+    this.aw = this.tx * this.nx;
+    const ah = ty * this.nz;
+
+    this.data = new Uint8Array(new ArrayBuffer(this.aw * ah * 4));
+    const tex = new THREE.DataTexture(this.data, this.aw, ah, THREE.RGBAFormat, THREE.UnsignedByteType);
     tex.minFilter = THREE.LinearFilter;
     tex.magFilter = THREE.LinearFilter;
     tex.wrapS = THREE.ClampToEdgeWrapping;
     tex.wrapT = THREE.ClampToEdgeWrapping;
-    tex.wrapR = THREE.ClampToEdgeWrapping;
+    tex.generateMipmaps = false;
     tex.needsUpdate = true;
     this.texture = tex;
   }
 
-  /** Texel count, for logging/debug. */
-  get texelCount(): number {
-    return this.nx * this.ny * this.nz;
-  }
-
   /**
-   * Repopulate the whole volume from the flood-fill. `sampleLevel(x,y,z)` gives
-   * a 0..15 light level at a world voxel. Written grayscale for now (the shader
-   * tints it with the biome's held-light color, matching today's terrain look);
-   * per-source color is a later pass that fills RGB directly.
+   * Repopulate the whole atlas from the flood-fill. `sampleLevel(x,y,z)` gives a
+   * 0..15 light level at a world voxel; written grayscale for now (the shader
+   * tints it with the biome's held-light color — matching today's terrain).
    */
   rebuild(sampleLevel: (x: number, y: number, z: number) => number): void {
-    const { nx, ny, nz, min, step, data } = this;
-    let p = 0;
-    for (let k = 0; k < nz; k++) {
-      const wz = Math.round(min.z + (k + 0.5) * step);
-      for (let j = 0; j < ny; j++) {
-        const wy = Math.round(min.y + (j + 0.5) * step);
+    const { nx, ny, nz, tx, aw, min, step, data } = this;
+    for (let j = 0; j < ny; j++) {
+      const wy = Math.round(min.y + (j + 0.5) * step);
+      const baseX = (j % tx) * nx;
+      const baseY = Math.floor(j / tx) * nz;
+      for (let k = 0; k < nz; k++) {
+        const wz = Math.round(min.z + (k + 0.5) * step);
+        const rowBase = ((baseY + k) * aw + baseX) * 4;
         for (let i = 0; i < nx; i++) {
           const wx = Math.round(min.x + (i + 0.5) * step);
           const v = Math.min(255, Math.round((sampleLevel(wx, wy, wz) / 15) * 255));
-          data[p] = v;
-          data[p + 1] = v;
-          data[p + 2] = v;
-          data[p + 3] = 255;
-          p += 4;
+          const idx = rowBase + i * 4;
+          data[idx] = v;
+          data[idx + 1] = v;
+          data[idx + 2] = v;
+          data[idx + 3] = 255;
         }
       }
     }

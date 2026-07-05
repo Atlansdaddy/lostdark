@@ -36,6 +36,14 @@ export interface LitUniforms {
   /** Moonlight: direction + strength (0 when clouds cover the moon). */
   uMoonDir: { value: THREE.Vector3 };
   uMoonI: { value: number };
+  // --- Sampled light volume (LightVolume 2D atlas). uLightVolMix blends it
+  // against the per-vertex baked light: 0 = today's look, 1 = volume-driven. ---
+  uLightAtlas: { value: THREE.Texture | null };
+  uLightMin: { value: THREE.Vector3 };
+  uLightStep: { value: number };
+  uLightDim: { value: THREE.Vector3 };
+  uLightTiles: { value: THREE.Vector2 };
+  uLightVolMix: { value: number };
 }
 
 export function createLitMaterial(): { material: THREE.ShaderMaterial; uniforms: LitUniforms } {
@@ -53,6 +61,12 @@ export function createLitMaterial(): { material: THREE.ShaderMaterial; uniforms:
     uVoxelDetail: { value: 1 }, // blocky terrain default — full voxel texturing
     uMoonDir: { value: new THREE.Vector3(0.3, 0.8, 0.2).normalize() },
     uMoonI: { value: 0 },
+    uLightAtlas: { value: null },
+    uLightMin: { value: new THREE.Vector3(-128, -14, -128) },
+    uLightStep: { value: 2 },
+    uLightDim: { value: new THREE.Vector3(1, 1, 1) },
+    uLightTiles: { value: new THREE.Vector2(1, 1) },
+    uLightVolMix: { value: 0 }, // default OFF — terrain identical until toggled
   };
 
   const material = new THREE.ShaderMaterial({
@@ -94,12 +108,44 @@ export function createLitMaterial(): { material: THREE.ShaderMaterial; uniforms:
       uniform vec3 uMoonDir;
       uniform float uMoonI;
 
+      // Sampled light volume (2D atlas of the flood-fill; see LightVolume.ts).
+      uniform sampler2D uLightAtlas;
+      uniform vec3 uLightMin;
+      uniform float uLightStep;
+      uniform vec3 uLightDim;    // nx, ny, nz
+      uniform vec2 uLightTiles;  // tilesX, tilesY
+      uniform float uLightVolMix;
+
       varying vec3 vWorld;
       varying vec3 vNormal;
       varying vec3 vColor;
       varying float vBaked;
       varying float vAO;
       varying float vMat;
+
+      // Flood-fill light level (0..1) at a world position, read from the atlas.
+      // Bilinear in x,z (the GPU filter) + a manual blend between the two Y
+      // layers; x,z clamped half a texel inside each layer so the filter never
+      // bleeds across tile seams.
+      float sampleLightVol(vec3 wp) {
+        vec3 v = (wp - uLightMin) / uLightStep;      // continuous voxel coords
+        float nx = uLightDim.x, ny = uLightDim.y, nz = uLightDim.z;
+        float tX = uLightTiles.x, tY = uLightTiles.y;
+        float aw = tX * nx, ah = tY * nz;
+        float cx = clamp(v.x, 0.5, nx - 0.5);
+        float cz = clamp(v.z, 0.5, nz - 0.5);
+        float fy = v.y - 0.5;
+        float s0 = clamp(floor(fy), 0.0, ny - 1.0);
+        float s1 = clamp(s0 + 1.0, 0.0, ny - 1.0);
+        float wy = clamp(fy - s0, 0.0, 1.0);
+        vec2 t0 = vec2(mod(s0, tX), floor(s0 / tX));
+        vec2 t1 = vec2(mod(s1, tX), floor(s1 / tX));
+        vec2 uv0 = vec2(t0.x * nx + cx, t0.y * nz + cz) / vec2(aw, ah);
+        vec2 uv1 = vec2(t1.x * nx + cx, t1.y * nz + cz) / vec2(aw, ah);
+        float l0 = texture2D(uLightAtlas, uv0).r;
+        float l1 = texture2D(uLightAtlas, uv1).r;
+        return mix(l0, l1, wy);
+      }
 
       // --- procedural texture helpers ---
       float hash3(vec3 p) {
@@ -243,6 +289,15 @@ export function createLitMaterial(): { material: THREE.ShaderMaterial; uniforms:
 
         float held = vBaked * (0.35 + 0.65 * vAO); // AO shapes the baked light
         held = held * held * 1.6; // quadratic response: bright cores, fast falloff into dark
+        // Blend in the per-fragment light volume (same flood-fill, sampled not
+        // baked). 0 = today's per-vertex light, 1 = volume-driven. When the two
+        // match, the volume is trustworthy — and it can then update live.
+        if (uLightVolMix > 0.0) {
+          float volL = sampleLightVol(p);
+          float volHeld = volL * (0.35 + 0.65 * vAO);
+          volHeld = volHeld * volHeld * 1.6;
+          held = mix(held, volHeld, uLightVolMix);
+        }
         vec3 dyn = (bubble + pulse) * uOrbColor * vAO;
 
         vec3 lit = albedo * (uAmbient * sky * vAO) + albedo * held * uHeldColor

@@ -23,6 +23,7 @@ import { LightGrid } from './lighting/LightGrid';
 import { Orb } from './orb/Orb';
 import { OrbMood } from './orb/Mood';
 import { createLitMaterial } from './render/litMaterial';
+import { LightVolume } from './render/LightVolume';
 import { buildChunkGeometry } from './render/VoxelMesher';
 import { buildSmoothChunkGeometry } from './render/SmoothMesher';
 import { Mat } from './world/Materials';
@@ -676,6 +677,13 @@ interface TreeFlora {
   leafInst: THREE.InstancedMesh | null; // mode-A leaf cards (one draw call)
   leafBase: Float32Array; // 7 per leaf: px,py,pz, nx,ny,nz, phase (crown-local)
   leafCount: number;
+  // BOUGHS hitbox: the canopy is its own springy mass on the crown, so brushing
+  // the foliage sways it independently of the trunk's bend (a second hitbox).
+  canopyR: number;
+  cwx: number; // crown wobble offset + velocity
+  cwz: number;
+  cwvx: number;
+  cwvz: number;
   phase: number;
 }
 const treeFlora: TreeFlora[] = [];
@@ -1165,6 +1173,11 @@ function makeSporeTree(x: number, y: number, z: number, h: number): void {
     leafInst,
     leafBase,
     leafCount,
+    canopyR: 2.4 + tseed * 1.0, // matches the boughs collider footprint
+    cwx: 0,
+    cwz: 0,
+    cwvx: 0,
+    cwvz: 0,
     phase: x * 0.23 + z * 0.11,
   });
   updateRopeTube({ nodes, n, radii, radial, tubePos, tubeNrm }); // bake rest shape
@@ -1495,6 +1508,26 @@ console.info(`[world] Initial area loaded. Chunks: ${world.chunks.size}`);
 
 lightGrid.update();
 remeshDirtyChunks();
+
+// Sampled light volume: pack the flood-fill into a 2D atlas the terrain shader
+// can read per-fragment. Wired but OFF by default (uLightVolMix = 0) — flip it
+// on with waiver.lightVol(1) to A/B it against the baked light before we rely
+// on it for dynamic (charge-driven) lighting.
+const lightVol = new LightVolume(
+  new THREE.Vector3(-REEK_HALF_INIT, -14, -REEK_HALF_INIT),
+  new THREE.Vector3(REEK_HALF_INIT, 20, REEK_HALF_INIT),
+  2,
+);
+lightVol.rebuild((x, y, z) => lightGrid.sample(x, y, z));
+uniforms.uLightAtlas.value = lightVol.texture;
+uniforms.uLightMin.value.copy(lightVol.min);
+uniforms.uLightStep.value = lightVol.step;
+uniforms.uLightDim.value.copy(lightVol.dim);
+uniforms.uLightTiles.value.copy(lightVol.tiles);
+console.info(
+  `[lightvol] ${lightVol.texture.image.width}x${lightVol.texture.image.height} atlas` +
+    ` (${lightVol.dim.x}x${lightVol.dim.y}x${lightVol.dim.z} voxels)`,
+);
 
 // Grass builds AFTER the light flood so each tuft bakes its held light.
 const grassField = new GrassField();
@@ -2073,13 +2106,14 @@ function frame(): void {
     const pcx = pulseCenter.x - tree.anchor.x;
     const pcy = pulseCenter.y - tree.anchor.y;
     const pcz = pulseCenter.z - tree.anchor.z;
+    // Should the shell be touching ANY part of this trunk right now? Widen the
+    // band by the whole trunk span (base→crown), so a far tree wakes up while
+    // the wave is anywhere along it — not only when it reaches the crown.
     let pulseHere = false;
     if (pulseActive) {
-      const cwx = nodes[last * 3];
-      const cwy = nodes[last * 3 + 1];
-      const cwz = nodes[last * 3 + 2];
-      const dC = Math.sqrt((cwx - pcx) ** 2 + (cwy - pcy) ** 2 + (cwz - pcz) ** 2);
-      pulseHere = Math.abs(dC - pulseRadius) < LightConfig.pulse.thickness + 4;
+      const dBase = Math.sqrt(pcx * pcx + pcy * pcy + pcz * pcz);
+      const span = rest[last * 3 + 1] + 4; // ~trunk height + margin
+      pulseHere = Math.abs(dBase - pulseRadius) < LightConfig.pulse.thickness + span;
     }
     if (!nearOrb && !pulseHere) continue;
 
@@ -2094,7 +2128,10 @@ function frame(): void {
       let sx = (nodes[k] - prev[k]) * TREE_DRAG + Math.sin(time * 0.7 + tree.phase) * TREE_BREEZE * f * tdt2;
       let sy = (nodes[k + 1] - prev[k + 1]) * TREE_DRAG;
       let sz = (nodes[k + 2] - prev[k + 2]) * TREE_DRAG + Math.cos(time * 0.6 + tree.phase) * TREE_BREEZE * f * tdt2;
-      if (pulseHere) {
+      // Per-NODE shell test (not gated on the crown): as the wavefront climbs
+      // the trunk it shoves each node in turn, so the bend travels UP the trunk
+      // instead of only kicking the crown.
+      if (pulseActive) {
         const rx = nodes[k] - pcx;
         const ry = nodes[k + 1] - pcy;
         const rz = nodes[k + 2] - pcz;
@@ -2552,5 +2589,12 @@ frame();
     const t0 = performance.now();
     remeshDirtyChunks();
     console.info(`[terrain] ${v ? 'smooth' : 'blocky'} remesh in ${(performance.now() - t0).toFixed(0)}ms`);
+  },
+  /** A/B the sampled light volume against the baked terrain light. 0 = baked
+   *  (default), 1 = fully volume-driven. If terrain looks the same at 1, the
+   *  volume is correct and ready to carry dynamic (charge) light. */
+  lightVol(mix: number): void {
+    uniforms.uLightVolMix.value = mix;
+    console.info(`[lightvol] mix = ${mix}`);
   },
 };
