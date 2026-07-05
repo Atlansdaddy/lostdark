@@ -946,7 +946,7 @@ function makeButtons(x: number, y: number, z: number): void {
   const mat = new THREE.MeshStandardMaterial({
     color: pal.cap,
     emissive: glow.clone().lerp(new THREE.Color(0.5, 0.5, 0.5), 0.35),
-    emissiveIntensity: 0.18, // faint — undergrowth, not lamps
+    emissiveIntensity: 0.4, // always faintly alive — noticeable, never a lamp
     roughness: 0.85,
     metalness: 0,
     envMapIntensity: 0.04,
@@ -989,7 +989,7 @@ function makeStrandAt(px: number, py: number, pz: number, len: number): void {
   const strandMat = new THREE.MeshStandardMaterial({
     color: 0x2a3a30,
     emissive: glow,
-    emissiveIntensity: 0.12,
+    emissiveIntensity: 0.32, // hanging strands: always a soft, faint glow
     roughness: 0.9,
     metalness: 0,
     envMapIntensity: 0.03,
@@ -999,7 +999,7 @@ function makeStrandAt(px: number, py: number, pz: number, len: number): void {
   const beadMat = new THREE.MeshStandardMaterial({
     color: 0x0c1512,
     emissive: glow,
-    emissiveIntensity: 0.9,
+    emissiveIntensity: 0.6, // spore-ball tips: soft, below the bloom threshold
     roughness: 0.6,
     metalness: 0,
   });

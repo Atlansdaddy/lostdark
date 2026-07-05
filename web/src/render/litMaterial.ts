@@ -59,9 +59,9 @@ export function createLitMaterial(): { material: THREE.ShaderMaterial; uniforms:
     uVoxelDetail: { value: 1 }, // blocky terrain default — full voxel texturing
     uMoonDir: { value: new THREE.Vector3(0.3, 0.8, 0.2).normalize() },
     uMoonI: { value: 0 },
-    uFloraPos: { value: Array.from({ length: 12 }, () => new THREE.Vector3()) },
-    uFloraColor: { value: Array.from({ length: 12 }, () => new THREE.Color()) },
-    uFloraInt: { value: new Float32Array(12) }, // 0 = off; >0 scales the glow
+    uFloraPos: { value: Array.from({ length: 24 }, () => new THREE.Vector3()) },
+    uFloraColor: { value: Array.from({ length: 24 }, () => new THREE.Color()) },
+    uFloraInt: { value: new Float32Array(24) }, // 0 = off; >0 scales the glow
   };
 
   const material = new THREE.ShaderMaterial({
@@ -102,8 +102,8 @@ export function createLitMaterial(): { material: THREE.ShaderMaterial; uniforms:
       uniform float uVoxelDetail;
       uniform vec3 uMoonDir;
       uniform float uMoonI;
-      #define FLORA_N 12
-      #define FLORA_R 10.0   // reach: a cap-top light must fall to the floor below it
+      #define FLORA_N 24      // slots: enough that lights don't pop in/out of the set
+      #define FLORA_R 14.0    // reach: gentle, wide falloff — fades to dark, no hard edge
       uniform vec3 uFloraPos[FLORA_N];
       uniform vec3 uFloraColor[FLORA_N];
       uniform float uFloraInt[FLORA_N];
