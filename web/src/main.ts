@@ -972,7 +972,17 @@ function makeButtons(x: number, y: number, z: number): void {
 // Strands anchor to a point (ceiling OR tree canopy) and hang PLUMB — a
 // near-vertical drop with a slight catenary drift, beads swelling toward the
 // tip. Sway is a pendulum: longer strands swing slower (√(g/L)), tiny angles.
-const strandSway: { group: THREE.Group; phase: number; rate: number; amp: number }[] = [];
+const strandSway: {
+  group: THREE.Group;
+  phase: number;
+  rate: number;
+  amp: number;
+  // Player-wake spring state: current lean + its velocity (gives them weight).
+  pushX: number;
+  pushZ: number;
+  velX: number;
+  velZ: number;
+}[] = [];
 
 function makeStrandAt(px: number, py: number, pz: number, len: number): void {
   const g = new THREE.Group();
@@ -1019,6 +1029,10 @@ function makeStrandAt(px: number, py: number, pz: number, len: number): void {
     phase: px * 0.5 + pz * 0.7,
     rate: Math.sqrt(9.8 / Math.max(len, 0.5)) * 0.35,
     amp: 0.1 / (0.8 + len * 0.4),
+    pushX: 0,
+    pushZ: 0,
+    velX: 0,
+    velZ: 0,
   });
 }
 
@@ -1412,6 +1426,18 @@ function frame(): void {
       const pd = s.pos.distanceTo(pulseCenter);
       if (Math.abs(pd - pulseRadius) < 3.2) s.charge += dt * 4.5;
     }
+    // Held light keeps flora charged: inside a ward's dome, caps stay topped up
+    // (a ward is permanent light, so its grove is always lit).
+    for (const ward of wards) {
+      if (s.pos.distanceToSquared(ward.pos) < WARD_RADIUS * WARD_RADIUS) {
+        s.charge += dt * 0.6;
+        break;
+      }
+    }
+    // Moonlight trickle-charges surface caps — VERY faint, and it follows the
+    // moon: a full clear moon (high moonI) tops them up a touch more than a
+    // sliver does. (Cave caps, below the sky, get none.)
+    if (s.pos.y > -4) s.charge += dt * moonI * 0.01;
     if (s.charge > 1) s.charge = 1;
     s.charge *= Math.exp(-dt / 30); // ~30s afterglow, like real phosphor paint
     s.capMat.emissiveIntensity = 0.05 + s.charge * 0.85;
@@ -1516,12 +1542,36 @@ function frame(): void {
       Math.sin(clock.elapsedTime * 0.55 + s.phase) * 0.035 +
       Math.sin(clock.elapsedTime * 1.3 + s.phase * 2.1) * 0.012;
   }
-  // Strand pendulums: gravity-true — anchored at the top, swinging with
-  // their own period (longer = slower), in two slightly detuned axes so the
-  // motion traces a lazy ellipse, never a metronome.
+  // Strand pendulums: gravity-true — anchored at the top, swinging with their
+  // own period, PLUS a player wake: the orb shoulders each strand aside as it
+  // passes and it swings back with weight (an underdamped driven spring).
+  const STRAND_STIFF = 34; // spring rate — higher = snappier return
+  const STRAND_DAMP = 5.5; // damping — lower = more overshoot/swing (more weight)
+  const STRAND_R = 3.2; // how close the orb must be to disturb a strand
   for (const s of strandSway) {
-    s.group.rotation.z = Math.sin(clock.elapsedTime * s.rate + s.phase) * s.amp;
-    s.group.rotation.x = Math.sin(clock.elapsedTime * s.rate * 0.93 + s.phase * 1.7) * s.amp * 0.7;
+    const swayZ = Math.sin(clock.elapsedTime * s.rate + s.phase) * s.amp;
+    const swayX = Math.sin(clock.elapsedTime * s.rate * 0.93 + s.phase * 1.7) * s.amp * 0.7;
+
+    // Target lean: away from the orb, stronger the closer it is.
+    const dx = s.group.position.x - orb.pos.x;
+    const dz = s.group.position.z - orb.pos.z;
+    const d2 = dx * dx + dz * dz;
+    let tx = 0;
+    let tz = 0;
+    if (d2 < STRAND_R * STRAND_R) {
+      const d = Math.sqrt(d2) + 1e-3;
+      const push = (1 - d / STRAND_R) * 0.5;
+      tx = (dx / d) * push;
+      tz = (dz / d) * push;
+    }
+    // Damped spring toward the target — the velocity term is what gives weight.
+    s.velX += ((tx - s.pushX) * STRAND_STIFF - s.velX * STRAND_DAMP) * dt;
+    s.velZ += ((tz - s.pushZ) * STRAND_STIFF - s.velZ * STRAND_DAMP) * dt;
+    s.pushX += s.velX * dt;
+    s.pushZ += s.velZ * dt;
+
+    s.group.rotation.z = swayZ + s.pushX;
+    s.group.rotation.x = swayX - s.pushZ;
   }
   updateFloraCulling();
   updateCamera(dt);
