@@ -10,8 +10,8 @@
  *   ONE-HANDED MOUSE (design goal: full play with one hand)
  *                    LMB-drag look · RMB-hold glide forward · wheel-up jump
  *                    MMB pulse
- *   GAMEPAD          L-stick glide · R-stick look · A wave-jump · X pulse
- *                    B dash · Y ward · Start tide
+ *   GAMEPAD          L-stick glide · R-stick look · A jump (hold = hover) · B dash
+ *                    X pulse · Y ward · L3 camera view · R3 tide · Start menu
  *   TOUCH            left half = virtual move-stick · right half = look-drag
  *                    on-screen buttons: PULSE · JUMP · WARD
  *
@@ -52,8 +52,10 @@ export class Input {
   private _dash = false;
   private _buildWard = false;
   private _tide = false;
+  /** Camera-mode toggle edge (KeyV / gamepad L3) — same flip as pressing V. */
+  private _camToggle = false;
 
-  /** Autoforward: toggled with L3 / KeyQ, cancelled by pulling back. */
+  /** Autoforward: toggled with KeyQ, cancelled by pulling back. */
   private autoForward = false;
 
   /** Pointer lock: desktop mouse-look without click-dragging. */
@@ -62,6 +64,9 @@ export class Input {
   /** Held (not edge) dash state per device — sprint is a HOLD. */
   private gpDashHeld = false;
   private touchDashHeld = false;
+  /** Held jump state per device — HOLD to hover-boost (see Orb.update). */
+  private gpJumpHeld = false;
+  private touchJumpHeld = false;
 
   /** Gamepad state. */
   private gpMove = { x: 0, z: 0 };
@@ -121,7 +126,12 @@ export class Input {
       (opts.primary ? wrap : secondary).appendChild(b);
       return b;
     };
-    mk('JUMP', () => (this._jump = true));
+    const jumpBtn = mk('JUMP', () => (this._jump = true));
+    // JUMP taps a wave-jump; HELD it hover-boosts (finger up = let go / fall).
+    jumpBtn.addEventListener('pointerdown', () => (this.touchJumpHeld = true));
+    jumpBtn.addEventListener('pointerup', () => (this.touchJumpHeld = false));
+    jumpBtn.addEventListener('pointercancel', () => (this.touchJumpHeld = false));
+    jumpBtn.addEventListener('pointerleave', () => (this.touchJumpHeld = false));
     const dashBtn = mk('DASH', () => (this._dash = true));
     // DASH taps a blink-burst; HELD it also sprints (finger up = cruise).
     dashBtn.addEventListener('pointerdown', () => (this.touchDashHeld = true));
@@ -302,6 +312,7 @@ export class Input {
       this.gpDpad.x = 0;
       this.gpDpad.z = 0;
       this.gpDashHeld = false;
+      this.gpJumpHeld = false;
       this.gpPrev.clear();
       return;
     }
@@ -313,6 +324,7 @@ export class Input {
     let rx = 0;
     let ry = 0;
     let padDashHeld = false;
+    let padJumpHeld = false;
 
     const nextPrev = new Map<number, boolean[]>();
     for (const gp of connected) {
@@ -338,14 +350,18 @@ export class Input {
         ry = lookY;
       }
 
+      // Face buttons only (single-button verbs — no bumpers/triggers yet):
+      //   A jump · B dash · X pulse · Y ward · L3 camera · R3 tide.
+      // Start (9) is the menu button, handled by the menu's own pad poll.
       const edge = (i: number) => pressed(gp, i) && !prev[i];
-      if (edge(0)) this._jump = true;
-      if (edge(1) || edge(5)) this._dash = true;
-      if (edge(2) || edge(4) || edge(6) || edge(7)) this._pulse = true;
-      if (edge(3)) this._buildWard = true;
-      if (edge(9)) this._tide = true;
-      if (edge(10)) this.autoForward = !this.autoForward; // L3: cruise control
-      if (pressed(gp, 1) || pressed(gp, 5)) padDashHeld = true; // B/RB held
+      if (edge(0)) this._jump = true; // A
+      if (edge(1)) this._dash = true; // B
+      if (edge(2)) this._pulse = true; // X
+      if (edge(3)) this._buildWard = true; // Y
+      if (edge(11)) this._tide = true; // R3: call a tide (test)
+      if (edge(10)) this._camToggle = true; // L3: flip camera mode (like KeyV)
+      if (pressed(gp, 1)) padDashHeld = true; // B held → sprint
+      if (pressed(gp, 0)) padJumpHeld = true; // A held → hover-boost
 
       nextPrev.set(gp.index, gp.buttons.map((b) => b.pressed));
     }
@@ -355,9 +371,15 @@ export class Input {
     this.gpDpad.x = dpadX;
     this.gpDpad.z = dpadZ;
     this.gpDashHeld = padDashHeld;
+    this.gpJumpHeld = padJumpHeld;
     this.orbitDX += rx * 520 * dt;
     this.orbitDY += ry * 380 * dt;
     this.gpPrev = nextPrev;
+  }
+
+  /** Jump HELD on any device → hover-boost (tap = wave-jump). Space / A / touch. */
+  jumpHeld(): boolean {
+    return this.keys.has('Space') || this.gpJumpHeld || this.touchJumpHeld;
   }
 
   /** Dash key HELD on any device → sprint at the old cruise speed (tap = dash). */
@@ -402,19 +424,28 @@ export class Input {
   }
 
   /** Read + clear edge actions for this frame. */
-  consumeActions(): { pulse: boolean; jump: boolean; dash: boolean; buildWard: boolean; tide: boolean } {
+  consumeActions(): {
+    pulse: boolean;
+    jump: boolean;
+    dash: boolean;
+    buildWard: boolean;
+    tide: boolean;
+    camToggle: boolean;
+  } {
     const r = {
       pulse: this._pulse,
       jump: this._jump,
       dash: this._dash,
       buildWard: this._buildWard,
       tide: this._tide,
+      camToggle: this._camToggle,
     };
     this._pulse = false;
     this._jump = false;
     this._dash = false;
     this._buildWard = false;
     this._tide = false;
+    this._camToggle = false;
     return r;
   }
 

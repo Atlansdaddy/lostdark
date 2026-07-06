@@ -23,6 +23,17 @@ export const enum Mat {
    *  the flood-fill grid. The hybrid art rule's glue: life is mesh, its light
    *  is still voxel-true. */
   GlowAir = 10,
+  /** Water pool marker. NON-SOLID so the voxel mesher skips it (no ugly cubes) —
+   *  the visible surface is a dedicated wave-shader mesh (render/WaterZone). Its
+   *  faint emission feeds the flood-fill so a pool casts a soft luminescence onto
+   *  its basin walls. The testbed water corner. */
+  Water = 11,
+  /** Dead charcoal — dark, solid, non-emissive. The bulk of the ember/coal
+   *  hearth; it reads black until the fire's dynamic light licks over it. */
+  Coal = 12,
+  /** Live coal — solid + hot emissive. Scattered through the Coal bed so the
+   *  hearth glows from within (bloom turns these into embers). */
+  Ember = 13,
 }
 
 export interface Material {
@@ -85,6 +96,34 @@ export const MATERIALS: Record<Mat, Material> = {
     solid: false,
     density: 0,
     hardness: 0,
+  }),
+  [Mat.Water]: M({
+    id: Mat.Water,
+    name: 'Water',
+    // A dark reflective paint (never literal black — see the light-paths rule):
+    // the surface mesh carries the real look; this is just the voxel marker.
+    color: [0.03, 0.09, 0.16],
+    emission: 0, // DARK until a light is near (John's call) — no self-glow at all
+    solid: false, // mesher skips it; the wave surface is a separate mesh
+    density: 1.0,
+    hardness: 0,
+  }),
+  [Mat.Coal]: M({
+    id: Mat.Coal,
+    name: 'Coal',
+    color: [0.045, 0.038, 0.033], // charcoal — dark but non-zero so light reads
+    emission: 0,
+    density: 1.3,
+    hardness: 3,
+  }),
+  [Mat.Ember]: M({
+    id: Mat.Ember,
+    name: 'Ember',
+    color: [0.14, 0.06, 0.02],
+    emission: 9, // hot coal — glows the hearth from within (blooms to embers)
+    emissionColor: [1.0, 0.42, 0.12],
+    density: 1.3,
+    hardness: 2,
   }),
 };
 

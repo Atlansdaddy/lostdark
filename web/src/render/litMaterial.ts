@@ -44,6 +44,16 @@ export interface LitUniforms {
   uWardPos: { value: THREE.Vector3[] };
   uWardColor: { value: THREE.Color };
   uWardRadius: { value: number };
+  // --- Charged phosphor-shrooms as explicit point lights. Each casts a real
+  // ray-marched shadow against the STATIC solidity volume (no per-frame repack,
+  // so no stutter). The grove you charge lights itself and throws shadows. ---
+  uShroomCount: { value: number };
+  uShroomPos: { value: THREE.Vector3[] };
+  uShroomColor: { value: THREE.Color[] };
+  uShroomI: { value: number[] };
+  /** Per-light reach — big caps ~9, tiny button/shelf caps ~3. One engine,
+   *  per-source properties. */
+  uShroomR: { value: number[] };
   // --- Sampled light volume (LightVolume 2D atlas). uLightVolMix blends it
   // against the per-vertex baked light: 0 = today's look, 1 = volume-driven. ---
   uLightAtlas: { value: THREE.Texture | null };
@@ -74,6 +84,12 @@ export function createLitMaterial(): { material: THREE.ShaderMaterial; uniforms:
     uWardPos: { value: Array.from({ length: 12 }, () => new THREE.Vector3()) },
     uWardColor: { value: new THREE.Color(0.5, 1.0, 0.82) }, // ward teal
     uWardRadius: { value: 15 }, // soft glow that fills the ward's dome
+
+    uShroomCount: { value: 0 },
+    uShroomPos: { value: Array.from({ length: 8 }, () => new THREE.Vector3()) },
+    uShroomColor: { value: Array.from({ length: 8 }, () => new THREE.Color()) },
+    uShroomI: { value: new Array(8).fill(0) as number[] },
+    uShroomR: { value: new Array(8).fill(9) as number[] }, // per-light reach (big cap 9, micro cap ~3)
 
     uLightAtlas: { value: null },
     uLightMin: { value: new THREE.Vector3(-128, -14, -128) },
@@ -129,6 +145,14 @@ export function createLitMaterial(): { material: THREE.ShaderMaterial; uniforms:
       uniform vec3 uWardPos[MAX_WARDS];
       uniform vec3 uWardColor;
       uniform float uWardRadius;
+
+      // Charged phosphor-shrooms: explicit point lights that cast real shadows.
+      #define MAX_SHROOMS 8
+      uniform int uShroomCount;
+      uniform vec3 uShroomPos[MAX_SHROOMS];
+      uniform vec3 uShroomColor[MAX_SHROOMS];
+      uniform float uShroomI[MAX_SHROOMS];
+      uniform float uShroomR[MAX_SHROOMS];
 
       // Sampled light volume (2D atlas of the flood-fill; see LightVolume.ts).
       uniform sampler2D uLightAtlas;
@@ -194,6 +218,22 @@ export function createLitMaterial(): { material: THREE.ShaderMaterial; uniforms:
         vec3 dir = d / dist;
         float march = min(dist - 1.0, 16.0);
         for (int i = 1; i <= 16; i++) {
+          if (float(i) >= march) break;
+          if (sampleSolid(p + dir * (float(i) + 0.5)) > 0.5) return 0.0;
+        }
+        return 1.0;
+      }
+
+      // Same march, but toward an ARBITRARY point light (charged shrooms). Solid
+      // voxels between the surface and the light throw a shadow. Short cap (14)
+      // keeps it cheap; only ever called for surfaces inside a shroom's radius.
+      float ptShadow(vec3 p, vec3 lp) {
+        vec3 d = lp - p;
+        float dist = length(d);
+        if (dist < 1.5) return 1.0;
+        vec3 dir = d / dist;
+        float march = min(dist - 1.0, 14.0);
+        for (int i = 1; i <= 14; i++) {
           if (float(i) >= march) break;
           if (sampleSolid(p + dir * (float(i) + 0.5)) > 0.5) return 0.0;
         }
@@ -304,20 +344,25 @@ export function createLitMaterial(): { material: THREE.ShaderMaterial; uniforms:
         // ---- bump-from-noise: the surface has RELIEF under raking light.
         // Only computed where dynamic light actually reaches — everywhere
         // else is dark and relief would be invisible (darkness = perf budget).
+        // Relief fades in SMOOTHLY near light (perf gate stays — the noise taps
+        // only run where the blend is non-zero). The old hard step() popped the
+        // bump normal on/off at exactly orbRadius+1, and since bumpN feeds EVERY
+        // light term (held/ward/moon too), that pop drew a circle on the ground.
         float odPre = distance(p, uOrbPos);
-        float nearLight = step(odPre, uOrbRadius + 1.0);
+        float bumpBlend = 1.0 - smoothstep(uOrbRadius - 2.0, uOrbRadius + 2.0, odPre);
         if (uPulseIntensity > 0.0 && uPulseRadius >= 0.0) {
           float pdPre = distance(p, uPulseCenter);
-          nearLight = max(nearLight, step(abs(pdPre - uPulseRadius), uPulseThickness + 1.0));
+          bumpBlend = max(bumpBlend,
+            1.0 - smoothstep(uPulseThickness - 1.0, uPulseThickness + 2.0, abs(pdPre - uPulseRadius)));
         }
         vec3 bumpN = vNormal;
-        if (nearLight > 0.5) {
+        if (bumpBlend > 0.004) {
           vec3 bt1 = normalize(cross(vNormal, vec3(0.0, 1.0, 0.001)));
           vec3 bt2 = cross(vNormal, bt1);
           float bh0 = vnoise(p * 3.4);
           float bhx = vnoise((p + bt1 * 0.22) * 3.4);
           float bhy = vnoise((p + bt2 * 0.22) * 3.4);
-          bumpN = normalize(vNormal + (bt1 * (bh0 - bhx) + bt2 * (bh0 - bhy)) * 2.4);
+          bumpN = normalize(vNormal + (bt1 * (bh0 - bhx) + bt2 * (bh0 - bhy)) * 2.4 * bumpBlend);
         }
 
         // ---- lighting (bump normal: the texture catches raking light) ----
@@ -377,8 +422,24 @@ export function createLitMaterial(): { material: THREE.ShaderMaterial; uniforms:
           wardLit = albedo * wsum * uWardColor * vAO * wardKeep;
         }
 
+        // Charged phosphor-shrooms paint their grove and cast real ray-marched
+        // shadows. Guarded hard: the shadow march only runs for surfaces actually
+        // inside a charged cap's radius — near-free in the dark everywhere else.
+        vec3 shroomLit = vec3(0.0);
+        for (int i = 0; i < MAX_SHROOMS; i++) {
+          if (i >= uShroomCount) break;
+          float sd = distance(p, uShroomPos[i]);
+          float sb = 1.0 - clamp(sd / uShroomR[i], 0.0, 1.0);
+          sb = sb * sb * uShroomI[i];
+          if (sb <= 0.001) continue;
+          vec3 toS = normalize(uShroomPos[i] - vWorld + 1e-4);
+          sb *= 0.45 + 0.55 * clamp(dot(bumpN, toS), 0.0, 1.0);
+          sb *= ptShadow(p + vNormal * 1.5, uShroomPos[i]);
+          shroomLit += albedo * sb * uShroomColor[i] * vAO;
+        }
+
         vec3 lit = albedo * (uAmbient * sky * vAO) * uTideDark + albedo * held * uHeldColor
-                 + albedo * dyn + wardLit;
+                 + albedo * dyn + wardLit + shroomLit;
 
         // Subtle emissive rim (ART.md §1.3, locked "subtle"): where a LIT
         // surface silhouettes against the dark, its edge catches a faint

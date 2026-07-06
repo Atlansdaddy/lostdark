@@ -14,6 +14,7 @@
 
 import * as THREE from 'three';
 import { Move, Survival, Light } from '../config';
+import { Mat } from '../world/Materials';
 import { VoxelWorld } from '../world/VoxelWorld';
 
 const RADIUS = 0.45; // orb collision radius in voxels
@@ -37,6 +38,10 @@ export class Orb {
 
   private jumpsUsed = 0;
   grounded = false;
+  /** World-Y of the floor top-face directly below the orb (bob-invariant, so
+   *  the fog can sit ON the ground instead of riding the hover spring). Falls
+   *  to orb.y − GROUND_PROBE when there's no floor within reach (over a drop). */
+  floorY = 0;
   /** Set true for one frame when a wave-jump fires (drives the jump pulse FX). */
   jumped = false;
 
@@ -58,6 +63,17 @@ export class Orb {
    *  climbed back out by tapping up, while descending is just not jumping. */
   liftZone = false;
 
+  // --- Water (testbed pool): buoyancy + drag + a surface to leap from. ---
+  /** True while the orb rides in/on a water column. */
+  inWater = false;
+  /** World-Y of the water surface over the orb's column (−Infinity when dry). */
+  waterSurfaceY = -Infinity;
+  /** One-frame flag: the orb just crossed the surface hard (splash FX cue). */
+  splashed = false;
+  /** Camera pitch, fed by the scene each frame — swimming follows the LOOK:
+   *  aim down and push forward to dive, aim up to climb back out. */
+  lookPitch = 0;
+
   constructor(private world: VoxelWorld) {}
 
   spawn(x: number, y: number, z: number): void {
@@ -71,6 +87,7 @@ export class Orb {
    * @param jump   edge-triggered wave-jump this frame
    * @param sprint sprint HELD: glide at the old cruise speed, draining energy
    * @param dash   edge-triggered dash this frame: a blink-burst (ground or air)
+   * @param jumpHeld jump button HELD: sustained hover-boost, energy-hungry
    */
   update(
     dt: number,
@@ -79,6 +96,7 @@ export class Orb {
     jump: boolean,
     sprint: boolean,
     dash: boolean,
+    jumpHeld = false,
   ): void {
     // Camera-space intent → world direction.
     // Camera sits at azimuth `yaw` behind the orb, so its view axes are:
@@ -91,6 +109,7 @@ export class Orb {
 
     // --- Ground state first: dash and jump both read it. ---
     const floorDist = this.probeFloor();
+    this.floorY = this.pos.y - floorDist; // real ground under the orb, no bob
     this.grounded = floorDist <= Move.hoverHeight + 0.6;
     if (this.grounded) {
       this.jumpsUsed = 0;
@@ -99,6 +118,19 @@ export class Orb {
     // In a climb shaft the chain refreshes every frame and jumps are free, so a
     // deep drop is never a trap — tap up to bounce out the chimney.
     if (this.liftZone) this.jumpsUsed = 0;
+
+    // --- Water state: buoyancy makes the pool a floor you bob ON, and the jump
+    // chain refreshes every frame in it, so water is never a pit trap — float
+    // up, then leap out. Hysteresis (+0.45 vs the 0.35 float line) so the
+    // surface hand-off doesn't flutter. ---
+    this.waterSurfaceY = this.probeWater();
+    const wasInWater = this.inWater;
+    this.inWater = this.waterSurfaceY > -1e8 && this.pos.y < this.waterSurfaceY + 0.45;
+    this.splashed = this.inWater !== wasInWater && Math.abs(this.vel.y) > 1.5;
+    if (this.inWater) {
+      this.jumpsUsed = 0;
+      this.airDashesUsed = 0;
+    }
 
     // --- Dash: a dedicated blink-burst. Fires on the ground or in the air
     //     (air dashes limited per airtime), separate from hold-to-sprint. ---
@@ -165,11 +197,56 @@ export class Orb {
       this.dashTimer = 0; // a jump breaks the dash float — leap out of the blink
     }
 
+    // Hover-boost: while the jump button is HELD (and there's energy) the orb
+    // keeps lifting toward a ceiling, then hovers there — a sustained, costly
+    // alternative to the skillful triple-jump chain. Overrides the hover spring.
+    const boosting = jumpHeld && this.energy > 0 && this.dashTimer <= 0;
+    if (boosting) this.energy = Math.max(0, this.energy - Move.hoverBoost.costPerSec * dt);
+
     if (this.dashTimer > 0) {
       // During the burst the orb floats: gravity and the hover spring are held
       // off so the dash reads as a clean horizontal blink, ground or air.
       this.vel.y *= Math.max(0, 1 - 12 * dt);
       this.dashTimer = Math.max(0, this.dashTimer - dt);
+    } else if (this.inWater) {
+      // SWIM, not just float. The vertical is driven by intent, in priority:
+      //   1. Look-swim: aim the camera down and push forward to DIVE, aim up
+      //      to climb — swimming follows the look, like any 3D swimmer.
+      //   2. Hold jump: paddle straight up.
+      //   3. No intent, submerged: gentle buoyant drift back toward the light.
+      //   4. At the surface: bob on the float line (an underdamped spring).
+      // A wave-jump (chain refreshed every frame in water) still leaps you out.
+      const depth = this.waterSurfaceY - this.pos.y; // >0 = submerged
+      const fwdIntent = -move.z; // W = +1
+      const vertTarget = -fwdIntent * Math.sin(this.lookPitch) * speed * 0.6;
+      if (Math.abs(vertTarget) > 0.4) {
+        this.vel.y += (vertTarget - this.vel.y) * Math.min(1, 6 * dt);
+      } else if (jumpHeld && this.energy > 0) {
+        this.vel.y += 16 * dt; // paddle straight up
+      } else if (depth > 0.9) {
+        this.vel.y += (2.2 - this.vel.y) * 1.6 * dt; // idle: slow rise to the surface
+      } else {
+        const floatY = this.waterSurfaceY + 0.35;
+        this.vel.y += ((floatY - this.pos.y) * 30 - this.vel.y * 7) * dt;
+      }
+      const drag = Math.max(0, 1 - 2.0 * dt);
+      this.vel.x *= drag;
+      this.vel.z *= drag;
+    } else if (boosting) {
+      const h = this.pos.y - this.floorY;
+      if (h < Move.hoverBoost.ceiling) {
+        // Climb — but don't cap a fresh wave-jump's ballistic pop; let gravity
+        // bleed that down into hover range, then sustain the climb.
+        if (this.vel.y < Move.hoverBoost.riseSpeed) {
+          this.vel.y = Math.min(this.vel.y + Move.hoverBoost.accel * dt, Move.hoverBoost.riseSpeed);
+        } else {
+          this.vel.y -= Move.gravity * dt;
+        }
+      } else {
+        // At the ceiling: settle into a hover, easing down if we overshot.
+        this.vel.y += (0 - this.vel.y) * Math.min(1, 12 * dt);
+        if (h > Move.hoverBoost.ceiling + 0.4) this.vel.y = Math.min(this.vel.y, -0.6);
+      }
     } else {
       this.vel.y -= Move.gravity * dt;
       // Hover spring engages near the floor — but never fights an active jump
@@ -206,6 +283,24 @@ export class Orb {
     this.breath += dt * this.pulseRate * (1 + 0.25 * Math.sin(this.breath * 0.7));
     const depth = 0.09 + 0.07 / Math.max(this.pulseRate, 0.8);
     this.breathGlow = 1 + depth * Math.sin(this.breath) + 0.05 * Math.sin(this.breath * 2.3);
+  }
+
+  /** World-Y of the water surface over the orb's column, or −Infinity when the
+   *  orb isn't in/right above a water voxel. The visible surface plane sits
+   *  0.6 into the top water voxel (see Testbeds), so the physics agree with
+   *  what the player sees. */
+  private probeWater(): number {
+    const x = Math.floor(this.pos.x);
+    const z = Math.floor(this.pos.z);
+    let y = Math.floor(this.pos.y);
+    if (this.world.get(x, y, z) !== Mat.Water) {
+      // Riding just above the top water voxel still counts (surface bobbing).
+      if (this.world.get(x, y - 1, z) === Mat.Water) y -= 1;
+      else return -Infinity;
+    }
+    let top = y;
+    while (this.world.get(x, top + 1, z) === Mat.Water) top++;
+    return top + 0.6;
   }
 
   /** Distance from the orb's center to the first solid voxel straight below. */

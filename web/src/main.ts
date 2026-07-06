@@ -26,7 +26,7 @@ import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
 import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
-import { VolumetricFogPass, MAX_FOG_LIGHTS } from './render/VolumetricFogPass';
+import { VolumetricFogPass } from './render/VolumetricFogPass';
 import { GrassField } from './render/GrassField';
 import { SkyDome, cloudCoverAt } from './render/SkyDome';
 import { GodRaysPass } from './render/GodRaysPass';
@@ -42,8 +42,14 @@ import { buildSmoothChunkGeometry } from './render/SmoothMesher';
 import { Mat } from './world/Materials';
 import { Chunk, VoxelWorld } from './world/VoxelWorld';
 import { generateReek } from './world/ReekGen';
+import { carveTestbeds } from './world/Testbeds';
+import { WaterZone } from './render/WaterZone';
+import { FireZone } from './render/FireZone';
+import { BuildSandbox } from './world/BuildSandbox';
 import { FloraLibrary, type FloraName } from './world/FloraAssets';
+import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { Menu, type MenuBridge } from './ui/Menu';
+import { Minimap } from './ui/Minimap';
 
 type Pickup = {
   mesh: THREE.Mesh;
@@ -55,8 +61,25 @@ type Ward = {
   pos: THREE.Vector3;
   light: THREE.PointLight;
   core: THREE.Mesh;
-  /** The visible field of protection — a soft dome showing WHERE you're safe. */
+  /** Reactive membrane — INVISIBLE at rest. It fades in only while a tide
+   *  presses on it (and for a breath at placement), so the default read of a
+   *  ward is the ground ring + anchor, and the dome means "under attack". */
   dome: THREE.Mesh;
+  /** Keeper anchor body: the universal obelisk silhouette (Meshy GLB when
+   *  loaded, procedural shard fallback otherwise — see makeWardAnchor). */
+  anchor: THREE.Object3D;
+  /** Ground rings: the WARD_RADIUS ring is the default visible truth of the
+   *  safe circle; a small footprint ring seats the anchor on its plinth. */
+  rings: THREE.Group;
+  /** Faint vertical light column rising off the lumen core. */
+  beam: THREE.Mesh;
+  /** Glow-motes drifting inward across the circle — light being gathered. */
+  motes: THREE.Points;
+  /** Per-mote [angle, radius, height, drift speed], packed 4 floats each. */
+  moteState: Float32Array;
+  /** 1 at the moment of placement, decays over ~2s: the membrane is born
+   *  visible (activation surge), then rests until a tide tests it. */
+  activation: number;
   /** Voxel coords + floor height the ward was built at — enough to re-spawn it
    *  exactly when a save is loaded onto a fresh world. */
   vx: number;
@@ -64,8 +87,25 @@ type Ward = {
   floorY: number;
 };
 
-/** Ward protection radius (voxels). One number: dome size = mechanics = truth. */
+/** Ward protection radius (voxels). One number: ring size = mechanics = truth. */
 const WARD_RADIUS = 12;
+/** Anchor body height (units) — the lumen core hangs in its niche at ~2/3. */
+const WARD_ANCHOR_HEIGHT = 3.6;
+
+/** The ward is UNIVERSAL: one Keeper-anchor silhouette everywhere — obelisk +
+ *  ring + core + motes. The BIOME only skins it (mote/membrane/ring colors,
+ *  local particles); add entries here as biomes land. Never fork the ward's
+ *  shape per biome — that fragments the design language (docs/MESHY_ward.md). */
+const WARD_DRESSING = {
+  reek: {
+    light: 0x7fffd1,
+    core: 0x9dffd8,
+    ring: 0x7fffd1,
+    dome: 0x7fffd1,
+    /** Spore-teal with a violet drift — The Reek's contamination in the light. */
+    motes: [0x8fffe0, 0xb695ff],
+  },
+} as const;
 
 const app = document.querySelector<HTMLDivElement>('#app');
 const boot = document.querySelector<HTMLDivElement>('#boot');
@@ -169,10 +209,17 @@ composer.addPass(new RenderPass(scene, camera));
 // performance — the objects still exist so their per-frame setters are no-ops
 // and re-enabling later is just un-commenting these addPass calls + the prepass.
 const fogPass = new VolumetricFogPass(camera, sceneDepth);
-// composer.addPass(fogPass);
+// composer.addPass(fogPass); // OFF — the full-screen raymarch + depth prepass washed
+// the horizon and cost ~30fps. Replaced by GroundFog (a cheap contained plane stack).
 const godRays = new GodRaysPass(sceneDepth);
 // composer.addPass(godRays);
-const VOLUMETRICS_ON = false; // master switch for the fog/god-ray atmosphere
+const VOLUMETRICS_ON = false; // no depth prepass — GroundFog is a mesh, needs neither
+
+// Ground-smoke: OFF (John, 2026-07-06). The plane-stack approach rendered with
+// choppy layer lines and juddered on stepped terrain — it needs a real
+// ground-conforming design (per-fragment terrain height + weight/pooling in
+// dips, stopping at cave mouths) before it comes back. Class kept; not
+// instantiated, zero per-frame cost.
 
 /** Static fog lights (glowcaps, crystals, wards) — slot 0 is the orb, live. */
 const fogLightRegistry: { pos: THREE.Vector3; color: THREE.Color; intensity: number }[] = [];
@@ -194,6 +241,10 @@ orb.extraCollide = (p, r) => floraCollides(p, r);
 const mood = new OrbMood();
 let landSquash = 0; // landing squash impulse, decays fast
 let wasGrounded = true;
+let waterWakeTimer = 0; // throttles swim-wake ripples (see the water block in frame)
+// Controller telemetry is a setup aid, not gameplay UI — OFF by default,
+// toggled with P (hides the HUD line and drops the pad segment from metrics).
+let showPadDebug = false;
 const { material: worldMaterial, uniforms } = createLitMaterial();
 
 // Flora (trees, shrooms, crystals) are MeshStandardMaterials — the terrain's
@@ -224,7 +275,26 @@ function addPulseReveal(mat: THREE.MeshStandardMaterial): void {
     shader.uniforms.uLightDim = uniforms.uLightDim;
     shader.uniforms.uLightTiles = uniforms.uLightTiles;
     shader.uniforms.uHeldColor = uniforms.uHeldColor;
-    let vtxHead = 'varying vec3 vPulseWP;\n';
+    // Charged shrooms light the grove's FLORA too (not just the ground), and
+    // ray-march shadows against the same static solidity volume the terrain uses.
+    shader.uniforms.uShroomCount = uniforms.uShroomCount;
+    shader.uniforms.uShroomPos = uniforms.uShroomPos;
+    shader.uniforms.uShroomColor = uniforms.uShroomColor;
+    shader.uniforms.uShroomI = uniforms.uShroomI;
+    shader.uniforms.uShroomR = uniforms.uShroomR;
+    // The orb as a REAL organic light on foliage: half-Lambert wrap + leaf
+    // transmission (see the fragment). This is the fix for "flat/black foliage" —
+    // pro vegetation shaders (Crysis/SpeedTree/Unreal) light leaves with a
+    // transmittance lobe, not plain diffuse that goes black on shaded sides.
+    shader.uniforms.uOrbPos = uniforms.uOrbPos;
+    shader.uniforms.uOrbColor = uniforms.uOrbColor;
+    shader.uniforms.uOrbIntensity = uniforms.uOrbIntensity;
+    // UNIFY with the terrain: flora reads the SAME held light-volume (the
+    // propagated flood-fill light from charged groves, wards, crystals, biome),
+    // faded by the tide exactly like the ground. This is why the fog lit up but
+    // the trees didn't — the trees never sampled the environment light.
+    shader.uniforms.uTideDark = uniforms.uTideDark;
+    let vtxHead = 'varying vec3 vPulseWP;\nvarying vec3 vWNormal;\n';
     if (isLeaf) {
       shader.uniforms.uLeafTime = { value: 0 };
       leafTimeUniform = shader.uniforms.uLeafTime;
@@ -252,10 +322,13 @@ function addPulseReveal(mat: THREE.MeshStandardMaterial): void {
       `#include <begin_vertex>
          ${windCode}
          vec4 pulseWP = vec4(transformed, 1.0);
+         vec3 wnrm = objectNormal;
          #ifdef USE_INSTANCING
            pulseWP = instanceMatrix * pulseWP;
+           wnrm = mat3(instanceMatrix) * wnrm;
          #endif
-         vPulseWP = (modelMatrix * pulseWP).xyz;`,
+         vPulseWP = (modelMatrix * pulseWP).xyz;
+         vWNormal = normalize(mat3(modelMatrix) * wnrm);`,
     );
     shader.fragmentShader =
       `uniform vec3 uPulseCenter;
@@ -269,7 +342,18 @@ function addPulseReveal(mat: THREE.MeshStandardMaterial): void {
        uniform vec3 uLightDim;
        uniform vec2 uLightTiles;
        uniform vec3 uHeldColor;
+       #define MAX_SHROOMS 8
+       uniform int uShroomCount;
+       uniform vec3 uShroomPos[MAX_SHROOMS];
+       uniform vec3 uShroomColor[MAX_SHROOMS];
+       uniform float uShroomI[MAX_SHROOMS];
+       uniform float uShroomR[MAX_SHROOMS];
+       uniform vec3 uOrbPos;
+       uniform vec3 uOrbColor;
+       uniform float uOrbIntensity;
+       uniform float uTideDark;
        varying vec3 vPulseWP;
+       varying vec3 vWNormal;
        // Same 2D-atlas flood-fill sampler as the terrain shader.
        float sampleLightVol(vec3 wp) {
          vec3 v = (wp - uLightMin) / uLightStep;
@@ -287,10 +371,81 @@ function addPulseReveal(mat: THREE.MeshStandardMaterial): void {
          vec2 uv0 = vec2(t0.x * nx + cx, t0.y * nz + cz) / vec2(aw, ah);
          vec2 uv1 = vec2(t1.x * nx + cx, t1.y * nz + cz) / vec2(aw, ah);
          return mix(texture2D(uLightAtlas, uv0).r, texture2D(uLightAtlas, uv1).r, wy);
+       }
+       // Solidity (alpha) from the volume — nearest Y-slice. Used to shadow the
+       // shroom lights against the same static geometry the terrain marches.
+       float sampleSolid(vec3 wp) {
+         vec3 v = (wp - uLightMin) / uLightStep;
+         float nx = uLightDim.x, ny = uLightDim.y, nz = uLightDim.z;
+         float tX = uLightTiles.x, tY = uLightTiles.y;
+         float aw = tX * nx, ah = tY * nz;
+         float cx = clamp(v.x, 0.5, nx - 0.5);
+         float cz = clamp(v.z, 0.5, nz - 0.5);
+         float s = clamp(floor(v.y), 0.0, ny - 1.0);
+         vec2 t = vec2(mod(s, tX), floor(s / tX));
+         vec2 uv = vec2(t.x * nx + cx, t.y * nz + cz) / vec2(aw, ah);
+         return texture2D(uLightAtlas, uv).a;
+       }
+       float ptShadow(vec3 p, vec3 lp) {
+         vec3 d = lp - p; float dist = length(d);
+         if (dist < 1.5) return 1.0;
+         vec3 dir = d / dist;
+         float march = min(dist - 1.0, 14.0);
+         for (int i = 1; i <= 14; i++) {
+           if (float(i) >= march) break;
+           if (sampleSolid(p + dir * (float(i) + 0.5)) > 0.5) return 0.0;
+         }
+         return 1.0;
+       }
+       // Organic point light on foliage. WRAP (half-Lambert) so shaded sides keep
+       // a value floor (never black) — used by ALL flora. TRANSMISSION (light
+       // through the thin leaf toward the eye, warm-shifted) is gated by translu
+       // and ONLY applied to leaves — a solid rock/trunk is NOT translucent, so
+       // giving it a glow-through read as ghostly/transparent. Recipe: Crysis/
+       // SpeedTree/Unreal Two-Sided Foliage. Defined AFTER ptShadow it calls —
+       // GLSL has no hoisting, so this MUST come last (that ordering bug blanked
+       // every flora mesh).
+       vec3 floraLight(vec3 albedo, vec3 lp, vec3 lcol, float reach, float power, float translu) {
+         vec3 toL = lp - vPulseWP;
+         float d = length(toL);
+         float atten = 1.0 - clamp(d / reach, 0.0, 1.0);
+         atten = atten * atten * power;
+         if (atten < 0.001) return vec3(0.0);
+         vec3 L = toL / max(d, 1e-4);
+         float sh = ptShadow(vPulseWP, lp);
+         float wrap = clamp(dot(vWNormal, L) * 0.5 + 0.5, 0.0, 1.0);       // reads on grazing/shaded sides
+         vec3 body = albedo * wrap;
+         vec3 glow = vec3(0.0);
+         if (translu > 0.001) {
+           vec3 V = normalize(cameraPosition - vPulseWP);
+           float trans = pow(clamp(dot(V, -L) * 0.5 + 0.5, 0.0, 1.0), 2.5); // backlit glow-through
+           glow = albedo * vec3(1.15, 1.0, 0.55) * trans * translu * 0.7;   // warm transmitted light (leaves only)
+         }
+         return (body + glow) * atten * sh * lcol;
        }\n` +
       shader.fragmentShader.replace(
         '#include <opaque_fragment>',
-        `if (uPulseIntensity > 0.0 && uPulseRadius >= 0.0) {
+        `// Held environment light — the SAME propagated flood-fill the terrain reads
+         // (charged groves, wards, crystals, biome light), quadratic response, faded
+         // by the tide. This is the unify step: trees standing in lit air now catch
+         // the light like the ground (and the mist) do.
+         float volL = sampleLightVol(vPulseWP);
+         float held = volL * volL * 1.6 * uTideDark;
+         outgoingLight += diffuseColor.rgb * held * uHeldColor;
+         // Leaves transmit light (translu 1); solid flora (rocks/trunks/caps) do NOT (0).
+         float translu = ${isLeaf ? '1.0' : '0.0'};
+         // The orb reveals foliage organically: wrap + leaf transmission + real
+         // falloff + ray-marched shadow. Reach 15 = the carried bubble on flora.
+         outgoingLight += floraLight(diffuseColor.rgb, uOrbPos, uOrbColor, 15.0, 0.6 + uOrbIntensity, translu);
+         // Charged shrooms light the grove's flora the same organic way, shadowed
+         // by the world so a stem or wall between cap and leaf casts a real shadow.
+         for (int si = 0; si < MAX_SHROOMS; si++) {
+           if (si >= uShroomCount) break;
+           if (uShroomI[si] < 0.001) continue;
+           outgoingLight += floraLight(diffuseColor.rgb, uShroomPos[si], uShroomColor[si], uShroomR[si], uShroomI[si] * 1.4, translu);
+         }
+         // Pulse shell sweep — a bright reveal as the wavefront passes.
+         if (uPulseIntensity > 0.0 && uPulseRadius >= 0.0) {
            float pd = distance(vPulseWP, uPulseCenter);
            float ring = 1.0 - clamp(abs(pd - uPulseRadius) / uPulseThickness, 0.0, 1.0);
            ring = ring * ring * uPulseIntensity;
@@ -406,14 +561,38 @@ const orbAura = new THREE.Sprite(
   }),
 );
 orbAura.scale.setScalar(3.4);
+// Aura + halo are additive glow — they must be SKIPPED by the depth prepass
+// (like the trail/spores/pulse). Otherwise the prepass renders their square
+// sprite/rim quads as opaque depth, and the fog pass reads that square → a
+// boxy fog halo around the orb (the "box glitch"). Core stays on layer 0 so it
+// occludes and writes real depth; only the glow layers move to the effects layer.
+orbAura.layers.set(1);
+orbHalo.layers.set(1);
 orbGroup.add(orbAura, orbHalo, orbCore);
 scene.add(orbGroup);
 
-// distance 16 / decay 1.1: a full, soft SPHERE of light — not a physical
-// inverse-square pinprick. Flora within the bubble get genuinely revealed; it
-// still falls to black by the cutoff so distance stays dark.
-const orbLight = new THREE.PointLight(0x8defff, 2.8, 16, 1.1);
+// UNIFIED FALLOFF LAW (the lighting engine rule): every point light in the game
+// decays at the physical 1/d² (decay 2) with NO range cutoff — light dies because
+// distance kills it, not because a radius window clips it. Non-physical decay
+// (1.1) + a range cutoff was still bright when it hit the window, so it died in
+// a visible RING — the "false circle" on water/crystal. Intensity is higher to
+// compensate (physical falloff eats light fast); the pool is brighter near, dies
+// organically, and never draws a circle.
+const orbLight = new THREE.PointLight(0x8defff, 8, 0, 2);
 scene.add(orbLight);
+
+// Charged shrooms emit REAL light onto everything (imported flora, orb, native
+// meshes), not just the terrain shader's own shroom-light path. A small fixed
+// POOL of point lights is re-aimed each frame at the brightest charged shrooms
+// nearest the orb. Fixed count (always in the scene, intensity 0 when idle) so
+// the light total never changes → no per-frame shader recompiles/hitches.
+const SHROOM_LIGHT_POOL = 4;
+const shroomLights: THREE.PointLight[] = [];
+for (let i = 0; i < SHROOM_LIGHT_POOL; i++) {
+  const L = new THREE.PointLight(0xffffff, 0, 0, 2); // unified falloff law: 1/d², no cutoff ring
+  scene.add(L);
+  shroomLights.push(L);
+}
 
 // --- Orb trail: drifting light-motes in the orb's wake (secondary motion —
 // the single cheapest "it's alive" signal per RESEARCH_orb_life). ---
@@ -486,16 +665,22 @@ for (let i = 0; i < SPORE_MAX; i++) {
   sporeSeed[i * 2] = Math.random() * 100;
   sporeSeed[i * 2 + 1] = 0.15 + Math.random() * 0.3;
 }
+const sporeCol = new Float32Array(SPORE_MAX * 3); // per-mote brightness (light-gated)
 const sporeGeo = new THREE.BufferGeometry();
 sporeGeo.setAttribute('position', new THREE.BufferAttribute(sporePos, 3));
+sporeGeo.setAttribute('color', new THREE.BufferAttribute(sporeCol, 3));
 const sporePoints = new THREE.Points(
   sporeGeo,
+  // Motes are DUST, not fireflies: they carry no light of their own. Each frame
+  // their color is set from how much light actually reaches them (orb bubble +
+  // pulse), so a mote only glints where a beam catches it and is invisible in the
+  // dark. Small + reflective (takes the light's own color), never a self-glow.
   new THREE.PointsMaterial({
-    size: 0.22,
+    size: 0.14,
     map: moteTexture, // soft radial sprite — never hard squares
-    color: 0x7fffc8,
+    vertexColors: true, // brightness driven per-mote by nearby light
     transparent: true,
-    opacity: 0.5,
+    opacity: 0.9,
     blending: THREE.AdditiveBlending,
     depthWrite: false,
     sizeAttenuation: true,
@@ -519,8 +704,32 @@ function updateSpores(dt: number, t: number): void {
       if (rel < -SPORE_RANGE) sporePos[i * 3 + a] += SPORE_RANGE * 2;
     }
     if (sporePos[i * 3 + 1] > 12) sporePos[i * 3 + 1] = 0.3;
+
+    // Light-gate: a dust mote is only visible where light actually reaches it.
+    // It CATCHES the orb's glow (tight falloff — only the near air glints) and
+    // flares as the pulse shell sweeps past; everywhere else it's black = unseen.
+    const dx = sporePos[i * 3] - orb.pos.x;
+    const dy = sporePos[i * 3 + 1] - orb.pos.y;
+    const dz = sporePos[i * 3 + 2] - orb.pos.z;
+    const od = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    let lit = Math.max(0, 1 - od / 12); // reach of the orb's bubble
+    lit = lit * lit * 1.7; // fades with distance but bright enough to read in the beam
+    if (pulseActive && pulseRadius >= 0) {
+      const px = sporePos[i * 3] - pulseCenter.x;
+      const py = sporePos[i * 3 + 1] - pulseCenter.y;
+      const pz = sporePos[i * 3 + 2] - pulseCenter.z;
+      const pd = Math.sqrt(px * px + py * py + pz * pz);
+      lit += Math.max(0, 1 - Math.abs(pd - pulseRadius) / 3) * 1.2; // the shell lights the air it passes
+    }
+    lit = Math.min(lit, 1.6);
+    // Reflective, not emissive: the mote takes the LIGHT'S colour (the orb mood),
+    // dimmed — a fleck catching a beam, not a bulb.
+    sporeCol[i * 3] = orbLight.color.r * lit;
+    sporeCol[i * 3 + 1] = orbLight.color.g * lit;
+    sporeCol[i * 3 + 2] = orbLight.color.b * lit;
   }
   sporeGeo.attributes.position.needsUpdate = true;
+  sporeGeo.attributes.color.needsUpdate = true;
 }
 
 function updateTrail(dt: number): void {
@@ -615,7 +824,7 @@ hud.innerHTML = `
     <div><span>Glowspores</span><b id="spores">0</b></div>
   </div>
   <div id="objective" class="objective"></div>
-  <div id="gamepad-debug" class="gamepad-debug">pad: none</div>
+  <div id="gamepad-debug" class="gamepad-debug" style="display:none">pad: none</div>
 `;
 document.body.appendChild(hud);
 
@@ -1305,9 +1514,11 @@ const leafGeo = makeLeafClusterGeometry();
 const leafMat = new THREE.MeshStandardMaterial({
   map: makeLeafTexture(), // used only for its ALPHA (the leaf silhouette)
   alphaTest: 0.42, // cut the soft texture into organic leaf edges (opaque, cheap)
-  // Fully BLACK albedo — foliage is a pure black silhouette until the lighting
-  // system (another agent) puts light on it. No emissive, no self-glow.
-  color: 0x000000,
+  // Dark reek-foliage green — NOT pure black. A zero albedo reflects nothing, so
+  // no light (orb, pulse, shroom, held) can ever reveal it: every lighting path
+  // multiplies by this color. It must be dark enough to vanish in the black but
+  // REFLECTIVE enough to read the moment the orb's beam touches it.
+  color: 0x2c4a30,
   roughness: 0.85,
   metalness: 0,
   side: THREE.DoubleSide,
@@ -1481,6 +1692,47 @@ function makeSporeTree(x: number, y: number, z: number, h: number): void {
   addFloraCollider(x + 0.5, z + 0.5, y + h - 1.2, y + h + 2.2, 2.4);
 }
 
+// --- Micro phosphor glows: button-caps + shelf fungi run the SAME charge
+// system as the big shrooms (orb trickle / pulse surge / slow decay / tide
+// leach) with MICRO properties: a tiny halo sprite and a short light reach.
+// One lighting engine; per-thing scale. ---
+interface MicroGlow {
+  pos: THREE.Vector3;
+  mat: THREE.MeshStandardMaterial; // shared clump material — the clump glows as one
+  halo: THREE.Sprite;
+  baseEmissive: number; // resting "barely alive" glimmer
+  charge: number;
+}
+const microGlows: MicroGlow[] = [];
+function registerMicroGlow(
+  g: THREE.Group,
+  mat: THREE.MeshStandardMaterial,
+  yOff: number,
+  baseEmissive: number,
+): void {
+  const halo = new THREE.Sprite(
+    new THREE.SpriteMaterial({
+      map: moteTexture,
+      color: mat.emissive.clone(),
+      transparent: true,
+      opacity: 0, // dark until charged
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+    }),
+  );
+  halo.scale.setScalar(0.6); // tiny — these are button caps, not lamps
+  halo.position.y = yOff;
+  halo.layers.set(1); // effects layer, like every other glow sprite
+  g.add(halo);
+  microGlows.push({
+    pos: g.position.clone().add(new THREE.Vector3(0, yOff, 0)),
+    mat,
+    halo,
+    baseEmissive,
+    charge: 0,
+  });
+}
+
 // --- Button-caps: tiny ground fungi in clumps (silhouette #2) ---
 function makeButtons(x: number, y: number, z: number): void {
   const g = new THREE.Group();
@@ -1490,7 +1742,7 @@ function makeButtons(x: number, y: number, z: number): void {
   const mat = new THREE.MeshStandardMaterial({
     color: pal.cap,
     emissive: glow.clone().lerp(new THREE.Color(0.5, 0.5, 0.5), 0.35),
-    emissiveIntensity: 0.4, // always faintly alive — noticeable, never a lamp
+    emissiveIntensity: 0.05, // PHOSPHORESCENT: near-dark until light charges it
     roughness: 0.85,
     metalness: 0,
     envMapIntensity: 0.04,
@@ -1511,6 +1763,7 @@ function makeButtons(x: number, y: number, z: number): void {
   g.position.set(x + 0.5, y, z + 0.5);
   scene.add(g);
   registerFlora(g);
+  registerMicroGlow(g, mat, 0.3, 0.05); // buttons charge + glow like the big caps, tiny
 }
 
 // --- Hanging mycelium strands: a real ROPE, not a rigid rod on a hinge. Each
@@ -1711,7 +1964,7 @@ function makeShelf(x: number, y: number, z: number, dx: number, dz: number): voi
   const mat = new THREE.MeshStandardMaterial({
     color: pal.cap,
     emissive: glow.clone().lerp(new THREE.Color(0.5, 0.5, 0.5), 0.35),
-    emissiveIntensity: 0.22,
+    emissiveIntensity: 0.05, // PHOSPHORESCENT: near-dark until light charges it
     roughness: 0.85,
     metalness: 0,
     envMapIntensity: 0.04,
@@ -1731,6 +1984,7 @@ function makeShelf(x: number, y: number, z: number, dx: number, dz: number): voi
   g.position.set(x, y, z);
   scene.add(g);
   registerFlora(g);
+  registerMicroGlow(g, mat, 0.5, 0.05); // shelves charge + glow like the big caps, tiny
 }
 
 // --- Reek-grass: collected during generation, instanced after (1 draw call) ---
@@ -1776,10 +2030,12 @@ const REEK_HALF_INIT = 128; // 256×256 voxel initial area (was 512×512 = too m
 // loads asynchronously, but worldgen runs synchronously right here — so the tree
 // hook just RECORDS each placement; the models are built once the assets land.
 const pendingTrees: { x: number; y: number; z: number; h: number }[] = [];
+// Groves are likewise deferred: recorded here, then built as imported multicolour
+// asset caps once the GLTFs land (procedural makeGlowcap is the fallback).
+const pendingGroves: { x: number; y: number; z: number; h: number }[] = [];
 
 const reekHooks = {
-  grove: (x: number, y: number, z: number, h: number) =>
-    makeGlowcap(x, smoothSurfaceY(x, z, y) - 0.08, z, h),
+  grove: (x: number, y: number, z: number, h: number) => pendingGroves.push({ x, y, z, h }),
   crystalLight: (x: number, y: number, z: number) =>
     fogLightRegistry.push({
       pos: new THREE.Vector3(x + 0.5, y + 0.5, z + 0.5),
@@ -1803,6 +2059,12 @@ const reekHooks = {
 logger('world').info(`generating initial ${REEK_HALF_INIT * 2}×${REEK_HALF_INIT * 2} voxel area…`);
 const reek = generateReek(world, REEK_SEED, REEK_HALF_INIT, reekHooks);
 logger('world').info(`initial area loaded — ${world.chunks.size} chunks`);
+
+// Elemental testbeds — carve the water / forge / build-sandbox stages into three
+// map corners BEFORE the light flood so their emissives (Water, Ember) light and
+// mesh with everything else. The visual systems are built from `testbeds` below.
+const testbeds = carveTestbeds(world);
+logger('world').info('testbeds carved (water NW · forge NE · sandbox SW)');
 
 lightGrid.update();
 remeshDirtyChunks();
@@ -1832,6 +2094,76 @@ logger('lightvol').info(
     ` (${lightVol.dim.x}x${lightVol.dim.y}x${lightVol.dim.z} voxels)`,
 );
 
+// --- Elemental testbed visual systems (water surface · fire · build editor) ---
+// Carved geometry lives in the world; these own the meshes/particles that bring
+// each corner to life. All are driven per-frame in frame().
+// Fish share the flora's pulse-reveal patch: black shadows in the water until
+// the orb's bubble or the echo pulse paints them.
+const waterZone = new WaterZone(testbeds.water.pools, moteTexture, addPulseReveal);
+// One lighting engine: the water shadow-marches the SAME light-volume the
+// terrain/flora shaders hold — shared uniform OBJECTS, so it's always current.
+waterZone.wireLightVolume({
+  uLightAtlas: uniforms.uLightAtlas,
+  uLightMin: uniforms.uLightMin,
+  uLightStep: uniforms.uLightStep,
+  uLightDim: uniforms.uLightDim,
+  uLightTiles: uniforms.uLightTiles,
+});
+scene.add(waterZone.group);
+// John's rigged fish (public/assets/fish). Async — a simple placeholder school
+// swims until these land, then the rigged bodies take over. If a nose points
+// the wrong way, waiver.waterZone.flipFish() spins them 180°.
+waterZone
+  .loadFishModels('assets/fish/bigfish.glb', 'assets/fish/littlefish.glb')
+  .catch((err) => logger('water').warn('fish models failed', err));
+
+const fireZone = new FireZone(testbeds.forge.hearths, testbeds.forge.bed, moteTexture);
+scene.add(fireZone.group);
+// The hearth throws real, flickering light — register it so the orb's reflected
+// sheen (and future fog) picks it up. Intensity is refreshed each frame.
+const fireFogIdx = fogLightRegistry.length;
+fogLightRegistry.push({
+  pos: fireZone.light.position.clone(),
+  color: new THREE.Color(1.0, 0.5, 0.18),
+  intensity: 1.4,
+});
+
+// --- Discovery minimap: dark until explored, with the zones marked so the
+// corners are findable (John: "I can't find the lake"). Settings live in
+// Menu → Settings → Map. Baked AFTER the carve so the lake shows as water.
+const minimap = new Minimap(world, REEK_HALF_INIT, (bx, bz) => {
+  // Zone stages were pushed in carve order: water, forge, sandbox.
+  const inRect = (s: { x0: number; z0: number; x1: number; z1: number } | undefined) =>
+    !!s && bx >= s.x0 && bx < s.x1 && bz >= s.z0 && bz < s.z1;
+  if (inRect(testbeds.stages[0])) return 'The Reek — The Lake';
+  if (inRect(testbeds.stages[1])) return 'The Reek — The Forge';
+  if (inRect(testbeds.stages[2])) return 'The Reek — The Sandbox';
+  return orbRoofed ? 'The Reek — The Deeps' : 'The Reek';
+});
+minimap.setMarkers([
+  { x: testbeds.water.center.x, z: testbeds.water.center.z, icon: '◈', label: 'Lake', color: '#54c8ff' },
+  { x: testbeds.forge.center.x, z: testbeds.forge.center.z, icon: '◆', label: 'Forge', color: '#ff9a4a' },
+  { x: testbeds.sandbox.center.x, z: testbeds.sandbox.center.z, icon: '▣', label: 'Sandbox', color: '#9fe8ff' },
+  { x: reek.spawn[0], z: reek.spawn[2], icon: '✦', label: 'Spawn', color: '#7fffd1' },
+]);
+
+const buildSandbox = new BuildSandbox({
+  scene,
+  world,
+  moteTexture,
+  deck: testbeds.sandbox.deck, // building/destruction is gated to this footprint
+  // world.set() already marks the touched chunk (+boundary neighbours) dirty, so
+  // we ONLY remesh those. We deliberately skip the full-world lightGrid.update()
+  // here — that global flood-fill was the per-edit stutter. Baked light on the
+  // new/removed voxel is left as-is (fine for the sandbox; a live relight is a
+  // later refinement, not a per-keystroke cost).
+  commit: (edits) => {
+    for (const [x, y, z, m] of edits) world.set(x, y, z, m);
+    remeshDirtyChunks();
+  },
+  onForceWave: (origin) => waterZone.splash(origin),
+});
+
 // Dark-game surface pass over every flora material:
 //   1. Strip the RoomEnvironment IBL — nothing floats half-lit in the dark.
 //   2. DEEPEN bright albedos — in a dark game a surface only shows what light
@@ -1840,7 +2172,11 @@ logger('lightvol').info(
 //      surfaces read as a soft reveal, not a glare; already-dark albedos are
 //      left alone. Emissive (the bioluminescence) is untouched.
 // Materials are shared across flora, so each is processed exactly once.
-const ALBEDO_MAX_LUM = 0.22; // deepest a lit flora surface may reflect (dark, but reads when the orb hits it)
+const ALBEDO_MAX_LUM = 0.5; // deepest a lit flora surface may reflect. With no
+// ambient/fog anymore, flora is black until a light touches it — so the albedo
+// must be REFLECTIVE enough to actually read in the orb's beam (0.22 was so dark
+// nothing but the self-emitting shrooms showed). Darkness comes from no-light,
+// not from a crushed albedo.
 const seenMats = new Set<THREE.Material>();
 for (const f of floraCull) {
   f.group.traverse((o) => {
@@ -1864,8 +2200,51 @@ for (const f of floraCull) {
 //  ray-marched shadows — is static and built once at load. Dynamic sources come
 //  back as real shader lights next, not a texture repack.)
 
+// Re-seat pre-carve grass onto the testbed stages: worldgen placed these tufts
+// BEFORE carveTestbeds flattened the corners, so anything inside a stage
+// floats at the old terrain height. Probe each column for its REAL solid top —
+// water voxels are non-solid, so tufts over the lake fall through and seat ON
+// the dirt lakebed, waving under the surface.
+for (const spot of grassSpots) {
+  const vx = Math.floor(spot[0]);
+  const vz = Math.floor(spot[2]);
+  if (!testbeds.stages.some((s) => vx >= s.x0 && vx < s.x1 && vz >= s.z0 && vz < s.z1)) continue;
+  for (let y = 22; y > -8; y--) {
+    if (world.solid(vx, y, vz)) {
+      spot[1] = y + 1 - 0.06;
+      break;
+    }
+  }
+}
+// Plant the lakebed itself: a deterministic scatter of extra tufts across the
+// wet columns — kelp-like growth swaying under the surface (same wind/orb
+// shader as land grass; lit only when light reaches down to it).
+{
+  const lake = testbeds.water.pools[0];
+  const surfY = Math.floor(lake.surfaceY);
+  for (let vx = Math.ceil(lake.cx - lake.halfX); vx < lake.cx + lake.halfX; vx += 2) {
+    for (let vz = Math.ceil(lake.cz - lake.halfZ); vz < lake.cz + lake.halfZ; vz += 2) {
+      if (((vx * 374761393 + vz * 668265263) >>> 0) % 1000 > 300) continue; // ~30% of sampled columns
+      if (world.get(vx, surfY, vz) !== Mat.Water) continue; // dry column
+      for (let y = surfY; y > surfY - 10; y--) {
+        if (world.solid(vx, y, vz)) {
+          grassSpots.push([vx + 0.5, y + 1 - 0.06, vz + 0.5]);
+          break;
+        }
+      }
+    }
+  }
+}
+
 // Grass builds AFTER the light flood so each tuft bakes its held light.
 const grassField = new GrassField();
+// One lighting engine: grass adopts the shared light-volume uniform objects so
+// its orb bubble shadow-marches the same world solidity as everything else.
+grassField.uniforms.uLightAtlas = uniforms.uLightAtlas;
+grassField.uniforms.uLightMin = uniforms.uLightMin;
+grassField.uniforms.uLightStep = uniforms.uLightStep;
+grassField.uniforms.uLightDim = uniforms.uLightDim;
+grassField.uniforms.uLightTiles = uniforms.uLightTiles;
 for (const [gx0, gy0, gz0] of grassSpots) {
   grassField.addTuft(gx0, gy0, gz0, lightGrid.sample(gx0, gy0 + 1, gz0) / 15);
 }
@@ -1916,6 +2295,133 @@ interface SwayProp {
 }
 const swayProps: SwayProp[] = [];
 
+// Glow halos for imported phosphorescent shrooms — the additive "volumetric"
+// emission read. Its size/opacity EASE toward the charge (no snap) and breathe
+// gently, so it reads as a soft living glow instead of a popping billboard.
+const phosphorHalos: { sprite: THREE.Sprite; shroom: Shroom; base: number; cur: number }[] = [];
+function updatePhosphorHalos(dt: number, time: number): void {
+  const k = Math.min(1, dt * 3.5); // ease rate toward the target charge
+  for (const h of phosphorHalos) {
+    if (!h.sprite.parent?.visible) continue; // culled shroom → skip
+    h.cur += (h.shroom.charge - h.cur) * k;
+    const breathe = 1 + Math.sin(time * 1.1 + h.base * 3.1) * 0.07;
+    const mat = h.sprite.material as THREE.SpriteMaterial;
+    mat.opacity = Math.min(0.5, h.cur * 0.55); // softer than before
+    h.sprite.scale.setScalar(h.base * (0.7 + h.cur * 1.2) * breathe);
+  }
+}
+
+// --- Imported-mushroom rig -------------------------------------------------
+// A single GLTF mushroom is one mesh, so to move cap and stalk on separate axes
+// we SPLIT the mesh at the cap/stalk junction into two hinged pieces: the stalk
+// stays under the root group, the cap goes under a pivot at the junction. The
+// split pieces are then handed to the SAME native glowcap sim (shroomFlora loop)
+// as the procedural placeholders, so an imported shroom moves identically to the
+// one it replaces — it is a straight visual swap, no new movement code.
+
+/** Find the local y where the cap begins: bin vertices by height, take the ring
+ *  just below the widest one (the cap's overhang crown). */
+function findCapStartY(geos: THREE.BufferGeometry[], maxY: number): number {
+  const BINS = 16;
+  const maxR = new Float32Array(BINS);
+  for (const g of geos) {
+    const p = g.getAttribute('position');
+    for (let i = 0; i < p.count; i++) {
+      const b = Math.min(BINS - 1, Math.max(0, Math.floor((p.getY(i) / maxY) * BINS)));
+      const r = Math.hypot(p.getX(i), p.getZ(i));
+      if (r > maxR[b]) maxR[b] = r;
+    }
+  }
+  // Search for the widest ring only in the UPPER structure — a wide mossy base
+  // or a low cluster would otherwise be mistaken for the cap crown. Bias to the
+  // top ~55% so the junction lands at the real cap/stalk neck.
+  const lo = Math.floor(BINS * 0.45);
+  let widest = 0;
+  let wb = Math.floor(BINS * 0.7);
+  for (let b = lo; b < BINS; b++) if (maxR[b] > widest) ((widest = maxR[b]), (wb = b));
+  return (Math.max(lo, wb - 2) / BINS) * maxY;
+}
+
+/** Partition a geometry's triangles into below/above a local y plane. */
+function splitGeometryByY(
+  geo: THREE.BufferGeometry,
+  splitY: number,
+): { lower: THREE.BufferGeometry; upper: THREE.BufferGeometry } {
+  const g = geo.index ? geo.toNonIndexed() : geo;
+  const pos = g.getAttribute('position');
+  const nrm = g.getAttribute('normal');
+  const uv = g.getAttribute('uv');
+  const col = g.getAttribute('color');
+  const lo = { p: [] as number[], n: [] as number[], u: [] as number[], c: [] as number[] };
+  const hi = { p: [] as number[], n: [] as number[], u: [] as number[], c: [] as number[] };
+  for (let t = 0; t < pos.count; t += 3) {
+    const cy = (pos.getY(t) + pos.getY(t + 1) + pos.getY(t + 2)) / 3;
+    const d = cy >= splitY ? hi : lo;
+    for (let k = 0; k < 3; k++) {
+      const i = t + k;
+      d.p.push(pos.getX(i), pos.getY(i), pos.getZ(i));
+      if (nrm) d.n.push(nrm.getX(i), nrm.getY(i), nrm.getZ(i));
+      if (uv) d.u.push(uv.getX(i), uv.getY(i));
+      if (col) d.c.push(col.getX(i), col.getY(i), col.getZ(i));
+    }
+  }
+  const build = (d: { p: number[]; n: number[]; u: number[]; c: number[] }) => {
+    const bg = new THREE.BufferGeometry();
+    bg.setAttribute('position', new THREE.Float32BufferAttribute(d.p, 3));
+    if (d.n.length) bg.setAttribute('normal', new THREE.Float32BufferAttribute(d.n, 3));
+    if (d.u.length) bg.setAttribute('uv', new THREE.Float32BufferAttribute(d.u, 2));
+    if (d.c.length) bg.setAttribute('color', new THREE.Float32BufferAttribute(d.c, 3));
+    if (!d.n.length) bg.computeVertexNormals();
+    return bg;
+  };
+  return { lower: build(lo), upper: build(hi) };
+}
+
+/** Split an imported mushroom into a leaning stalk + a wobbling cap, in place.
+ *  Returns the cap pivot + junction height, or null if it couldn't be split. */
+function rigMushroom(group: THREE.Group): { capPivot: THREE.Group; capStartY: number } | null {
+  group.updateMatrixWorld(true);
+  const groupInv = new THREE.Matrix4().copy(group.matrixWorld).invert();
+  const meshes: THREE.Mesh[] = [];
+  group.traverse((o) => {
+    if ((o as THREE.Mesh).isMesh) meshes.push(o as THREE.Mesh);
+  });
+  if (meshes.length === 0) return null;
+  // Bake each mesh's geometry into the group's local space (feet at y≈0).
+  const baked: { geo: THREE.BufferGeometry; mat: THREE.Material | THREE.Material[] }[] = [];
+  let maxY = 1e-4;
+  for (const m of meshes) {
+    m.updateWorldMatrix(true, false);
+    const local = new THREE.Matrix4().multiplyMatrices(groupInv, m.matrixWorld);
+    const geo = m.geometry.index ? m.geometry.toNonIndexed() : m.geometry.clone();
+    geo.applyMatrix4(local);
+    geo.computeBoundingBox();
+    maxY = Math.max(maxY, geo.boundingBox!.max.y);
+    baked.push({ geo, mat: m.material });
+  }
+  const capStartY = findCapStartY(
+    baked.map((b) => b.geo),
+    maxY,
+  );
+  if (capStartY <= 0.05 || capStartY >= maxY * 0.97) return null; // no clean split
+  const originals = group.children.filter((c) => !(c as THREE.Sprite).isSprite);
+  const capPivot = new THREE.Group();
+  capPivot.position.y = capStartY;
+  const lowers: THREE.Mesh[] = [];
+  for (const { geo, mat } of baked) {
+    const { lower, upper } = splitGeometryByY(geo, capStartY);
+    if (lower.getAttribute('position').count > 0) lowers.push(new THREE.Mesh(lower, mat));
+    if (upper.getAttribute('position').count > 0) {
+      upper.translate(0, -capStartY, 0); // sit under the pivot, render in place
+      capPivot.add(new THREE.Mesh(upper, mat));
+    }
+  }
+  for (const c of originals) group.remove(c); // drop the un-split original meshes
+  for (const lm of lowers) group.add(lm);
+  group.add(capPivot);
+  return { capPivot, capStartY };
+}
+
 /** Deterministic 0..1 hash so a given (seed) always scatters the same foliage. */
 function frand(seed: number): number {
   const s = Math.sin(seed * 127.1 + 311.7) * 43758.5453;
@@ -1939,14 +2445,153 @@ interface PlaceOpts {
   collide?: boolean;
   sway?: boolean;
   brushR?: number;
+  /** Sink the base this many units below the ground (only the top pokes out). */
+  sink?: number;
+  /** Per-instance colour — tints albedo AND emission so the same mesh can appear
+   *  (and glow) in many colours across a grove. */
+  tint?: THREE.Color;
 }
-function placeImported(name: FloraName, x: number, z: number, opts: PlaceOpts = {}): void {
-  const inst = floraLib.make(name, opts.height);
-  if (!inst) return;
-  const gy = groundYAt(x, z);
+// Which imported props are fungi — these enlist in the phosphorescence loop.
+const MUSHROOM_KINDS = new Set<FloraName>([
+  'mushroom_01', 'mushroom_02', 'bigshroom_01', 'bigshroom_02', 'bigshroom_03',
+]);
+
+/** The shroom's own dominant colour, sampled from its base texture — saturation-
+ *  weighted so the vivid cap wins over pale spots/stalk, then normalised to a
+ *  bright hue. Used to tint the light + halo a phosphorescent shroom emits, so a
+ *  blue shroom casts blue, a violet one violet. Null if it can't be read. */
+function dominantTextureColor(map: THREE.Texture): THREE.Color | null {
+  const img = map.image as CanvasImageSource | undefined;
+  if (!img) return null;
+  try {
+    const S = 24;
+    const cv = document.createElement('canvas');
+    cv.width = cv.height = S;
+    const ctx = cv.getContext('2d', { willReadFrequently: true });
+    if (!ctx) return null;
+    ctx.drawImage(img, 0, 0, S, S);
+    const d = ctx.getImageData(0, 0, S, S).data;
+    let r = 0;
+    let g = 0;
+    let b = 0;
+    let wsum = 0;
+    for (let i = 0; i < d.length; i += 4) {
+      if (d[i + 3] < 8) continue; // skip transparent texels
+      const rr = d[i] / 255;
+      const gg = d[i + 1] / 255;
+      const bb = d[i + 2] / 255;
+      const sat = Math.max(rr, gg, bb) - Math.min(rr, gg, bb);
+      const w = 0.12 + sat; // base weight + saturation boost
+      r += rr * w;
+      g += gg * w;
+      b += bb * w;
+      wsum += w;
+    }
+    if (wsum < 1e-3) return null;
+    const c = new THREE.Color(r / wsum, g / wsum, b / wsum);
+    return c.multiplyScalar(1 / Math.max(c.r, c.g, c.b, 1e-3)); // vivid hue
+  } catch {
+    return null; // tainted canvas / undrawable image → caller falls back
+  }
+}
+
+/** Enlist an imported mushroom in the EXISTING phosphorescence system: its own
+ *  materials become the charge-driven emissive and it takes a fog-light slot, so
+ *  the per-frame charge/glow loop drives it exactly like a native glowcap. This
+ *  ADDS a participant to that loop — it does not change the phosphorescence. */
+function registerImportedPhosphor(group: THREE.Group, x: number, z: number, capY: number, tint?: THREE.Color): void {
+  const pal = pickPalette(x, z);
+  const glow = new THREE.Color(pal.glow);
+  const mutedGlow = glow.clone().lerp(new THREE.Color(0.5, 0.5, 0.5), 0.3);
+  const mats: THREE.MeshStandardMaterial[] = [];
+  group.traverse((o) => {
+    const m = (o as THREE.Mesh).material;
+    if (m instanceof THREE.MeshStandardMaterial) mats.push(m);
+    else if (Array.isArray(m)) for (const s of m) if (s instanceof THREE.MeshStandardMaterial) mats.push(s);
+  });
+  if (mats.length === 0) return;
+  // Phosphoresce THROUGH the model's own colours: use its base-colour texture as
+  // an emissive map (emissive tint = white so the texture shows true), so the
+  // red cap glows red and the pale spots glow pale — instead of one flat palette
+  // colour washing the whole mushroom out (which buried the spots). Untextured
+  // meshes fall back to the single palette glow. Charge drives emissiveIntensity.
+  for (const m of mats) {
+    if (m.map) {
+      m.emissiveMap = m.map;
+      // White → the texture glows its true colours; a tint shifts the whole glow
+      // toward that hue (so a tinted grove cap glows its tint).
+      m.emissive = tint ? tint.clone() : new THREE.Color(0xffffff);
+    } else {
+      m.emissive = tint ? tint.clone() : mutedGlow.clone();
+    }
+    m.emissiveIntensity = 0.05; // barely-alive base, as native caps
+    m.needsUpdate = true; // adding the emissive map needs a shader recompile
+  }
+  // Emission COLOUR = the tint if given, else the shroom's OWN dominant texture
+  // colour, so it casts light + a halo in that colour (blue shroom → blue light).
+  const primaryMap = mats.find((m) => m.map)?.map ?? null;
+  const texCol = primaryMap ? dominantTextureColor(primaryMap) : null;
+  const emitColor =
+    tint?.clone() ?? texCol ?? glow.clone().multiplyScalar(1 / Math.max(glow.r, glow.g, glow.b, 1e-3));
+  const fogIdx =
+    fogLightRegistry.push({
+      pos: new THREE.Vector3(x, capY + 0.4, z),
+      color: emitColor,
+      intensity: 0.04,
+    }) - 1;
+  const s: Shroom = {
+    pos: new THREE.Vector3(x, capY, z),
+    capMat: mats[0],
+    gillMat: mats[1] ?? mats[0],
+    fogIdx,
+    charge: 0.15, // a faint residual charge at world-start, like native caps
+  };
+  shrooms.push(s);
+  // Additive glow halo — the "volumetric" emission read (the raymarched fog pass
+  // is off by design). A soft camera-facing sprite at the cap that swells and
+  // brightens with charge (driven in updatePhosphorHalos each frame).
+  const haloLocalY = capY - group.position.y;
+  const halo = new THREE.Sprite(
+    new THREE.SpriteMaterial({
+      map: moteTexture,
+      color: emitColor.clone(),
+      transparent: true,
+      opacity: 0,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+    }),
+  );
+  halo.position.set(0, haloLocalY, 0);
+  halo.layers.set(1); // effects layer — skipped by the depth prepass
+  group.add(halo);
+  phosphorHalos.push({ sprite: halo, shroom: s, base: Math.max(1.6, haloLocalY * 0.9), cur: 0 });
+}
+
+function placeImported(
+  name: FloraName,
+  x: number,
+  z: number,
+  opts: PlaceOpts = {},
+): { height: number; radius: number; gy: number } | null {
+  const isShroom = MUSHROOM_KINDS.has(name) || /shroom|mushroom|fungus|fungi/i.test(name);
+  // Per-instance size variation — a grove is never uniform (0.72–1.57×).
+  const jitter = 0.72 + frand(x * 2.3 + z * 4.1) * 0.85;
+  const inst = floraLib.make(name, opts.height, jitter);
+  if (!inst) return null;
+  const gy = groundYAt(x, z) - (opts.sink ?? 0); // sink → only the top pokes out
   const g = inst.group;
   g.position.set(x, gy, z);
   g.rotation.y = frand(x * 1.7 + z) * Math.PI * 2; // varied facing
+  // Per-instance colour tint: multiply every albedo toward the tint hue so one
+  // mesh can populate a grove in many colours (emission is tinted to match in
+  // registerImportedPhosphor).
+  if (opts.tint) {
+    g.traverse((o) => {
+      const m = (o as THREE.Mesh).material;
+      const arr = Array.isArray(m) ? m : m ? [m] : [];
+      for (const mm of arr) if ((mm as THREE.MeshStandardMaterial).color) (mm as THREE.MeshStandardMaterial).color.multiply(opts.tint!);
+    });
+  }
   scene.add(g);
   registerFlora(g); // pulse-reveal patch + distance culling
   importedFlora.push(g);
@@ -1956,17 +2601,68 @@ function placeImported(name: FloraName, x: number, z: number, opts: PlaceOpts = 
   if (opts.sway) {
     swayProps.push({ group: g, x, z, brushR: opts.brushR ?? inst.radius + 2, lx: 0, lz: 0, lvx: 0, lvz: 0 });
   }
+  // Fungi (known or named like one) join the phosphorescence automatically.
+  if (isShroom) {
+    registerImportedPhosphor(g, x, z, gy + inst.height * 0.65, opts.tint);
+    // Rig the bigger shrooms with a cap/stalk two-spring; tiny scatter caps stay
+    // static (the split isn't worth it and reads fine still).
+    if (inst.height >= 2) {
+      const rig = rigMushroom(g);
+      if (rig) {
+        // Hand the split pieces to the SAME native glowcap sim as the procedural
+        // placeholders (group = stalk lean, cap pivot = cap wobble), so this
+        // imported shroom moves identically to the one it replaces.
+        shroomFlora.push({
+          group: g,
+          cap: rig.capPivot,
+          gills: rig.capPivot, // unused by the sim; kept valid
+          capBaseY: rig.capStartY,
+          x,
+          z,
+          h: inst.height,
+          capR: inst.radius,
+          stalkR: Math.max(inst.radius * 0.28, 0.2),
+          phase: x * 0.7 + z * 0.31,
+          lx: 0, lz: 0, lvx: 0, lvz: 0,
+          cx: 0, cz: 0, cvx: 0, cvz: 0,
+          neighbors: null,
+        });
+      }
+    }
+  }
+  return { height: inst.height, radius: inst.radius, gy };
 }
 
 /** A tree plus a small ring of ground foliage clustered at its base. */
 function placeTreeCluster(x: number, z: number, h: number, seed: number): void {
-  placeImported(frand(seed) < 0.5 ? 'tree_01' : 'tree_02', x, z, {
+  const tree = placeImported(frand(seed) < 0.5 ? 'tree_01' : 'tree_02', x, z, {
     height: h,
     collide: true,
     sway: true,
     brushR: 3,
   });
-  const kinds: FloraName[] = ['bush_01', 'fern_01', 'mushroom_01', 'mushroom_02', 'rock_01', 'rock_02', 'grass_01'];
+  // Mycelium drips off the crown — the same Verlet rope strands the procedural
+  // spore-trees hung (orb drapes them, pulses whip them). Anchored in WORLD
+  // space at the canopy underside so they hang gravity-plumb; deliberately NOT
+  // parented to the tree group, or the sway lean would tilt the anchor.
+  if (tree) {
+    const strandCount = 2 + Math.floor(frand(seed + 23) * 3);
+    for (let s = 0; s < strandCount; s++) {
+      const sa = frand(seed + 31 + s * 7.7) * Math.PI * 2;
+      const sr = 0.6 + frand(seed + 43 + s * 11.3) * Math.max(tree.radius * 0.7, 1.6);
+      const sy = tree.gy + h * (0.58 + frand(seed + 53 + s * 13.9) * 0.22);
+      makeStrandAt(
+        x + Math.cos(sa) * sr,
+        sy,
+        z + Math.sin(sa) * sr,
+        1.4 + frand(seed + 61 + s * 17.1) * 2.2,
+      );
+    }
+  }
+  // NB: mushrooms are NOT scattered here anymore — caps come from the groves
+  // (spaced + thinned). mushroom_02 (shelf fungus) belongs on cave walls, and
+  // dotting mushroom_01 around every tree is what made it feel like "too many".
+  const kinds: FloraName[] = ['bush_01', 'fern_01', 'rock_01', 'rock_02', 'grass_01'];
   const n = 2 + Math.floor(frand(seed + 5) * 3); // 2–4 props
   for (let i = 0; i < n; i++) {
     const ang = frand(seed + i * 7.3) * Math.PI * 2;
@@ -1974,6 +2670,16 @@ function placeTreeCluster(x: number, z: number, h: number, seed: number): void {
     const kind = kinds[Math.floor(frand(seed + i * 5.7) * kinds.length)];
     const collide = kind.startsWith('rock') || kind.startsWith('bush');
     placeImported(kind, x + Math.cos(ang) * rad, z + Math.sin(ang) * rad, { collide });
+  }
+  // Occasional BIG phosphorescent toadstool at the cluster edge (charges + glows
+  // through the same loop as the native glowcaps).
+  if (frand(seed + 71) < 0.4) {
+    const ba = frand(seed + 79) * Math.PI * 2;
+    const br = 2.4 + frand(seed + 83) * 2.2;
+    const bk = (['bigshroom_01', 'bigshroom_02', 'bigshroom_03'] as FloraName[])[
+      Math.floor(frand(seed + 89) * 3)
+    ];
+    placeImported(bk, x + Math.cos(ba) * br, z + Math.sin(ba) * br, { collide: true, brushR: 2 });
   }
 }
 
@@ -1999,8 +2705,65 @@ void floraLib.preload().then(() => {
     const rad = 12 + (i % 2) * 4;
     placeTreeCluster(sx + Math.cos(ang) * rad, sz + Math.sin(ang) * rad, 8 + i, sx + sz + i * 11);
   }
+  // --- Groves: imported asset caps replace the procedural glowcaps. Each GLOWS
+  // its OWN texture colour (no albedo tint — the tint looked wrong on the tall
+  // ones). Caps are SPACED apart + hitboxed so they read as separate plants, and
+  // THINNED where worldgen would pile them up. Fallback to makeGlowcap if unloaded.
+  const capPool = (['meshy_glowshroom', 'meshy_glowshroom_03', 'meshy_flatshroom', 'mushroom_01'] as FloraName[]).filter(
+    (n) => floraLib.has(n),
+  );
+  const clusterLoaded = floraLib.has('meshy_glowshroom_02');
+  const placedCaps: { x: number; z: number; r: number }[] = [];
+  for (const gp of pendingGroves) {
+    const seed = gp.x * 41.3 + gp.z * 7.7;
+    if (capPool.length === 0) {
+      makeGlowcap(gp.x, smoothSurfaceY(gp.x, gp.z, gp.y) - 0.08, gp.z, gp.h);
+      continue;
+    }
+    if (frand(seed + 1) < 0.45) continue; // thin ~45% — worldgen packs groves too dense
+    const name = capPool[Math.floor(frand(seed) * capPool.length)];
+    const height = 1.3 + frand(seed + 7) * 1.4; // smaller caps, various sizes
+    const capR = 0.7 + height * 0.35; // spacing footprint
+    // Nudge off nearby caps; if it still can't fit its footprint, the area is
+    // packed → drop it (this is what thins the over-dense clusters).
+    let px = gp.x;
+    let pz = gp.z;
+    for (let it = 0; it < 8; it++) {
+      let moved = false;
+      for (const b of placedCaps) {
+        const dx = px - b.x;
+        const dz = pz - b.z;
+        const min = capR + b.r;
+        const d2 = dx * dx + dz * dz;
+        if (d2 < min * min) {
+          const d = Math.sqrt(d2) || 1e-3;
+          const push = (min - d) * 0.5 + 0.05;
+          px += (dx / d) * push;
+          pz += (dz / d) * push;
+          moved = true;
+        }
+      }
+      if (!moved) break;
+    }
+    if ((px - gp.x) ** 2 + (pz - gp.z) ** 2 > 9) continue; // drifted too far → thin out
+    placedCaps.push({ x: px, z: pz, r: capR });
+    placeImported(name, px, pz, { height, brushR: 2, collide: true });
+    // Sparingly: a sunk meshy cluster peeking out of the ground beside a grove.
+    if (clusterLoaded && frand(seed + 11) < 0.06) {
+      placeImported('meshy_glowshroom_02', px + 1.5, pz + 1.5, {
+        height: 1.2 + frand(seed + 13) * 0.5, // current size and smaller
+        sink: 1.1 + frand(seed + 17) * 0.6, // base under the voxel — only caps pop
+      });
+    }
+  }
+  // Showcase row by spawn so the new meshes are easy to eyeball (the cluster is
+  // excluded — it now appears sparsely + sunk in the groves).
+  const heroShrooms: FloraName[] = ['meshy_glowshroom', 'meshy_glowshroom_03', 'meshy_flatshroom'];
+  heroShrooms.forEach((name, i) => {
+    if (floraLib.has(name)) placeImported(name, sx + 4 + i * 3.5, sz - 4, { collide: true, brushR: 2.5 });
+  });
   logger('flora-assets').info(
-    `built ${pendingTrees.length} worldgen tree clusters + demo stand → ${importedFlora.length} props, ${swayProps.length} swayable`,
+    `built ${pendingTrees.length} tree clusters + ${pendingGroves.length} groves → ${importedFlora.length} props, ${swayProps.length} swayable, ${shroomFlora.length} shrooms`,
   );
   // Attach to the dev handle here (in the async callback) so it lands on the
   // FINAL window.waiver — the synchronous handle assignments have all run by now.
@@ -2076,9 +2839,134 @@ function addPickup(x: number, y: number, z: number): void {
   pickups.push({ mesh, pos: mesh.position.clone(), taken: false });
 }
 
+// --- Ward anchor body: the universal Keeper obelisk (docs/MESHY_ward.md).
+// Loaded best-effort at boot; wards raised before it lands (save-restore) or
+// without the asset use a procedural shard and are retrofitted on arrival. ---
+let wardAnchorRoot: THREE.Object3D | null = null;
+new GLTFLoader().load(
+  'assets/ward/ward_anchor.glb',
+  (gltf) => {
+    gltf.scene.traverse((o) => {
+      const mesh = o as THREE.Mesh;
+      if (!mesh.isMesh) return;
+      const m = (mesh.material as THREE.MeshStandardMaterial).clone();
+      // Same dark-game pass as imported flora: matte dielectric, no self-glow,
+      // no IBL. Albedo clamped dark-but-NONZERO — a 0x000000 albedo zeroes
+      // every light path and can never be lit, and a bright one blows out.
+      m.metalness = 0;
+      m.roughness = Math.max(m.roughness ?? 1, 0.85);
+      m.envMapIntensity = 0;
+      if (m.emissive) m.emissive.setRGB(0, 0, 0);
+      m.emissiveIntensity = 0;
+      if (m.color) {
+        const lum = m.color.r * 0.299 + m.color.g * 0.587 + m.color.b * 0.114;
+        if (lum > 0.4) m.color.multiplyScalar(0.4 / lum);
+        else if (lum < 0.04) m.color.setRGB(0.05, 0.062, 0.058);
+      }
+      mesh.material = m;
+    });
+    wardAnchorRoot = gltf.scene;
+    for (const w of wards) swapWardAnchor(w);
+    logger('ward').info('ward_anchor.glb loaded');
+  },
+  undefined,
+  () => logger('ward').warn('ward_anchor.glb unavailable — wards use the procedural shard'),
+);
+
+/** Build one anchor body, feet at y=0, centered on x/z, WARD_ANCHOR_HEIGHT
+ *  tall: the Meshy obelisk when loaded, else a stand-in shard (dark tapered
+ *  pylon + hovering tip with the lumen-core gap between them). */
+function makeWardAnchor(): THREE.Object3D {
+  if (wardAnchorRoot) {
+    const src = wardAnchorRoot.clone(true);
+    const bounds = new THREE.Box3().setFromObject(src);
+    const size = new THREE.Vector3();
+    const center = new THREE.Vector3();
+    bounds.getSize(size);
+    bounds.getCenter(center);
+    const scale = WARD_ANCHOR_HEIGHT / Math.max(size.y, 1e-4);
+    const group = new THREE.Group();
+    src.scale.setScalar(scale);
+    src.position.set(-center.x * scale, -bounds.min.y * scale, -center.z * scale);
+    group.add(src);
+    group.name = 'ward:anchor';
+    return group;
+  }
+  const group = new THREE.Group();
+  const stone = new THREE.MeshStandardMaterial({ color: 0x232c2a, roughness: 0.92, metalness: 0 });
+  const pylon = new THREE.Mesh(new THREE.CylinderGeometry(0.3, 0.58, 2.2, 4), stone);
+  pylon.position.y = 1.1;
+  pylon.rotation.y = Math.PI / 4;
+  const tip = new THREE.Mesh(new THREE.CylinderGeometry(0.26, 0.1, 0.85, 4), stone);
+  tip.position.y = 3.15; // hovers above the pylon — the niche gap holds the core
+  tip.rotation.y = Math.PI / 4;
+  group.add(pylon, tip);
+  group.name = 'ward:anchor-fallback';
+  return group;
+}
+
+/** Replace a ward's stand-in shard with the real obelisk once the GLB lands. */
+function swapWardAnchor(w: Ward): void {
+  if (!wardAnchorRoot || w.anchor.name !== 'ward:anchor-fallback') return;
+  const fresh = makeWardAnchor();
+  fresh.position.copy(w.anchor.position);
+  scene.remove(w.anchor);
+  scene.add(fresh);
+  w.anchor = fresh;
+}
+
+/** The dome as a REACTIVE membrane: a fresnel rim shell with slow ripple bands
+ *  crawling down it — thin at the center of view, bright at the silhouette, so
+ *  it reads as a soap-film of light the dark is breaking against rather than a
+ *  solid painted bubble. uStrength drives it; 0 = fully invisible (the rest
+ *  state). GLSL note: no function hoisting — keep helpers above callers. */
+function makeWardDomeMaterial(color: number): THREE.ShaderMaterial {
+  return new THREE.ShaderMaterial({
+    uniforms: {
+      uColor: { value: new THREE.Color(color) },
+      uStrength: { value: 0 },
+      uTime: { value: 0 },
+    },
+    vertexShader: /* glsl */ `
+      varying vec3 vWorld;
+      varying vec3 vNormalW;
+      void main() {
+        vec4 w = modelMatrix * vec4(position, 1.0);
+        vWorld = w.xyz;
+        vNormalW = normalize(mat3(modelMatrix) * normal);
+        gl_Position = projectionMatrix * viewMatrix * w;
+      }`,
+    fragmentShader: /* glsl */ `
+      uniform vec3 uColor;
+      uniform float uStrength;
+      uniform float uTime;
+      varying vec3 vWorld;
+      varying vec3 vNormalW;
+      void main() {
+        vec3 V = normalize(cameraPosition - vWorld);
+        float facing = abs(dot(normalize(vNormalW), V));
+        float rim = pow(1.0 - facing, 2.0);
+        // ripple bands sliding down the shell — the tide breaking on it
+        float band = 0.8 + 0.2 * sin(vWorld.y * 2.6 - uTime * 5.0);
+        float a = uStrength * band * (0.08 + 0.92 * rim);
+        gl_FragColor = vec4(uColor * (0.35 + 0.65 * rim), a);
+      }`,
+    transparent: true,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false,
+    side: THREE.DoubleSide,
+  });
+}
+
+/** Motes per ward — glow-points drifting inward across the circle. */
+const WARD_MOTES = 18;
+/** Beam height (units) — a faint column, not a searchlight. */
+const WARD_BEAM_H = 14;
+
 /** Raise a ward at voxel column (vx,vz) with its glow sunk to floorY. Builds
- *  the terrain + all three meshes but charges NO spores — the shared body of
- *  both live placement and save-restore. */
+ *  the terrain + every mesh but charges NO spores — the shared body of both
+ *  live placement and save-restore. Silhouette is universal (obelisk + ring +
+ *  core + motes); WARD_DRESSING skins it per biome. */
 function spawnWard(vx: number, vz: number, floorY: number): void {
   // Sink the glow INTO the floor (replace its top voxels) — never build a
   // platform at the orb's feet, which wedged the player inside solid ground.
@@ -2086,40 +2974,136 @@ function spawnWard(vx: number, vz: number, floorY: number): void {
   lightGrid.update();
   remeshDirtyChunks();
 
-  const pos = new THREE.Vector3(vx + 0.5, floorY + 2.3, vz + 0.5);
-  const light = new THREE.PointLight(0x7fffd1, 3.4, 24, 1.4);
+  const dressing = WARD_DRESSING.reek; // biome hook — only The Reek exists yet
+  const base = new THREE.Vector3(vx + 0.5, floorY + 1, vz + 0.5); // top of the sunk slab
+
+  // The anchor body: dark Keeper obelisk, lit only by the light around it.
+  const anchor = makeWardAnchor();
+  anchor.position.copy(base);
+
+  // The lumen core hangs in the anchor's carved niche at ~2/3 height. The
+  // ward's point light lives AT the core — the stone shades itself off it.
+  const pos = base.clone();
+  pos.y += WARD_ANCHOR_HEIGHT * 0.66;
+  const light = new THREE.PointLight(dressing.light, 12, 0, 2); // unified falloff law: 1/d², no cutoff ring
   light.position.copy(pos);
   const core = new THREE.Mesh(
-    new THREE.SphereGeometry(0.75, 24, 14),
+    new THREE.SphereGeometry(0.42, 24, 14),
     new THREE.MeshBasicMaterial({
-      color: 0x9dffd8,
+      color: dressing.core,
       transparent: true,
-      opacity: 0.72,
+      opacity: 0.85,
       blending: THREE.AdditiveBlending,
     }),
   );
   core.position.copy(pos);
-  // The dome: a soft, breathing shell of light showing exactly where the
-  // ward's protection reaches. The safe zone is VISIBLE, not implied.
-  const dome = new THREE.Mesh(
-    new THREE.SphereGeometry(WARD_RADIUS, 40, 20, 0, Math.PI * 2, 0, Math.PI / 2),
+
+  // Ground rings: the RADIUS ring is the ward's default read — the safe zone
+  // is VISIBLE without a dome. A small footprint ring seats the anchor.
+  const rings = new THREE.Group();
+  const ringMat = new THREE.MeshBasicMaterial({
+    color: dressing.ring,
+    transparent: true,
+    opacity: 0.16,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false,
+    side: THREE.DoubleSide,
+  });
+  const radiusRing = new THREE.Mesh(
+    new THREE.RingGeometry(WARD_RADIUS - 0.28, WARD_RADIUS, 96),
+    ringMat,
+  );
+  const footRing = new THREE.Mesh(new THREE.RingGeometry(1.35, 1.6, 48), ringMat.clone());
+  (footRing.material as THREE.MeshBasicMaterial).opacity = 0.3;
+  for (const r of [radiusRing, footRing]) {
+    r.rotation.x = -Math.PI / 2;
+    r.layers.set(1); // effects layer — skipped by the depth prepass
+  }
+  rings.add(radiusRing, footRing);
+  rings.position.set(base.x, base.y + 0.06, base.z); // just above the slab
+
+  // A faint vertical pulse-beam off the core — the ward seen from far ground.
+  const beam = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.07, 0.07, WARD_BEAM_H, 10, 1, true),
     new THREE.MeshBasicMaterial({
-      color: 0x7fffd1,
+      color: dressing.core,
       transparent: true,
-      opacity: 0.045,
+      opacity: 0.04,
       blending: THREE.AdditiveBlending,
       depthWrite: false,
       side: THREE.DoubleSide,
     }),
   );
-  dome.position.set(pos.x, pos.y - 2.3, pos.z);
-  scene.add(light, core, dome);
-  wards.push({ pos, light, core, dome, vx, vz, floorY });
+  beam.position.set(pos.x, pos.y + WARD_BEAM_H / 2, pos.z);
+  beam.layers.set(1);
+
+  // Inward-drifting motes: the ward GATHERING light, not hoarding it.
+  const moteState = new Float32Array(WARD_MOTES * 4);
+  const motePos = new Float32Array(WARD_MOTES * 3);
+  const moteCol = new Float32Array(WARD_MOTES * 3);
+  const cA = new THREE.Color(dressing.motes[0]);
+  const cB = new THREE.Color(dressing.motes[1]);
+  const mix = new THREE.Color();
+  for (let i = 0; i < WARD_MOTES; i++) {
+    moteState[i * 4] = Math.random() * Math.PI * 2; // angle
+    moteState[i * 4 + 1] = 2 + Math.random() * (WARD_RADIUS - 2); // radius
+    moteState[i * 4 + 2] = 0.2 + Math.random() * 2.4; // height above base
+    moteState[i * 4 + 3] = 0.5 + Math.random() * 0.9; // inward drift speed
+    mix.copy(cA).lerp(cB, Math.random() * 0.85);
+    moteCol[i * 3] = mix.r;
+    moteCol[i * 3 + 1] = mix.g;
+    moteCol[i * 3 + 2] = mix.b;
+  }
+  const moteGeo = new THREE.BufferGeometry();
+  moteGeo.setAttribute('position', new THREE.BufferAttribute(motePos, 3));
+  moteGeo.setAttribute('color', new THREE.BufferAttribute(moteCol, 3));
+  const motes = new THREE.Points(
+    moteGeo,
+    new THREE.PointsMaterial({
+      size: 0.17,
+      map: moteTexture, // soft radial sprite — never hard squares
+      vertexColors: true,
+      transparent: true,
+      opacity: 0.85,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      sizeAttenuation: true,
+    }),
+  );
+  motes.frustumCulled = false;
+  motes.layers.set(1);
+
+  // The membrane — spawned invisible; the update loop breathes it in under
+  // tide pressure and for the activation surge.
+  const dome = new THREE.Mesh(
+    new THREE.SphereGeometry(WARD_RADIUS, 40, 20, 0, Math.PI * 2, 0, Math.PI / 2),
+    makeWardDomeMaterial(dressing.dome),
+  );
+  dome.position.copy(base);
+
+  scene.add(light, anchor, core, rings, beam, motes, dome);
+  wards.push({
+    pos,
+    light,
+    core,
+    dome,
+    anchor,
+    rings,
+    beam,
+    motes,
+    moteState,
+    activation: 0,
+    vx,
+    vz,
+    floorY,
+  });
   fogLightRegistry.push({
     pos: pos.clone(),
     color: new THREE.Color(0.5, 1.0, 0.82),
     intensity: 1.3, // your held light owns the air around it
   });
+  // Every ward you raise is a marked location — held light shows on the map.
+  minimap.addMarker({ x: vx, z: vz, icon: '❈', label: 'Ward', color: '#7fffd1' });
 }
 
 function placeWard(): void {
@@ -2133,9 +3117,12 @@ function placeWard(): void {
   let floorY = Math.floor(orb.pos.y);
   while (floorY > -6 && !world.solid(vx, floorY, vz)) floorY--;
   spawnWard(vx, vz, floorY);
+  // Placement activation: the membrane is born visible for a breath, then
+  // rests — from then on the dome only shows when the dark tests it.
+  wards[wards.length - 1].activation = 1;
   mood.event('joy'); // made light — the proudest feeling the orb knows
   objective =
-    'The ward holds a circle of light: inside its dome the dark cannot drain you, and your Lumen refills. Press T to test it against a tide.';
+    'The ward holds a circle of light: inside its ring the dark cannot drain you, and your Lumen refills. Press T to test it against a tide.';
 }
 
 // --- Save / load: one slot in localStorage. The world is deterministic from a
@@ -2225,6 +3212,9 @@ const menuBridge: MenuBridge = {
     // Flush those pending edges so the orb doesn't jump/pulse on frame one of play.
     if (resuming) input.consumeActions();
   },
+  // Settings → Map drives the discovery minimap live.
+  mapPrefs: () => minimap.getPrefs(),
+  setMapPrefs: (p) => minimap.setPrefs(p),
 };
 const menu = new Menu(menuBridge);
 
@@ -2291,12 +3281,14 @@ function updateHud(): void {
   const sporeEl = document.querySelector<HTMLSpanElement>('#spores');
   const obj = document.querySelector<HTMLDivElement>('#objective');
   const gamepadDebug = document.querySelector<HTMLDivElement>('#gamepad-debug');
-  const padStatus = input.debugGamepadStatus();
   if (lumen) lumen.textContent = Math.round(orb.lumen).toString();
   if (energy) energy.textContent = Math.round(orb.energy).toString();
   if (sporeEl) sporeEl.textContent = spores.toString();
   if (obj) obj.textContent = objective;
-  if (gamepadDebug) gamepadDebug.textContent = padStatus;
+  if (gamepadDebug) {
+    gamepadDebug.style.display = showPadDebug ? '' : 'none';
+    if (showPadDebug) gamepadDebug.textContent = input.debugGamepadStatus();
+  }
 }
 
 /** Set by window.waiver.throwTest() to fault the next N frames on purpose. */
@@ -2376,9 +3368,15 @@ function frame(): void {
   }
   if (!paused && actions.buildWard) placeWard();
   if (!paused && actions.tide) startTide();
+  // L3 / KeyV flip the camera rig; the pad routes it through here.
+  if (!paused && actions.camToggle) {
+    camMode = camMode === 0 ? 1 : 0;
+    logger('camera').debug(`mode = ${camMode === 1 ? 'shoulder' : 'adaptive'} (pad L3)`);
+  }
 
   orb.pulseRate = mood.pulseRate;
   orb.liftZone = computeLiftZone();
+  orb.lookPitch = pitch; // swimming follows the look (dive = aim down + forward)
   // Frozen input while paused — the orb just hovers in place, idling.
   const moveIntent = paused ? { x: 0, z: 0 } : input.moveVector();
   orb.update(
@@ -2388,6 +3386,7 @@ function frame(): void {
     !paused && actions.jump,
     !paused && input.sprinting(),
     !paused && actions.dash,
+    !paused && input.jumpHeld(),
   );
   if (orb.jumped) {
     pulseFlash = Math.max(pulseFlash, 0.55); // wave-jump = a small pulse
@@ -2426,7 +3425,9 @@ function frame(): void {
   orbAura.scale.setScalar(3.4 * orb.breathGlow * flashBoost);
   orbLight.position.copy(orb.pos);
   orbLight.color.copy(mood.color);
-  orbLight.intensity = 4.2 * orb.breathGlow * flashBoost * mood.brightness;
+  // Physical 1/d² falloff eats light fast, so the base is higher — brightness at
+  // mid-bubble (~4 units) matches the old non-physical tune, then dies organically.
+  orbLight.intensity = 8 * orb.breathGlow * flashBoost * mood.brightness;
 
   for (const p of pickups) {
     if (p.taken) continue;
@@ -2451,7 +3452,7 @@ function frame(): void {
     pulseShell.visible = true;
     pulseShell.position.copy(pulseCenter);
     pulseShell.scale.setScalar(pulseRadius);
-    (pulseShell.material as THREE.MeshBasicMaterial).opacity = 0.3 * (1 - t);
+    (pulseShell.material as THREE.MeshBasicMaterial).opacity = 0.5 * (1 - t); // brighter shell (was 0.3)
   } else {
     pulseShell.visible = false;
   }
@@ -2515,7 +3516,7 @@ function frame(): void {
   // and close toward your immediate sphere of light. At peak it's a tight,
   // near-black shroud: nothing beyond the orb's own pool survives.
   const tideFog = scene.fog as THREE.FogExp2;
-  tideFog.density = 0.1 * tidePress; // OFF at rest; only the tide rolls the shroud in (to ~0.1 at peak)
+  tideFog.density = 0; // FOG OFF (John's call). Tide darkness is done via the light dying, not FogExp2.
   tideFog.color.setRGB(0.02 * (1 - tidePress), 0.031 * (1 - tidePress), 0.039 * (1 - tidePress));
 
   // --- Phosphorescence: glowcaps charge under light, glow as they fade. ---
@@ -2553,17 +3554,122 @@ function frame(): void {
     fogLightRegistry[s.fogIdx].intensity = 0.04 + s.charge * 0.65;
   }
 
+  // Micro phosphor caps (buttons + shelf fungi): the SAME charge law as the big
+  // shrooms — orb trickle, pulse surge, slow decay, faster leach under the tide —
+  // at micro scale: a tiny halo blooms with the charge, never a lamp.
+  for (const m of microGlows) {
+    const md = m.pos.distanceTo(orb.pos);
+    if (md < 6) m.charge += dt * 0.5 * (1 - md / 6);
+    if (pulseActive) {
+      const pd = m.pos.distanceTo(pulseCenter);
+      if (Math.abs(pd - pulseRadius) < 3.2) m.charge += dt * 4.5;
+    }
+    if (m.charge > 1) m.charge = 1;
+    m.charge *= Math.exp((-dt / 26) * (1 + 5 * tidePress));
+    m.mat.emissiveIntensity = m.baseEmissive + m.charge * 1.15;
+    const hm = m.halo.material as THREE.SpriteMaterial;
+    hm.opacity = m.charge * 0.38;
+    m.halo.scale.setScalar(0.5 + 0.55 * m.charge);
+  }
+
+  // Feed the charged glow sources NEAREST the orb to the shader as real point
+  // lights (each ray-marches a shadow against the static solidity volume). BIG
+  // caps and MICRO caps compete for the same slots — one engine — but each
+  // carries its own properties: reach 9 for a grove cap, ~3 for a button clump.
+  const litShrooms = shrooms
+    .filter((s) => s.charge > 0.06)
+    .sort((a, b) => a.pos.distanceToSquared(orb.pos) - b.pos.distanceToSquared(orb.pos))
+    .slice(0, uniforms.uShroomPos.value.length);
+  const glowFeed: { pos: THREE.Vector3; color: THREE.Color; i: number; r: number }[] = [];
+  for (const s of shrooms) {
+    if (s.charge > 0.06) glowFeed.push({ pos: s.pos, color: s.capMat.emissive, i: s.charge * 1.4, r: 9 });
+  }
+  for (const m of microGlows) {
+    if (m.charge > 0.12) glowFeed.push({ pos: m.pos, color: m.mat.emissive, i: m.charge * 0.55, r: 3.2 });
+  }
+  glowFeed.sort((a, b) => a.pos.distanceToSquared(orb.pos) - b.pos.distanceToSquared(orb.pos));
+  const nGlow = Math.min(glowFeed.length, uniforms.uShroomPos.value.length);
+  uniforms.uShroomCount.value = nGlow;
+  for (let i = 0; i < nGlow; i++) {
+    uniforms.uShroomPos.value[i].copy(glowFeed[i].pos);
+    uniforms.uShroomColor.value[i].copy(glowFeed[i].color);
+    uniforms.uShroomI.value[i] = glowFeed[i].i;
+    uniforms.uShroomR.value[i] = glowFeed[i].r;
+  }
+  // Re-aim the REAL point-light pool at the brightest charged shrooms nearest the
+  // orb, so a charged grove casts coloured light on ALL geometry (imported flora,
+  // orb, native meshes) — not only the terrain shader's own shroom-light path.
+  for (let i = 0; i < SHROOM_LIGHT_POOL; i++) {
+    const L = shroomLights[i];
+    const s = litShrooms[i];
+    if (s && s.charge > 0.12) {
+      L.position.copy(s.pos);
+      L.color.copy(fogLightRegistry[s.fogIdx].color);
+      L.intensity = s.charge * 11; // physical 1/d² — higher base, dies naturally (no distance window)
+    } else {
+      L.intensity = 0;
+    }
+  }
+
   for (const ward of wards) {
-    const breathe = 1 + Math.sin(clock.elapsedTime * 2.1 + ward.pos.x) * 0.08;
+    const t = clock.elapsedTime;
+    const breathe = 1 + Math.sin(t * 2.1 + ward.pos.x) * 0.08;
     ward.core.scale.setScalar(breathe);
-    ward.light.intensity = 2.8 + breathe * 0.8;
-    // The dome breathes faintly; when a tide presses and you shelter inside,
-    // it flares — you SEE the ward holding the dark off.
-    const domeMat = ward.dome.material as THREE.MeshBasicMaterial;
+    ward.light.intensity = 10 + breathe * 2.8; // ×3.5 for the physical-falloff retune
+    ward.activation = Math.max(0, ward.activation - dt * 0.55); // ~2s surge
+
+    // The dome is a REACTIVE membrane, not the default look: invisible at
+    // rest, born for a breath at placement, and under a tide it fades in —
+    // strongest when you shelter inside it. You SEE the shield only when the
+    // dark is actually breaking against it.
+    const pressure = tideActive ? 0.25 + 0.75 * tidePress : 0;
     const sheltering = tideActive && ward.pos.distanceTo(orb.pos) < WARD_RADIUS;
-    domeMat.opacity = sheltering
-      ? 0.1 + 0.1 * tidePress + 0.03 * Math.sin(clock.elapsedTime * 6)
-      : 0.03 + 0.02 * breathe;
+    const strain = Math.max(ward.activation, pressure * (sheltering ? 1 : 0.55));
+    const domeMat = ward.dome.material as THREE.ShaderMaterial;
+    // flicker rises with strain — a membrane under stress, not a steady wall
+    domeMat.uniforms.uStrength.value =
+      strain * (0.42 + 0.1 * Math.sin(t * 6.3 + ward.pos.z) * (0.4 + 0.6 * strain));
+    domeMat.uniforms.uTime.value = t;
+
+    // The radius ring is the ward's default read: it breathes at rest, blooms
+    // with the activation surge, and hardens while a tide presses the circle.
+    const ringGlow = 0.14 + 0.05 * breathe + 0.35 * ward.activation + 0.14 * pressure;
+    const rMats = ward.rings.children.map((c) => (c as THREE.Mesh).material as THREE.MeshBasicMaterial);
+    if (rMats[0]) rMats[0].opacity = ringGlow;
+    if (rMats[1]) rMats[1].opacity = ringGlow + 0.14;
+    ward.rings.rotation.y = t * 0.05; // barely-perceptible slow turn — alive, not mechanical
+
+    // The beam pulses with the core; flares on activation and under pressure.
+    (ward.beam.material as THREE.MeshBasicMaterial).opacity =
+      0.03 + 0.02 * breathe + 0.22 * ward.activation + 0.05 * pressure;
+
+    // Motes spiral inward across the circle and sink toward the lumen core —
+    // gathered light, respawning at the rim so the inflow never stops.
+    const mp = ward.motes.geometry.attributes.position.array as Float32Array;
+    const st = ward.moteState;
+    const baseY = ward.floorY + 1;
+    const coreY = ward.pos.y;
+    for (let i = 0; i < WARD_MOTES; i++) {
+      st[i * 4] += dt * (0.18 + st[i * 4 + 3] * 0.12); // slow spiral
+      st[i * 4 + 1] -= dt * st[i * 4 + 3] * (0.6 + 0.6 * ward.activation); // drift inward
+      if (st[i * 4 + 1] < 0.5) {
+        // reached the core — respawn at the rim
+        st[i * 4] = Math.random() * Math.PI * 2;
+        st[i * 4 + 1] = WARD_RADIUS * (0.9 + Math.random() * 0.1);
+        st[i * 4 + 2] = 0.2 + Math.random() * 2.4;
+        st[i * 4 + 3] = 0.5 + Math.random() * 0.9;
+      }
+      const frac = 1 - st[i * 4 + 1] / WARD_RADIUS; // 0 at rim → 1 at core
+      const y =
+        baseY +
+        st[i * 4 + 2] +
+        (coreY - baseY - st[i * 4 + 2]) * frac * frac + // ease up into the niche
+        Math.sin(t * 1.7 + i * 2.6) * 0.12; // gentle bob
+      mp[i * 3] = ward.anchor.position.x + Math.cos(st[i * 4]) * st[i * 4 + 1];
+      mp[i * 3 + 1] = y;
+      mp[i * 3 + 2] = ward.anchor.position.z + Math.sin(st[i * 4]) * st[i * 4 + 1];
+    }
+    ward.motes.geometry.attributes.position.needsUpdate = true;
   }
 
   uniforms.uOrbPos.value.copy(orb.pos);
@@ -2622,33 +3728,13 @@ function frame(): void {
     moonAhead ? 0.6 + 3.4 * moonI : 0, // even a dim moon spears through
     camera.aspect,
   );
-  fogPass.setOrb(orb.pos); // low fog parts around the orb
-  fogPass.setMoon(moonI); // fog banks silver under an open moon
-
-  // --- Fog lights: orb in slot 0, then the nearest world lights. During a
-  // tide the mist itself recoils — the air dims with the world. And when a
-  // pulse fires, the whole atmosphere blooms for a breath.
-  fogPass.setBoost(1 + 0.45 * pulseFlash); // a breath of bloom, not a floodlight
-  // The mist recoils with the world — the lit air goes near-black at peak tide.
+  // (ground-smoke disabled — see the GroundFog note near the composer setup.
+  //  The nearest-lights sort below still feeds the orb's reflected-glow sheen,
+  //  and is ready to light the fog again when a ground-conforming fog returns.)
   const tideDim = 1 - 0.9 * tidePress;
-  fogPass.lightPos[0].copy(orb.pos);
-  fogPass.lightColor[0].copy(mood.color); // even the air takes the orb's mood
-  // The orb's own air-glow is NOT dimmed by the tide — it's the carried light
-  // the dark can't swallow; its bubble stays bright while the world goes black.
-  fogPass.lightIntensity[0] = 1.15 * orb.breathGlow * flashBoost * mood.brightness * orbTideBoost;
   const sorted = fogLightRegistry
     .map((l) => ({ l, d: l.pos.distanceToSquared(orb.pos) }))
     .sort((a, b) => a.d - b.d);
-  for (let i = 1; i < MAX_FOG_LIGHTS; i++) {
-    const entry = sorted[i - 1];
-    if (entry) {
-      fogPass.lightPos[i].copy(entry.l.pos);
-      fogPass.lightColor[i].copy(entry.l.color);
-      fogPass.lightIntensity[i] = entry.l.intensity * tideDim;
-    } else {
-      fogPass.lightIntensity[i] = 0;
-    }
-  }
 
   // The hero reflects the world's light: sum the nearby glow at the orb and
   // bleed a faint sheen of it onto the black core — teal in a grove, violet by
@@ -2664,10 +3750,66 @@ function frame(): void {
     orbWorldLit.g += e.l.color.g * w;
     orbWorldLit.b += e.l.color.b * w;
   }
-  (orbCore.material as THREE.MeshPhysicalMaterial).emissive.copy(orbWorldLit).multiplyScalar(0.3);
+  // Bleed a WHISPER of the world's light onto the black core — a reflected mood,
+  // never a glow. Clamped so a bright grove can't turn the satin core into a lamp;
+  // the orb's light lives in the aura ring, the body stays dark and reflective.
+  orbWorldLit.r = Math.min(orbWorldLit.r, 0.4);
+  orbWorldLit.g = Math.min(orbWorldLit.g, 0.4);
+  orbWorldLit.b = Math.min(orbWorldLit.b, 0.4);
+  (orbCore.material as THREE.MeshPhysicalMaterial).emissive.copy(orbWorldLit).multiplyScalar(0.16);
 
   updateTrail(dt);
   updateSpores(dt, clock.elapsedTime);
+
+  // --- Elemental testbeds: water surface, fire, build editor ---
+  // The water is DARK until lit: it only answers to the orb plus whatever live
+  // sources sit near the pool (wards, charged groves, crystals — the registry
+  // carries them all with their current charge-driven intensity).
+  const waterLights: { pos: THREE.Vector3; color: THREE.Color; intensity: number }[] = [
+    { pos: orb.pos, color: mood.color, intensity: 1.6 * orb.breathGlow },
+  ];
+  {
+    const wc = testbeds.water.center;
+    for (const l of fogLightRegistry) {
+      if (waterLights.length >= 8) break;
+      if (l.intensity < 0.25) continue;
+      const dxl = l.pos.x - wc.x;
+      const dzl = l.pos.z - wc.z;
+      if (dxl * dxl + dzl * dzl < 60 * 60) waterLights.push(l);
+    }
+  }
+  waterZone.update({
+    t: clock.elapsedTime,
+    orbPos: orb.pos,
+    orbColor: mood.color,
+    orbIntensity: orbLight.intensity,
+    pulseCenter,
+    pulseRadius: pulseActive ? pulseRadius : -1,
+    pulseIntensity: pulseActive ? LightConfig.pulse.intensity : 0,
+    pulseThickness: LightConfig.pulse.thickness,
+    moonDir,
+    moonI,
+    lights: waterLights,
+    tier: qualityTier,
+  });
+  // The orb interacts with the water: crossing the surface hard splashes;
+  // swimming drags a wake of expanding ripple rings behind it.
+  if (orb.splashed) {
+    waterZone.splash(orb.pos);
+    waterZone.disturb(orb.pos.x, orb.pos.z, 1.3);
+    mood.event('effort');
+  }
+  if (orb.inWater) {
+    waterWakeTimer -= dt;
+    const swimSpeed = Math.hypot(orb.vel.x, orb.vel.z);
+    if (waterWakeTimer <= 0 && swimSpeed > 2) {
+      waterZone.disturb(orb.pos.x, orb.pos.z, 0.22 + swimSpeed * 0.03);
+      waterWakeTimer = 0.16;
+    }
+  }
+  fireZone.update(dt, clock.elapsedTime, camera.position, qualityTier);
+  fogLightRegistry[fireFogIdx].intensity = 1.0 + 0.6 * (fireZone.light.intensity / 3);
+  if (!paused) buildSandbox.update(dt, orb.pos, yaw, camera.position);
   // The grass field: wind + parts around the orb + ripples with the pulse.
   grassField.update(
     clock.elapsedTime,
@@ -3184,11 +4326,13 @@ function frame(): void {
   }
   updateFloraCulling();
   updateSwayProps(dt); // imported trees lean from the orb + shudder on the pulse
+  updatePhosphorHalos(dt, clock.elapsedTime); // charged imported shrooms swell their glow
   // (dynamic light-volume re-flood removed — it repacked the whole atlas ~3×/s
   //  and spiked frames = the stutter. Solidity for shadows is static, built once
   //  at load; dynamic sources come back as real shader lights, not a repack.)
   updateCamera(dt);
   updateHud();
+  minimap.update(dt, orb.pos, yaw);
   renderer.info.reset();
   // Depth prepass ONLY feeds the volumetric fog/god-rays. With those off it's a
   // whole wasted scene render per frame, so skip it entirely.
@@ -3214,21 +4358,20 @@ function frame(): void {
     metricsFresh = true;
     metricsTimer = 0;
     const info = renderer.info.render;
-    const padStatus = input.debugGamepadStatus();
     metricsBar.textContent =
       `${fpsEma.toFixed(0)} fps · ${(1000 / Math.max(fpsEma, 1)).toFixed(1)} ms · ` +
       `${info.calls} calls · ${(info.triangles / 1000).toFixed(0)}k tris · ` +
       `${chunkMeshes.size} chunks · ${fogLightRegistry.length + 1} lights` +
       (qualityTier > 0 ? ` · Q${qualityTier}` : '') +
-      ` · ${padStatus}`;
+      (showPadDebug ? ` · ${input.debugGamepadStatus()}` : '');
   }
 
   if (metricsFresh && (window.innerWidth < 720 || window.matchMedia('(pointer: coarse)').matches)) {
     const info = renderer.info.render;
-    const padStatus = input.debugGamepadStatus();
     metricsBar.textContent =
       `${fpsEma.toFixed(0)} fps | ${(1000 / Math.max(fpsEma, 1)).toFixed(1)} ms | ` +
-      `${(info.triangles / 1000).toFixed(0)}k tri | Q${qualityTier} | ${padStatus}`;
+      `${(info.triangles / 1000).toFixed(0)}k tri | Q${qualityTier}` +
+      (showPadDebug ? ` | ${input.debugGamepadStatus()}` : '');
   }
 
   // Adaptive step-down: sustained low fps drops one tier at a time.
@@ -3453,6 +4596,23 @@ frameLoop();
   },
   tide: startTide,
   ward: placeWard,
+  // --- Elemental testbeds (John's corners): warp to each + drive the sandbox.
+  // These MUST live on THIS object — it's the final `waiver` assignment; an
+  // earlier duplicate assignment gets clobbered (that's why toWater() didn't
+  // exist and the lake was unfindable).
+  toWater: () => orb.pos.copy(testbeds.water.teleport),
+  toForge: () => orb.pos.copy(testbeds.forge.teleport),
+  toSandbox: () => orb.pos.copy(testbeds.sandbox.teleport),
+  build: {
+    place: () => buildSandbox.place(),
+    remove: () => buildSandbox.remove(),
+    cycle: () => buildSandbox.cycleMat(),
+    force: () => buildSandbox.forceWave(orb.pos.clone()),
+  },
+  testbeds, // dev: inspect carved zone metadata
+  waterZone, // dev: live-tune the water shader uniforms + flipFish()
+  fireZone, // dev: inspect the hearth
+  minimap, // dev: map prefs/markers from the console
   read: () => ({
     orb: orb.pos.toArray(),
     yaw,
@@ -3506,9 +4666,36 @@ frameLoop();
 };
 
 // Press V to flip the cave camera between adaptive and over-shoulder (A/B).
+// Press P to toggle the controller telemetry (HUD line + metrics pad segment).
 window.addEventListener('keydown', (e) => {
   if (e.code === 'KeyV') {
     camMode = camMode === 0 ? 1 : 0;
     logger('camera').debug(`mode = ${camMode === 1 ? 'shoulder' : 'adaptive'}`);
+  }
+  if (e.code === 'KeyP') {
+    showPadDebug = !showPadDebug;
+    logger('input').debug(`pad telemetry ${showPadDebug ? 'ON' : 'OFF'}`);
+  }
+});
+
+// Testbed build controls for the SW sandbox. F/B/T/Q/V/L are already bound
+// (see core/Input.ts), so the build verbs use the free keys:
+//   G = force wave (scatters your placed blocks) · E = place · R = remove
+//   C = cycle build material. The wire-box cursor floats in front of the orb.
+window.addEventListener('keydown', (e) => {
+  if (paused || e.repeat) return;
+  switch (e.code) {
+    case 'KeyG':
+      buildSandbox.forceWave(orb.pos.clone());
+      break;
+    case 'KeyE':
+      buildSandbox.place();
+      break;
+    case 'KeyR':
+      buildSandbox.remove();
+      break;
+    case 'KeyC':
+      logger('build').info(`material → ${buildSandbox.cycleMat()}`);
+      break;
   }
 });

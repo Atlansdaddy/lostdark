@@ -1,0 +1,50 @@
+{
+  "_comment": "Saved Meshy AI generations for wAIver, so they can be re-downloaded, remeshed, retextured, or reuploaded later. task ids are the durable handle: pass a refineTaskId as meshy_remesh input_task_id (or re-download via meshy_download_model). Original high-res GLBs are backed up under meshy_assets/originals/. createdAt = epoch ms.",
+  "assets": [
+    {
+      "file": "web/public/assets/flora/meshy_glowshroom.glb",
+      "original": "meshy_assets/originals/meshy_glowshroom.glb",
+      "kind": "flora/mushroom",
+      "prompt": "giant bioluminescent glowing toadstool mushroom, fantasy, dark forest floor",
+      "refineTaskId": "019f38c6-f37f-73db-8925-a96e07086d2e",
+      "previewTaskId": "019f38c4-ac4f-77ba-9674-7bda80a7ff68",
+      "createdAt": 1783363990415
+    },
+    {
+      "file": "web/public/assets/flora/meshy_glowshroom_02.glb",
+      "original": "meshy_assets/originals/meshy_glowshroom_02.glb",
+      "kind": "flora/mushroom-cluster",
+      "prompt": "cluster of small bioluminescent glowing blue mushrooms with luminous caps, fantasy dark forest floor, moss",
+      "refineTaskId": "019f38e7-b74e-7cee-978f-bbeee9047ab5",
+      "previewTaskId": "019f38e6-1707-7b82-93a5-ed5a21affb5b",
+      "createdAt": 1783366137701
+    },
+    {
+      "file": "web/public/assets/flora/meshy_glowshroom_03.glb",
+      "original": "meshy_assets/originals/meshy_glowshroom_03.glb",
+      "kind": "flora/mushroom",
+      "prompt": "tall glowing amanita toadstool with luminous glowing spots, violet cap, bioluminescent, fantasy dark forest",
+      "refineTaskId": "019f38e7-4e2e-70a0-bcac-65ec3c1a991f",
+      "previewTaskId": "019f38e6-263e-7067-9b7b-5eae16985e5d",
+      "createdAt": 1783366110795
+    },
+    {
+      "file": "web/public/assets/flora/meshy_flatshroom.glb",
+      "original": "meshy_assets/originals/meshy_flatshroom.glb",
+      "kind": "flora/mushroom",
+      "prompt": "large mushroom with a very broad flat wide parasol cap, bioluminescent glowing luminous, fantasy dark forest",
+      "refineTaskId": "019f3924-a0ae-760d-b107-5bb752919914",
+      "previewTaskId": "019f3923-1286-7c38-89ec-9bf2df49edf5",
+      "createdAt": 1783370129603
+    },
+    {
+      "file": null,
+      "original": null,
+      "kind": "ward-experiment/obelisk",
+      "prompt": "Ancient keeper obelisk anchor: a single tall tapered monolithic pylon of dark weathered basalt, angular faceted shard silhouette, an empty diamond-shaped hollow niche carved clean through the pylon at two-thirds of its height, standing on a low circular stone plinth base etched with concentric grooves, hairline cracks and shallow carved runic channels running up the faces, ancient ruined relic infrastructure, fantasy game environment prop, strong clean silhouette, no crystals, no lantern, no glow",
+      "refineTaskId": "019f3948-bbde-7ab7-8c77-785e08890faf",
+      "previewTaskId": null,
+      "createdAt": 1783372497573
+    }
+  ]
+}

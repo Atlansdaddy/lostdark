@@ -24,6 +24,13 @@ export const FLORA_MANIFEST = {
   tree_02: 'tree_02.glb', // dead/bare tree — reads well in The Reek
   mushroom_01: 'mushroom_01.glb',
   mushroom_02: 'mushroom_02.glb', // Laetiporus shelf fungus
+  bigshroom_01: 'bigshroom_01.glb', // large toadstool
+  bigshroom_02: 'bigshroom_02.glb',
+  bigshroom_03: 'bigshroom_03.glb',
+  meshy_glowshroom: 'meshy_glowshroom.glb', // Meshy-generated giant glowing toadstool
+  meshy_glowshroom_02: 'meshy_glowshroom_02.glb', // cluster of small blue glowcaps
+  meshy_glowshroom_03: 'meshy_glowshroom_03.glb', // tall violet amanita
+  meshy_flatshroom: 'meshy_flatshroom.glb', // broad flat parasol cap
   rock_01: 'rock_01.glb', // round pebble
   rock_02: 'rock_02.glb', // square pebble
   bush_01: 'bush_01.glb',
@@ -50,7 +57,7 @@ export interface FloraInstance {
  *  albedos are bright/pastel; in a dark game a bright albedo blows out the
  *  instant any light touches it. Clamped so a lit surface is a soft reveal, not
  *  a glare (matches the native-flora dark-game pass). */
-const ALBEDO_MAX_LUM = 0.16;
+const ALBEDO_MAX_LUM = 0.5;
 
 /**
  * Rework one imported material so it lights like native flora instead of the
@@ -92,6 +99,13 @@ const DEFAULT_HEIGHT: Record<FloraName, number> = {
   tree_02: 8,
   mushroom_01: 1.4,
   mushroom_02: 1.1,
+  bigshroom_01: 3.6,
+  bigshroom_02: 3.0,
+  bigshroom_03: 2.6,
+  meshy_glowshroom: 4.2, // giant — the generated hero toadstool
+  meshy_glowshroom_02: 1.8, // low cluster
+  meshy_glowshroom_03: 3.4, // tall amanita
+  meshy_flatshroom: 3.2, // broad flat parasol
   rock_01: 1.1,
   rock_02: 1.3,
   bush_01: 1.6,
@@ -99,9 +113,54 @@ const DEFAULT_HEIGHT: Record<FloraName, number> = {
   grass_01: 0.9,
 };
 
+/** Shrink an oversized texture in place: swap its image for a downscaled canvas.
+ *  Keeps the SAME texture object, so flipY / colorSpace / wrap / UV mapping are
+ *  all preserved (no re-orientation or colour shift). The Meshy exports ship 2K+
+ *  maps — overkill for this game — so cap the longest side at `size`. */
+function downscaleTexture(tex: THREE.Texture, size: number): void {
+  const img = tex.image as { width?: number; height?: number } | undefined;
+  if (!img || typeof img.width !== 'number' || typeof img.height !== 'number') return;
+  const w = img.width;
+  const h = img.height;
+  if (Math.max(w, h) <= size) return;
+  const s = size / Math.max(w, h);
+  const cv = document.createElement('canvas');
+  cv.width = Math.max(1, Math.round(w * s));
+  cv.height = Math.max(1, Math.round(h * s));
+  const ctx = cv.getContext('2d');
+  if (!ctx) return;
+  try {
+    ctx.drawImage(img as CanvasImageSource, 0, 0, cv.width, cv.height);
+  } catch {
+    return; // undrawable / tainted → leave original
+  }
+  tex.image = cv;
+  tex.needsUpdate = true;
+}
+
 export class FloraLibrary {
   private roots = new Map<FloraName, THREE.Object3D>();
   private loaded = false;
+
+  /** Shrink every texture on a loaded asset (done once per asset, before it's
+   *  cloned across the world) so hundreds of instances don't hold 2K maps. */
+  private optimize(root: THREE.Object3D): void {
+    const seen = new Set<THREE.Texture>();
+    root.traverse((o) => {
+      const mesh = o as THREE.Mesh;
+      if (!mesh.isMesh) return;
+      const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+      for (const m of mats) {
+        const std = m as THREE.MeshStandardMaterial;
+        for (const t of [std.map, std.normalMap, std.roughnessMap, std.metalnessMap, std.aoMap, std.emissiveMap]) {
+          if (t && !seen.has(t)) {
+            seen.add(t);
+            downscaleTexture(t, 512);
+          }
+        }
+      }
+    });
+  }
 
   /** Load every manifest entry in parallel. Missing files warn (and are simply
    *  skipped) rather than throwing — one bad asset shouldn't blank the world. */
@@ -117,6 +176,7 @@ export class FloraLibrary {
             loader.load(
               ASSET_BASE + FLORA_MANIFEST[name],
               (gltf) => {
+                this.optimize(gltf.scene); // shrink textures once, before cloning
                 this.roots.set(name, gltf.scene);
                 resolve();
               },
@@ -148,7 +208,8 @@ export class FloraLibrary {
    * Materials are cloned so the caller can patch them (pulse-reveal, dark-game
    * albedo) without touching the shared source model.
    */
-  make(name: FloraName, height = DEFAULT_HEIGHT[name]): FloraInstance | null {
+  make(name: FloraName, height = DEFAULT_HEIGHT[name], sizeMul = 1): FloraInstance | null {
+    height *= sizeMul; // per-instance size variation (a grove is never uniform)
     const root = this.roots.get(name);
     if (!root) {
       log.warn(`make(${name}) — not loaded`);

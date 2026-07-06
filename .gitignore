@@ -6,6 +6,17 @@ dist/
 build/
 *.local
 
+# Secrets / API keys — NEVER commit. Real values live in .env.local (untracked);
+# .env.example documents the variable names without the values.
+.env
+.env.*
+!.env.example
+secrets/
+
+# Meshy original high-res GLB backups (large; recoverable via the task ids in
+# meshy_assets/manifest.json, which IS committed). Keep the manifest, skip the blobs.
+meshy_assets/originals/
+
 # Vite / dev caches
 .vite/
 *.tsbuildinfo

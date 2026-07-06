@@ -19,14 +19,14 @@ export const Light = {
    *  but with the sky still overhead. */
   ambientFloor: 0.0015,
   /** Steady glow bubble the orb carries with it. */
-  orbRadius: 7,
-  orbIntensity: 0.9,
+  orbRadius: 9, // bigger carried bubble so nearby flora reads
+  orbIntensity: 1.1, // slightly brighter
   /** Manual pulse: an expanding shell that briefly reveals what it washes over. */
   pulse: {
-    speed: 34, // voxels/sec the shell travels
-    maxRadius: 46, // SPEC §2: ~30–60 voxel reveal
-    thickness: 6, // shell half-width in voxels
-    intensity: 0.8, // a reveal, not a floodlight (tuned vs the muted grade)
+    speed: 22, // voxels/sec — slower so the shell lingers a little longer
+    maxRadius: 34, // ~25% smaller reveal (was 46)
+    thickness: 4.5, // shell half-width, ~25% smaller (was 6)
+    intensity: 1.2, // brighter reveal (was 0.8)
     energyCost: 12, // SPEC §2: ~10–15 energy
   },
 } as const;
@@ -49,8 +49,8 @@ export const Move = {
   // Dash = a dedicated blink-burst on TAP, distinct from sprint. Works on the
   // ground and in the air; air dashes are limited and refresh on landing.
   dash: {
-    speed: 46, // burst velocity along the dash direction
-    duration: 0.16, // seconds the burst holds (float, no gravity) before glide resumes
+    speed: 30, // burst velocity along the dash direction (~65% of the old burst)
+    duration: 0.12, // seconds the burst holds (float, no gravity) — tuned to ~half the old reach
     cooldown: 0.45, // min seconds between dashes — a beat, not spammable
     cost: 14, // energy per dash — a real spend, like the pulse
     airMax: 1, // air dashes allowed per airtime (refreshes when grounded)
@@ -68,6 +68,15 @@ export const Move = {
   jumpDecay: 0.72, // each chained jump keeps this much of the last one's power
   jumpCost: 10,
   fallGlide: 10, // terminal fall speed — the orb *drifts* down, never plummets
+  // Hover-boost: HOLD jump to rise and hover, topping out around 0.75 of a full
+  // triple-jump's height above the floor — but energy burns fast. Tap = the
+  // ballistic wave-jump above; hold = a sustained, deliberate lift you pay for.
+  hoverBoost: {
+    ceiling: 5, // voxels above the floor the sustained hover tops out at (~0.75× triple-jump)
+    accel: 48, // upward accel while held (beats gravity 34 so it climbs)
+    riseSpeed: 7, // capped climb speed while boosting (a fresh jump's pop rides above it)
+    costPerSec: 26, // energy/sec — the "burns fast" spend
+  },
 } as const;
 
 export const Camera = {

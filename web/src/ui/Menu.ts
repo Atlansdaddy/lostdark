@@ -14,6 +14,8 @@
  * instead set a resume flag and reload, so they too land on a clean world.
  */
 
+import type { MapPrefs } from './Minimap';
+
 const K = {
   introSeen: 'waiver.introSeen',
   resume: 'waiver.resume', // transient: "on next boot, auto-load the save"
@@ -33,9 +35,12 @@ export interface MenuBridge {
   deleteSave(): void;
   /** true = freeze gameplay (menu is up), false = hand control back. */
   setPaused(paused: boolean): void;
+  /** Live minimap preferences (Settings → Map reads/writes these). */
+  mapPrefs(): MapPrefs;
+  setMapPrefs(p: Partial<MapPrefs>): void;
 }
 
-type Screen = 'title' | 'intro' | 'controls' | 'load' | 'settings' | 'pause' | 'playing';
+type Screen = 'title' | 'intro' | 'controls' | 'load' | 'settings' | 'map' | 'pause' | 'playing';
 
 interface IntroPanel {
   glyph: string;
@@ -82,8 +87,8 @@ const INTRO: IntroPanel[] = [
     glyph: '❈',
     title: 'Shape a ward',
     body: [
-      'Spend your glowspores to raise a ward: a fixed wellspring of held light that throws a dome of safety over the ground.',
-      'Inside a ward the dark cannot drain you, and your Lumen refills. Held light is the only light the tide cannot take.',
+      'Spend your glowspores to raise a ward: a Keeper anchor of held light that claims a circle of ground, marked by its glowing ring.',
+      'Inside that ring the dark cannot drain you, and your Lumen refills. When a tide presses, a membrane of light flares over the circle to hold it. Held light is the only light the tide cannot take.',
     ],
   },
   {
@@ -119,14 +124,15 @@ const DEVICES: Device[] = [
         rows: [
           ['Look around', 'Move mouse (click to lock) · or drag'],
           ['Glide', 'W A S D · or arrows'],
-          ['Dash — hold', 'Shift'],
+          ['Dash tap · sprint hold', 'Shift'],
+          ['Camera view', 'V'],
           ['Cruise — auto-forward', 'Q'],
         ],
       },
       {
         title: 'Actions',
         rows: [
-          ['Wave-jump', 'Space'],
+          ['Jump — hold to hover', 'Space'],
           ['Pulse — echolocate', 'F  (or click when locked)'],
           ['Raise a ward', 'B'],
           ['Call a tide — test', 'T'],
@@ -152,25 +158,26 @@ const DEVICES: Device[] = [
         rows: [
           ['Glide', 'Left stick · or D-pad'],
           ['Look around', 'Right stick'],
-          ['Dash — hold', 'Ⓑ  or  RB'],
-          ['Cruise — auto-forward', 'L3  (click left stick)'],
+          ['Camera view', 'L3  (click left stick)'],
         ],
       },
       {
         title: 'Actions',
         rows: [
-          ['Wave-jump', 'Ⓐ'],
-          ['Pulse — echolocate', 'Ⓧ  (or LT / RT)'],
+          ['Jump — hold to hover', 'Ⓐ'],
+          ['Dash — hold to sprint', 'Ⓑ'],
+          ['Pulse — echolocate', 'Ⓧ'],
           ['Raise a ward', 'Ⓨ'],
-          ['Call a tide — test', '☰ Menu'],
+          ['Call a tide — test', 'R3  (click right stick)'],
         ],
       },
       {
         title: 'Menus',
         rows: [
+          ['Open / close menu', '☰ Start'],
           ['Navigate', 'D-pad / stick'],
           ['Select · Back', 'Ⓐ · Ⓑ'],
-          ['Skip intro', '☰ Menu'],
+          ['Skip intro', '☰ Start'],
         ],
       },
     ],
@@ -184,22 +191,23 @@ const DEVICES: Device[] = [
         rows: [
           ['Glide', 'Left stick · or D-pad'],
           ['Look around', 'Right stick'],
-          ['Dash — hold', '○  or  R1'],
-          ['Cruise — auto-forward', 'L3  (click left stick)'],
+          ['Camera view', 'L3  (click left stick)'],
         ],
       },
       {
         title: 'Actions',
         rows: [
-          ['Wave-jump', '✕'],
-          ['Pulse — echolocate', '□  (or L2 / R2)'],
+          ['Jump — hold to hover', '✕'],
+          ['Dash — hold to sprint', '○'],
+          ['Pulse — echolocate', '□'],
           ['Raise a ward', '△'],
-          ['Call a tide — test', 'Options'],
+          ['Call a tide — test', 'R3  (click right stick)'],
         ],
       },
       {
         title: 'Menus',
         rows: [
+          ['Open / close menu', 'Options'],
           ['Navigate', 'D-pad / stick'],
           ['Select · Back', '✕ · ○'],
           ['Skip intro', 'Options'],
@@ -210,29 +218,30 @@ const DEVICES: Device[] = [
   {
     key: 'pad',
     label: 'Generic pad',
-    note: 'Positions on a standard controller — bottom / right / left / top face buttons.',
+    note: 'Face buttons by position — bottom / right / left / top. Single-button verbs only for now.',
     groups: [
       {
         title: 'Move & look',
         rows: [
           ['Glide', 'Left stick · or D-pad'],
           ['Look around', 'Right stick'],
-          ['Dash — hold', 'Right face · or right bumper'],
-          ['Cruise — auto-forward', 'Left stick click'],
+          ['Camera view', 'Left stick click (L3)'],
         ],
       },
       {
         title: 'Actions',
         rows: [
-          ['Wave-jump', 'Bottom face button'],
-          ['Pulse — echolocate', 'Left face · or triggers'],
-          ['Raise a ward', 'Top face button'],
-          ['Call a tide — test', 'Start'],
+          ['Jump — hold to hover', 'Bottom face'],
+          ['Dash — hold to sprint', 'Right face'],
+          ['Pulse — echolocate', 'Left face'],
+          ['Raise a ward', 'Top face'],
+          ['Call a tide — test', 'Right stick click (R3)'],
         ],
       },
       {
         title: 'Menus',
         rows: [
+          ['Open / close menu', 'Start'],
           ['Navigate', 'D-pad / stick'],
           ['Select · Back', 'Bottom · right face'],
           ['Skip intro', 'Start'],
@@ -256,7 +265,7 @@ const DEVICES: Device[] = [
         title: 'On-screen buttons',
         rows: [
           ['Pulse — echolocate', 'PULSE'],
-          ['Wave-jump', 'JUMP'],
+          ['Jump — hold to hover', 'JUMP'],
           ['Dash — hold to sprint', 'DASH'],
           ['Raise a ward', 'WARD'],
           ['Call a tide — test', 'TIDE'],
@@ -312,7 +321,6 @@ export class Menu {
   // highlight, A confirms, B goes back. Runs only while a menu screen is up.
   private focusables: HTMLButtonElement[] = [];
   private focusIdx = 0;
-  private padRaf = 0;
   private padPrev: boolean[] = [];
   private navHeld = 0; // last stepped direction, for press-then-repeat
   private navRepeatAt = 0; // performance.now() when the held dir may step again
@@ -324,6 +332,7 @@ export class Menu {
     this.root = el('div', { class: 'wm-root' }, [this.panel]);
     document.body.appendChild(this.root);
     window.addEventListener('keydown', (e) => this.onKey(e));
+    this.startPad(); // one perpetual poll: Start opens the menu, drives nav inside it
   }
 
   /** Keyboard drives the menus too: arrows move focus, Enter confirms, Esc
@@ -389,14 +398,12 @@ export class Menu {
     document.body.classList.add('waiver-menu-open');
     this.root.classList.remove('wm-hidden');
     this.render();
-    this.startPad();
   }
 
   private enterPlay(): void {
     this.screen = 'playing';
     this.root.classList.add('wm-hidden');
     document.body.classList.remove('waiver-menu-open');
-    this.stopPad();
     this.bridge.setPaused(false);
   }
 
@@ -449,6 +456,9 @@ export class Menu {
       case 'settings':
         this.renderSettings();
         break;
+      case 'map':
+        this.renderMapSettings();
+        break;
       case 'pause':
         this.renderPause();
         break;
@@ -495,20 +505,17 @@ export class Menu {
     back?.click();
   }
 
+  /** One perpetual poll for the WHOLE session. During play it watches only the
+   *  Start button (opens the pause menu); inside a menu it drives full nav. It
+   *  must never stop — stopping and restarting inside a poll re-armed the loop
+   *  and left the pad driving hidden menus during play (the "A opens the menu"
+   *  bug). Gating by screen keeps gameplay buttons (A = jump) out of the menu. */
   private startPad(): void {
-    if (this.padRaf) return;
-    this.padPrev = [];
-    this.navHeld = 0;
     const loop = () => {
       this.pollPad();
-      this.padRaf = requestAnimationFrame(loop);
+      requestAnimationFrame(loop);
     };
-    this.padRaf = requestAnimationFrame(loop);
-  }
-
-  private stopPad(): void {
-    if (this.padRaf) cancelAnimationFrame(this.padRaf);
-    this.padRaf = 0;
+    requestAnimationFrame(loop);
   }
 
   private pollPad(): void {
@@ -516,15 +523,22 @@ export class Menu {
       typeof navigator !== 'undefined' && navigator.getGamepads ? navigator.getGamepads() : [];
     const gp = Array.from(pads).find((p): p is Gamepad => !!p && p.connected);
     if (!gp) return;
-    const now = typeof performance !== 'undefined' ? performance.now() : 0;
     const pressed = (i: number) => !!gp.buttons[i]?.pressed;
-    const axis = (i: number) => gp.axes[i] ?? 0;
+    const edge = (i: number) => pressed(i) && !this.padPrev[i];
 
+    if (this.screen === 'playing') {
+      // In play the ONLY menu key is Start — everything else is the game's.
+      if (edge(9)) this.open('pause');
+      this.padPrev = gp.buttons.map((b) => b.pressed);
+      return;
+    }
+
+    // Menu is up → full navigation.
+    const now = typeof performance !== 'undefined' ? performance.now() : 0;
+    const axis = (i: number) => gp.axes[i] ?? 0;
     // Direction from D-pad OR either stick — any axis cycles the focus list.
-    const prevDir =
-      pressed(12) || pressed(14) || axis(1) < -0.55 || axis(0) < -0.55 ? -1 : 0;
-    const nextDir =
-      pressed(13) || pressed(15) || axis(1) > 0.55 || axis(0) > 0.55 ? 1 : 0;
+    const prevDir = pressed(12) || pressed(14) || axis(1) < -0.55 || axis(0) < -0.55 ? -1 : 0;
+    const nextDir = pressed(13) || pressed(15) || axis(1) > 0.55 || axis(0) > 0.55 ? 1 : 0;
     const dir = prevDir || nextDir;
     if (dir === 0) {
       this.navHeld = 0;
@@ -535,11 +549,13 @@ export class Menu {
       this.navHeld = dir;
     }
 
-    // A (0) confirms, B (1) backs — edge-triggered against last frame.
-    // Start (9) skips the intro, matching the ✕ / X affordance.
-    const edge = (i: number) => pressed(i) && !this.padPrev[i];
+    // Start (9): skip the intro, resume from pause, else step back. A (0)
+    // confirms, B (1) backs — all edge-triggered against the last frame.
     if (this.screen === 'intro' && edge(9)) this.finishIntro();
-    else if (edge(0)) this.confirm();
+    else if (edge(9)) {
+      if (this.screen === 'pause') this.resume();
+      else this.pressBack();
+    } else if (edge(0)) this.confirm();
     else if (edge(1)) this.pressBack();
     this.padPrev = gp.buttons.map((b) => b.pressed);
   }
@@ -736,6 +752,14 @@ export class Menu {
     ]);
     controlsRow.addEventListener('click', () => this.openControls(false));
     list.append(controlsRow);
+    // Map is LIVE — discovery minimap size/shape/orientation.
+    const mapRow = el('button', { class: 'wm-set-row wm-set-live', type: 'button' }, [
+      el('div', { class: 'wm-set-name', textContent: 'Map' }),
+      el('div', { class: 'wm-set-hint', textContent: 'Discovery minimap — size, shape, orientation' }),
+      el('div', { class: 'wm-set-go', textContent: 'View ›' }),
+    ]);
+    mapRow.addEventListener('click', () => this.open('map'));
+    list.append(mapRow);
     // Stubbed pipes — wired visually, contents land in a later pass.
     for (const [name, hint] of [
       ['Graphics', 'Quality, bloom, volumetrics'],
@@ -760,6 +784,69 @@ export class Menu {
     );
     this.panel.append(
       el('h2', { class: 'wm-h2', textContent: 'Settings' }),
+      list,
+      actions,
+    );
+  }
+
+  /** Settings → Map: each row is a cycle button that rewrites its own value
+   *  chip in place (no re-render, so pad/keyboard focus never jumps). */
+  private renderMapSettings(): void {
+    const list = el('div', { class: 'wm-settings' });
+    const cycleRow = (
+      name: string,
+      hint: string,
+      current: () => string,
+      onCycle: () => void,
+    ): HTMLButtonElement => {
+      const value = el('div', { class: 'wm-set-go', textContent: current() });
+      const row = el('button', { class: 'wm-set-row wm-set-live', type: 'button' }, [
+        el('div', { class: 'wm-set-name', textContent: name }),
+        el('div', { class: 'wm-set-hint', textContent: hint }),
+        value,
+      ]);
+      row.addEventListener('click', () => {
+        onCycle();
+        value.textContent = current();
+      });
+      return row;
+    };
+    const p = () => this.bridge.mapPrefs();
+    list.append(
+      cycleRow(
+        'Visible',
+        'Show the minimap in the corner',
+        () => (p().visible ? 'On ‹›' : 'Off ‹›'),
+        () => this.bridge.setMapPrefs({ visible: !p().visible }),
+      ),
+      cycleRow(
+        'Size',
+        'How much of the corner it takes',
+        () => ({ S: 'Small ‹›', M: 'Medium ‹›', L: 'Large ‹›' })[p().size],
+        () => this.bridge.setMapPrefs({ size: ({ S: 'M', M: 'L', L: 'S' } as const)[p().size] }),
+      ),
+      cycleRow(
+        'Shape',
+        'Round ring or square panel',
+        () => (p().shape === 'round' ? 'Round ‹›' : 'Square ‹›'),
+        () => this.bridge.setMapPrefs({ shape: p().shape === 'round' ? 'square' : 'round' }),
+      ),
+      cycleRow(
+        'Orientation',
+        'Rotate with your view, or hold north up',
+        () => (p().rotate ? 'Follow view ‹›' : 'North-up ‹›'),
+        () => this.bridge.setMapPrefs({ rotate: !p().rotate }),
+      ),
+    );
+    const actions = el('div', { class: 'wm-actions wm-row' });
+    actions.append(this.button('Back', () => this.open('settings'), 'primary'));
+    this.panel.append(
+      el('h2', { class: 'wm-h2', textContent: 'Map' }),
+      el('p', {
+        class: 'wm-ctrl-note',
+        textContent:
+          'The map is dark until you have BEEN somewhere — exploring burns away the fog. Marked locations point off the rim until you close in.',
+      }),
       list,
       actions,
     );
@@ -809,6 +896,7 @@ export class Menu {
       body.waiver-menu-open .metrics-bar,
       body.waiver-menu-open .touch-actions,
       body.waiver-menu-open .touch-stick-base,
+      body.waiver-menu-open .waiver-minimap,
       body.waiver-menu-open #light-toggle { display: none !important; }
 
       .wm-root {

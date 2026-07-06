@@ -37,6 +37,15 @@ export interface GrassUniforms {
   uPulseIntensity: { value: number };
   uHeldColor: { value: THREE.Color };
   uMoonI: { value: number };
+  // Shared light-volume atlas (main.ts overwrites these entries with the SAME
+  // uniform objects the terrain/flora use — one global lighting engine). The
+  // alpha channel is world solidity; grass shadow-marches its orb bubble against
+  // it so the bubble can't pass through walls (the "false circle" bug).
+  uLightAtlas: { value: THREE.Texture | null };
+  uLightMin: { value: THREE.Vector3 };
+  uLightStep: { value: number };
+  uLightDim: { value: THREE.Vector3 };
+  uLightTiles: { value: THREE.Vector2 };
 }
 
 export class GrassField {
@@ -51,6 +60,11 @@ export class GrassField {
     uPulseIntensity: { value: 0 },
     uHeldColor: { value: new THREE.Color(0.62, 1.0, 0.8) },
     uMoonI: { value: 0 },
+    uLightAtlas: { value: null },
+    uLightMin: { value: new THREE.Vector3(-128, -14, -128) },
+    uLightStep: { value: 2 },
+    uLightDim: { value: new THREE.Vector3(1, 1, 1) },
+    uLightTiles: { value: new THREE.Vector2(1, 1) },
   };
   private material: THREE.ShaderMaterial;
 
@@ -127,6 +141,41 @@ export class GrassField {
         uniform vec3 uOrbColor;
         uniform vec3 uHeldColor;
         uniform float uMoonI;
+        uniform sampler2D uLightAtlas;
+        uniform vec3 uLightMin;
+        uniform float uLightStep;
+        uniform vec3 uLightDim;
+        uniform vec2 uLightTiles;
+
+        // World solidity from the shared light-volume atlas (alpha) — the same
+        // data the terrain/flora shadow-march. Nearest Y-slice, crisp walls.
+        float sampleSolid(vec3 wp) {
+          vec3 v = (wp - uLightMin) / uLightStep;
+          float nx = uLightDim.x, ny = uLightDim.y, nz = uLightDim.z;
+          float tX = uLightTiles.x, tY = uLightTiles.y;
+          float aw = tX * nx, ah = tY * nz;
+          float cx = clamp(v.x, 0.5, nx - 0.5);
+          float cz = clamp(v.z, 0.5, nz - 0.5);
+          float s = clamp(floor(v.y), 0.0, ny - 1.0);
+          vec2 t = vec2(mod(s, tX), floor(s / tX));
+          vec2 uv = vec2(t.x * nx + cx, t.y * nz + cz) / vec2(aw, ah);
+          return texture2D(uLightAtlas, uv).a;
+        }
+        // Shadow march toward the orb — a wall between blade and orb blocks the
+        // bubble (no more lit-grass circles through solid terrain). Short march:
+        // only runs inside the bubble, so the field at large pays nothing.
+        float orbShadow(vec3 p) {
+          vec3 d = uOrbPos - p;
+          float dist = length(d);
+          if (dist < 1.5) return 1.0;
+          vec3 dir = d / dist;
+          float march = min(dist - 1.0, 10.0);
+          for (int i = 1; i <= 10; i++) {
+            if (float(i) >= march) break;
+            if (sampleSolid(p + dir * (float(i) + 0.5)) > 0.5) return 0.0;
+          }
+          return 1.0;
+        }
 
         void main() {
           // Per-blade tint: greens drifting toward teal, from the phase hash.
@@ -135,10 +184,13 @@ export class GrassField {
           vec3 tipCol = mix(vec3(0.16, 0.5, 0.3), vec3(0.14, 0.45, 0.42), t);
           vec3 albedo = mix(rootCol, tipCol, vH);
 
-          // Light: ambient whisper + baked held light + the orb's bubble.
+          // Light: ambient whisper + baked held light + the orb's bubble —
+          // radius matches the engine's orbRadius (9), and the bubble is
+          // OCCLUDED like every other light in the game.
           float od = distance(vWorld, uOrbPos);
-          float bubble = 1.0 - clamp(od / 7.0, 0.0, 1.0);
+          float bubble = 1.0 - clamp(od / 9.0, 0.0, 1.0);
           bubble = bubble * bubble * 0.9;
+          if (bubble > 0.004) bubble *= orbShadow(vWorld + vec3(0.0, 0.4, 0.0));
 
           float held = vLight * vLight * 1.6;
           vec3 lit = albedo * (0.05 + held) * uHeldColor
