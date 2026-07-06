@@ -171,6 +171,14 @@ function addPulseReveal(mat: THREE.MeshStandardMaterial): void {
     shader.uniforms.uPulseThickness = uniforms.uPulseThickness;
     shader.uniforms.uPulseIntensity = uniforms.uPulseIntensity;
     shader.uniforms.uPulseColor = uniforms.uOrbColor; // pulse takes the orb's mood
+    // Share the light volume so flora catch the SAME propagating flood-fill light
+    // as the terrain — a charged grove, ward or crystal lights the flora around it.
+    shader.uniforms.uLightAtlas = uniforms.uLightAtlas;
+    shader.uniforms.uLightMin = uniforms.uLightMin;
+    shader.uniforms.uLightStep = uniforms.uLightStep;
+    shader.uniforms.uLightDim = uniforms.uLightDim;
+    shader.uniforms.uLightTiles = uniforms.uLightTiles;
+    shader.uniforms.uHeldColor = uniforms.uHeldColor;
     let vtxHead = 'varying vec3 vPulseWP;\n';
     if (isLeaf) {
       shader.uniforms.uLeafTime = { value: 0 };
@@ -210,10 +218,38 @@ function addPulseReveal(mat: THREE.MeshStandardMaterial): void {
        uniform float uPulseThickness;
        uniform float uPulseIntensity;
        uniform vec3 uPulseColor;
-       varying vec3 vPulseWP;\n` +
+       uniform sampler2D uLightAtlas;
+       uniform vec3 uLightMin;
+       uniform float uLightStep;
+       uniform vec3 uLightDim;
+       uniform vec2 uLightTiles;
+       uniform vec3 uHeldColor;
+       varying vec3 vPulseWP;
+       // Same 2D-atlas flood-fill sampler as the terrain shader.
+       float sampleLightVol(vec3 wp) {
+         vec3 v = (wp - uLightMin) / uLightStep;
+         float nx = uLightDim.x, ny = uLightDim.y, nz = uLightDim.z;
+         float tX = uLightTiles.x, tY = uLightTiles.y;
+         float aw = tX * nx, ah = tY * nz;
+         float cx = clamp(v.x, 0.5, nx - 0.5);
+         float cz = clamp(v.z, 0.5, nz - 0.5);
+         float fy = v.y - 0.5;
+         float s0 = clamp(floor(fy), 0.0, ny - 1.0);
+         float s1 = clamp(s0 + 1.0, 0.0, ny - 1.0);
+         float wy = clamp(fy - s0, 0.0, 1.0);
+         vec2 t0 = vec2(mod(s0, tX), floor(s0 / tX));
+         vec2 t1 = vec2(mod(s1, tX), floor(s1 / tX));
+         vec2 uv0 = vec2(t0.x * nx + cx, t0.y * nz + cz) / vec2(aw, ah);
+         vec2 uv1 = vec2(t1.x * nx + cx, t1.y * nz + cz) / vec2(aw, ah);
+         return mix(texture2D(uLightAtlas, uv0).r, texture2D(uLightAtlas, uv1).r, wy);
+       }\n` +
       shader.fragmentShader.replace(
         '#include <opaque_fragment>',
-        `if (uPulseIntensity > 0.0 && uPulseRadius >= 0.0) {
+        `// Flora lit by the world's flood-fill light (groves, crystals, wards):
+         float volL = sampleLightVol(vPulseWP);
+         volL = volL * volL * 1.6; // quadratic — bright cores, fast fall into dark
+         outgoingLight += diffuseColor.rgb * volL * uHeldColor;
+         if (uPulseIntensity > 0.0 && uPulseRadius >= 0.0) {
            float pd = distance(vPulseWP, uPulseCenter);
            float ring = 1.0 - clamp(abs(pd - uPulseRadius) / uPulseThickness, 0.0, 1.0);
            ring = ring * ring * uPulseIntensity;
@@ -2101,12 +2137,22 @@ function frame(): void {
   orb.liftZone = computeLiftZone();
   // Frozen input while paused — the orb just hovers in place, idling.
   const moveIntent = paused ? { x: 0, z: 0 } : input.moveVector();
-  orb.update(dt, moveIntent, yaw, !paused && actions.jump, !paused && input.sprinting());
+  orb.update(
+    dt,
+    moveIntent,
+    yaw,
+    !paused && actions.jump,
+    !paused && input.sprinting(),
+    !paused && actions.dash,
+  );
   if (orb.jumped) {
     pulseFlash = Math.max(pulseFlash, 0.55); // wave-jump = a small pulse
     mood.event('effort');
   }
-  if (actions.dash) mood.event('effort'); // sprint start still reads as effort
+  if (orb.dashStarted) {
+    pulseFlash = Math.max(pulseFlash, 0.7); // the dash surges the aura as it fires
+    mood.event('effort');
+  }
   // Landing: a quick squash — weight without weight.
   if (!wasGrounded && orb.grounded) landSquash = 1;
   wasGrounded = orb.grounded;
