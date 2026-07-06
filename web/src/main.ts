@@ -81,6 +81,13 @@ let pitch = -0.28;
 let yawTarget = yaw;
 let pitchTarget = pitch;
 
+// Boom length/rise ease toward what the surrounding space allows (see
+// updateCamera): full in the open, drawn in + down in caves and tunnels.
+let camDistSmooth = CameraConfig.distance;
+let camHeightSmooth = CameraConfig.height;
+// 0 = adaptive third-person (default), 1 = fixed over-shoulder (press V to A/B).
+let camMode: 0 | 1 = 0;
+
 // HDR bloom → ACES output. The glowing orb and emissives NEED this to read
 // as light sources instead of flat sprites (GDD §5j: non-negotiable).
 // Depth prepass: the volumetric pass needs scene depth, but reading a depth
@@ -142,24 +149,52 @@ const { material: worldMaterial, uniforms } = createLitMaterial();
 // paints the flora in their own albedo, not just shadow. Injected into the
 // linear-HDR light (before tonemapping) using the shared pulse uniforms so it
 // stays in lockstep with the terrain. Instancing-aware for the leaf cards.
+// Leaf clusters route through this SAME patch (userData.leaf), so they get the
+// grove's pulse-reveal lighting — PLUS soft spherical normals (a cluster lights
+// as a round bush, not flat quads) and GPU wind. Both must live in one
+// onBeforeCompile, since a material only gets one.
+let leafTimeUniform: { value: number } | null = null;
 function addPulseReveal(mat: THREE.MeshStandardMaterial): void {
+  const isLeaf = mat.userData.leaf === true;
   mat.onBeforeCompile = (shader) => {
     shader.uniforms.uPulseCenter = uniforms.uPulseCenter;
     shader.uniforms.uPulseRadius = uniforms.uPulseRadius;
     shader.uniforms.uPulseThickness = uniforms.uPulseThickness;
     shader.uniforms.uPulseIntensity = uniforms.uPulseIntensity;
     shader.uniforms.uPulseColor = uniforms.uOrbColor; // pulse takes the orb's mood
-    shader.vertexShader =
-      'varying vec3 vPulseWP;\n' +
-      shader.vertexShader.replace(
-        '#include <begin_vertex>',
-        `#include <begin_vertex>
+    let vtxHead = 'varying vec3 vPulseWP;\n';
+    if (isLeaf) {
+      shader.uniforms.uLeafTime = { value: 0 };
+      leafTimeUniform = shader.uniforms.uLeafTime;
+      vtxHead += 'uniform float uLeafTime;\n';
+    }
+    shader.vertexShader = vtxHead + shader.vertexShader;
+    if (isLeaf) {
+      // Spherical normals: light the cluster as a soft round volume, not as the
+      // flat faces of its crossed quads (that flat read is why it looked wrong).
+      shader.vertexShader = shader.vertexShader.replace(
+        '#include <beginnormal_vertex>',
+        '#include <beginnormal_vertex>\n objectNormal = normalize(position + vec3(0.0, 0.0015, 0.0));',
+      );
+    }
+    const windCode = isLeaf
+      ? `float lph = instanceMatrix[3].x * 0.7 + instanceMatrix[3].z * 0.5;
+         float sway = uv.y * (0.12 * sin(uLeafTime * 1.3 + lph)
+                            + 0.06 * sin(uLeafTime * 3.1 + lph * 1.7)
+                            + 0.03 * sin(uLeafTime * 6.7 + lph * 2.3));
+         transformed.x += sway;
+         transformed.z += sway * 0.6;`
+      : '';
+    shader.vertexShader = shader.vertexShader.replace(
+      '#include <begin_vertex>',
+      `#include <begin_vertex>
+         ${windCode}
          vec4 pulseWP = vec4(transformed, 1.0);
          #ifdef USE_INSTANCING
            pulseWP = instanceMatrix * pulseWP;
          #endif
          vPulseWP = (modelMatrix * pulseWP).xyz;`,
-      );
+    );
     shader.fragmentShader =
       `uniform vec3 uPulseCenter;
        uniform float uPulseRadius;
@@ -178,8 +213,8 @@ function addPulseReveal(mat: THREE.MeshStandardMaterial): void {
          #include <opaque_fragment>`,
       );
   };
-  // All patched flora share one program — constant cache key, no variant blowup.
-  mat.customProgramCacheKey = () => 'pulseReveal';
+  // Leaf variant compiles as its own program; the rest share one cache key.
+  mat.customProgramCacheKey = () => (mat.userData.leaf ? 'pulseRevealLeaf' : 'pulseReveal');
 }
 
 const chunkMeshes = new Map<Chunk, THREE.Mesh>();
@@ -712,6 +747,9 @@ interface ShroomFlora {
   cz: number;
   cvx: number;
   cvz: number;
+  // Crowding neighbours — positions are static, so this is computed once (the
+  // first frame the shroom is simulated) and cached, not scanned every frame.
+  neighbors: ShroomFlora[] | null;
 }
 const shroomFlora: ShroomFlora[] = [];
 // Spacing registry — caps claim ground so new ones don't spawn interpenetrating.
@@ -746,6 +784,7 @@ interface TreeFlora {
   cwvx: number;
   cwvz: number;
   phase: number;
+  wake: number; // frames of sim left; 0 = asleep (no Verlet, no GPU re-upload)
 }
 const treeFlora: TreeFlora[] = [];
 
@@ -1019,6 +1058,7 @@ function makeGlowcap(x: number, y: number, z: number, h: number): void {
     cz: 0,
     cvx: 0,
     cvz: 0,
+    neighbors: null,
   });
   const fogIdx =
     fogLightRegistry.push({
@@ -1121,7 +1161,6 @@ function makeLeafClusterGeometry(): THREE.BufferGeometry {
 }
 
 const leafGeo = makeLeafClusterGeometry();
-let leafTimeUniform: { value: number } | null = null;
 const leafMat = new THREE.MeshStandardMaterial({
   map: makeLeafTexture(),
   alphaTest: 0.42, // cut the soft texture into organic leaf edges (opaque, cheap)
@@ -1133,27 +1172,9 @@ const leafMat = new THREE.MeshStandardMaterial({
   side: THREE.DoubleSide,
   envMapIntensity: 0.05,
 });
-leafMat.onBeforeCompile = (shader) => {
-  shader.uniforms.uLeafTime = { value: 0 };
-  leafTimeUniform = shader.uniforms.uLeafTime;
-  shader.vertexShader = 'uniform float uLeafTime;\n' + shader.vertexShader;
-  // Spherical normals: light the cluster as a soft round bush, not flat quads.
-  shader.vertexShader = shader.vertexShader.replace(
-    '#include <beginnormal_vertex>',
-    '#include <beginnormal_vertex>\n objectNormal = normalize(position + vec3(0.0, 0.0015, 0.0));',
-  );
-  // Wind: layered sines, tip-weighted by uv.y, phased per instance. GPU-only.
-  shader.vertexShader = shader.vertexShader.replace(
-    '#include <begin_vertex>',
-    `#include <begin_vertex>
-     float lph = instanceMatrix[3].x * 0.7 + instanceMatrix[3].z * 0.5;
-     float sway = uv.y * (0.12 * sin(uLeafTime * 1.3 + lph)
-                        + 0.06 * sin(uLeafTime * 3.1 + lph * 1.7)
-                        + 0.03 * sin(uLeafTime * 6.7 + lph * 2.3));
-     transformed.x += sway;
-     transformed.z += sway * 0.6;`,
-  );
-};
+// Marked so registerFlora → addPulseReveal gives leaves the grove's pulse
+// lighting AND the spherical-normal + wind patch, in one shared onBeforeCompile.
+leafMat.userData.leaf = true;
 
 function makeSporeTree(x: number, y: number, z: number, h: number): void {
   const g = new THREE.Group();
@@ -1306,6 +1327,7 @@ function makeSporeTree(x: number, y: number, z: number, h: number): void {
     cwvx: 0,
     cwvz: 0,
     phase: x * 0.23 + z * 0.11,
+    wake: 0,
   });
   updateRopeTube({ nodes, n, radii, radial, tubePos, tubeNrm }); // bake rest shape
   fogLightRegistry.push({
@@ -1368,7 +1390,8 @@ interface StrandRope {
   tubeNrm: THREE.BufferAttribute;
   beads: THREE.Mesh[]; // spore-balls, each riding a node
   beadNodes: number[];
-  phase: number; // ambient-breeze phase so nothing hangs perfectly dead-still
+  phase: number;
+  wake: number; // frames of sim left; 0 = asleep (no Verlet, no GPU re-upload)
 }
 const strandRopes: StrandRope[] = [];
 
@@ -1528,6 +1551,7 @@ function makeStrandAt(px: number, py: number, pz: number, len: number): void {
     beads,
     beadNodes,
     phase: px * 0.5 + pz * 0.7,
+    wake: 0,
   };
   updateRopeTube(rope); // bake the rest pose so it's shaped before first sim
   strandRopes.push(rope);
@@ -1641,7 +1665,9 @@ remeshDirtyChunks();
 // on with waiver.lightVol(1) to A/B it against the baked light before we rely
 // on it for dynamic (charge-driven) lighting.
 const lightVol = new LightVolume(
-  new THREE.Vector3(-REEK_HALF_INIT, -14, -REEK_HALF_INIT),
+  // Reaches down to bedrock (caves now run to y≈-40) so the charge-driven
+  // volume covers the full underdark, not just the surface band.
+  new THREE.Vector3(-REEK_HALF_INIT, -42, -REEK_HALF_INIT),
   new THREE.Vector3(REEK_HALF_INIT, 20, REEK_HALF_INIT),
   2,
 );
@@ -1656,17 +1682,26 @@ console.info(
     ` (${lightVol.dim.x}x${lightVol.dim.y}x${lightVol.dim.z} voxels)`,
 );
 
-// Flora were built as standard materials lit by the RoomEnvironment IBL, so
-// they glowed in the open dark (trees/caps visible everywhere). Strip the
-// environment off every flora material — now they're BLACK until a real light
-// (the orb, and next the volume) reaches them; their own bioluminescent
-// emissive still shows. Done as a post-creation sweep so the flora factory
-// functions (the other window's domain) are left untouched.
+// Force flora dark — COLLISION-PROOF against the other window's flora rewrites.
+// Every flora material: kill the RoomEnvironment IBL, and zero the self-glow on
+// everything EXCEPT the bioluminescent glowcaps (whose charge drives their glow
+// each frame). So trees/trunks/canopies go black until a real light reaches
+// them, no matter what emissive the flora factories set upstream.
+const glowMats = new Set<THREE.Material>();
+for (const s of shrooms) {
+  glowMats.add(s.capMat);
+  glowMats.add(s.gillMat);
+}
 for (const f of floraCull) {
   f.group.traverse((o) => {
     const mesh = o as THREE.Mesh;
-    const mat = mesh.material as THREE.MeshStandardMaterial | undefined;
-    if (mat && 'envMapIntensity' in mat) mat.envMapIntensity = 0;
+    if (!mesh.material) return;
+    const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+    for (const raw of mats) {
+      const m = raw as THREE.MeshStandardMaterial;
+      if ('envMapIntensity' in m) m.envMapIntensity = 0;
+      if ('emissiveIntensity' in m && !glowMats.has(m)) m.emissiveIntensity = 0;
+    }
   });
 }
 
@@ -2232,13 +2267,23 @@ function frame(): void {
     let tcz = 0;
 
     // Neighbour bend: lean away from any cap crowding this one's footprint.
-    for (const o of shroomFlora) {
-      if (o === s) continue;
+    // Positions are static, so the crowding set is found once and cached.
+    if (s.neighbors === null) {
+      s.neighbors = [];
+      for (const o of shroomFlora) {
+        if (o === s) continue;
+        const dx = s.x - o.x;
+        const dz = s.z - o.z;
+        const min = (s.capR + o.capR) * 0.85;
+        if (dx * dx + dz * dz < min * min) s.neighbors.push(o);
+      }
+    }
+    for (const o of s.neighbors) {
       const dx = s.x - o.x;
       const dz = s.z - o.z;
       const min = (s.capR + o.capR) * 0.85;
       const d2 = dx * dx + dz * dz;
-      if (d2 < min * min && d2 > 1e-4) {
+      if (d2 > 1e-4) {
         const d = Math.sqrt(d2);
         const over = (min - d) / min;
         tlx += (dx / d) * over * 0.12;
@@ -2327,8 +2372,8 @@ function frame(): void {
   // the top node, and the canopy either ripples or flutters its leaves.
   const TREE_DRAG = 0.96; // light damping so a push actually swings the crown
   const TREE_ITER = 8;
-  const TREE_BREEZE = 1.3;
   const TREE_MAXSTEP = 0.4;
+  const TREE_WAKE = 50; // frames a disturbed tree keeps simulating, then sleeps
   const TREE_CONTACT = 0.5 + ORB_HALO_RADIUS; // trunk collider + glow shell
   const TREE_PULSE_ACC = 150 * (LightConfig.pulse.intensity / 0.8);
   // Boughs = the crown's own springy mass (second hitbox): softer + swingier
@@ -2349,7 +2394,7 @@ function frame(): void {
     const last = n - 1;
     const adx = tree.anchor.x - orb.pos.x;
     const adz = tree.anchor.z - orb.pos.z;
-    const nearOrb = adx * adx + adz * adz < 34 * 34;
+    const nearOrb = adx * adx + adz * adz < 20 * 20;
     // Pulse centre in the tree's local frame.
     const pcx = pulseCenter.x - tree.anchor.x;
     const pcy = pulseCenter.y - tree.anchor.y;
@@ -2363,7 +2408,11 @@ function frame(): void {
       const span = rest[last * 3 + 1] + 4; // ~trunk height + margin
       pulseHere = Math.abs(dBase - pulseRadius) < LightConfig.pulse.thickness + span;
     }
-    if (!nearOrb && !pulseHere) continue;
+    // Sleep-gating: only simulate (and re-upload the trunk tube) while disturbed
+    // plus a short settle tail; idle trees sleep in their rest pose for free.
+    if (nearOrb || pulseHere) tree.wake = TREE_WAKE;
+    if (tree.wake <= 0) continue;
+    tree.wake--;
 
     const olx = orb.pos.x - tree.anchor.x;
     const oly = orb.pos.y - tree.anchor.y;
@@ -2372,10 +2421,9 @@ function frame(): void {
     // 1) Integrate free nodes (no gravity — rest curve holds it up).
     for (let i = 1; i < n; i++) {
       const k = i * 3;
-      const f = i / last;
-      let sx = (nodes[k] - prev[k]) * TREE_DRAG + Math.sin(time * 0.7 + tree.phase) * TREE_BREEZE * f * tdt2;
+      let sx = (nodes[k] - prev[k]) * TREE_DRAG;
       let sy = (nodes[k + 1] - prev[k + 1]) * TREE_DRAG;
-      let sz = (nodes[k + 2] - prev[k + 2]) * TREE_DRAG + Math.cos(time * 0.6 + tree.phase) * TREE_BREEZE * f * tdt2;
+      let sz = (nodes[k + 2] - prev[k + 2]) * TREE_DRAG;
       // Per-NODE shell test (not gated on the crown): as the wavefront climbs
       // the trunk it shoves each node in turn, so the bend travels UP the trunk
       // instead of only kicking the crown.
@@ -2563,9 +2611,9 @@ function frame(): void {
   const ROPE_GRAV = 17; //   local down-accel — sets how firmly it hangs plumb
   const ROPE_DRAG = 0.986; // velocity kept per frame — <1 so swings settle
   const ROPE_ITER = 12; //   constraint relaxation passes (stiffer thread)
-  const ROPE_BREEZE = 1.6; // faint living drift so nothing hangs dead-still
   const ROPE_MAXSTEP = 0.5; // per-frame node step cap — kills blow-ups
-  const ROPE_SIM_R2 = 26 * 26; // sim ropes this close to the orb (h-dist²)
+  const ROPE_SIM_R2 = 14 * 14; // wake ropes only when the orb is near enough to touch
+  const ROPE_WAKE = 50; // frames a disturbed rope keeps simulating, then sleeps
   const PULSE_THICK = LightConfig.pulse.thickness; // shell half-width (voxels)
   const PULSE_ACC = 78 * (LightConfig.pulse.intensity / 0.8); // wavefront shove
   const dtc = dt < 1 / 60 ? dt : 1 / 60; // clamp for a stable integrator
@@ -2587,23 +2635,24 @@ function frame(): void {
       // Anchor within the shell band, widened by the rope's reach below it.
       pulseHere = Math.abs(dA - pulseRadius) < PULSE_THICK + ropeLen + 3;
     }
-    if (!nearOrb && !pulseHere) continue;
+    // Sleep-gating: a rope only simulates (and re-uploads its tube to the GPU)
+    // while it's being disturbed, plus a short tail to settle — then it sleeps
+    // in its rest pose and costs nothing. This is what keeps idle groves free.
+    if (nearOrb || pulseHere) rope.wake = ROPE_WAKE;
+    if (rope.wake <= 0) continue;
+    rope.wake--;
 
     // Orb centre in the rope's local frame (anchor at origin).
     const olx = orb.pos.x - rope.anchor.x;
     const oly = orb.pos.y - rope.anchor.y;
     const olz = orb.pos.z - rope.anchor.z;
-    // A slow breeze, phase-offset per rope, so idle strands still breathe.
-    const bx = Math.sin(clock.elapsedTime * 0.6 + rope.phase) * ROPE_BREEZE;
-    const bz = Math.cos(clock.elapsedTime * 0.5 + rope.phase * 1.3) * ROPE_BREEZE;
 
     // 1) Verlet integrate every free node (node 0 stays pinned to the anchor).
     for (let i = 1; i < n; i++) {
       const k = i * 3;
-      const f = i / (n - 1); // tip drifts more in the breeze than the neck
-      let sx = (nodes[k] - prev[k]) * ROPE_DRAG + bx * f * dt2;
+      let sx = (nodes[k] - prev[k]) * ROPE_DRAG;
       let sy = (nodes[k + 1] - prev[k + 1]) * ROPE_DRAG - ROPE_GRAV * dt2;
-      let sz = (nodes[k + 2] - prev[k + 2]) * ROPE_DRAG + bz * f * dt2;
+      let sz = (nodes[k + 2] - prev[k + 2]) * ROPE_DRAG;
       // Pulse wavefront: while the expanding shell sits on this node, push it
       // radially OUTWARD from the pulse centre — same shove the orb gives, so
       // strands whip when a pulse rolls through and swing back on their own.
@@ -2742,14 +2791,59 @@ function frame(): void {
 const camOrigin = new THREE.Vector3();
 const camDir = new THREE.Vector3();
 
+/** How open the space around the orb is, 0 (snug tunnel) … 1 (open sky).
+ *  Reads BOTH the ceiling clearance and the horizontal room, and takes the
+ *  tighter of the two — a low roof OR near walls both count as enclosed. */
+function orbOpenness(): number {
+  const ox = Math.floor(orb.pos.x);
+  const oy = orb.pos.y;
+  const oz = Math.floor(orb.pos.z);
+  // Ceiling clearance.
+  let head = 0;
+  for (; head < CameraConfig.headroomOpen + 2; head++) {
+    if (world.solid(ox, Math.floor(oy + 1.4 + head), oz)) break;
+  }
+  // Horizontal clearance: shortest reach across 8 compass directions.
+  let minClear = CameraConfig.lateralOpen + 2;
+  for (let a = 0; a < 8; a++) {
+    const dx = Math.cos((a / 8) * Math.PI * 2);
+    const dz = Math.sin((a / 8) * Math.PI * 2);
+    let d = 0;
+    for (; d < CameraConfig.lateralOpen + 2; d++) {
+      if (world.solid(Math.floor(orb.pos.x + dx * (1.2 + d)), Math.floor(oy + 0.4), Math.floor(orb.pos.z + dz * (1.2 + d)))) break;
+    }
+    if (d < minClear) minClear = d;
+  }
+  const headO = Math.min(1, head / CameraConfig.headroomOpen);
+  const latO = Math.min(1, minClear / CameraConfig.lateralOpen);
+  return Math.min(headO, latO);
+}
+
 function updateCamera(dt: number): void {
-  const distance = CameraConfig.distance;
-  const height = CameraConfig.height;
+  const open = orbOpenness();
+  // Ease boom length/rise between the open-sky rig and the snug-cave rig so the
+  // camera never *wants* to sit where geometry forbids (the old whip/clip).
+  const tDist = camMode === 1
+    ? CameraConfig.shoulderDistance
+    : CameraConfig.tightDistance + (CameraConfig.distance - CameraConfig.tightDistance) * open;
+  const tHeight = camMode === 1
+    ? CameraConfig.shoulderHeight
+    : CameraConfig.tightHeight + (CameraConfig.height - CameraConfig.tightHeight) * open;
+  const ease = Math.min(1, dt * CameraConfig.enclosureLerp);
+  camDistSmooth += (tDist - camDistSmooth) * ease;
+  camHeightSmooth += (tHeight - camHeightSmooth) * ease;
+  const distance = camDistSmooth;
+  const height = camHeightSmooth;
   tempVec.set(
     orb.pos.x + Math.sin(yaw) * Math.cos(pitch) * distance,
     orb.pos.y + height + Math.sin(pitch) * distance,
     orb.pos.z + Math.cos(yaw) * Math.cos(pitch) * distance,
   );
+  // Over-shoulder alt-rig: nudge the boom sideways so the orb isn't dead-centre.
+  if (camMode === 1) {
+    tempVec.x += Math.cos(yaw) * CameraConfig.shoulderSide;
+    tempVec.z += -Math.sin(yaw) * CameraConfig.shoulderSide;
+  }
 
   // Collision: march from just above the orb toward the desired position and
   // stop short of the first solid voxel — the camera never leaves the level.
@@ -2867,4 +2961,18 @@ frame();
     uniforms.uLightVolMix.value = mix;
     console.info(`[lightvol] mix = ${mix}`);
   },
+  /** A/B the cave camera: 'adaptive' (default) draws the boom in as the space
+   *  tightens; 'shoulder' is a fixed close over-shoulder chase. Or press V. */
+  camMode(mode: 'adaptive' | 'shoulder'): void {
+    camMode = mode === 'shoulder' ? 1 : 0;
+    console.info(`[camera] mode = ${mode}`);
+  },
 };
+
+// Press V to flip the cave camera between adaptive and over-shoulder (A/B).
+window.addEventListener('keydown', (e) => {
+  if (e.code === 'KeyV') {
+    camMode = camMode === 0 ? 1 : 0;
+    console.info(`[camera] mode = ${camMode === 1 ? 'shoulder' : 'adaptive'}`);
+  }
+});
