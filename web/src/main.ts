@@ -110,7 +110,7 @@ renderer.domElement.addEventListener('webglcontextrestored', () => {
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x020205);
-scene.fog = new THREE.FogExp2(0x05080a, 0.024);
+scene.fog = new THREE.FogExp2(0x05080a, 0.055); // dense enough that distance goes black
 
 // The night above The Reek: clouds, star pockets, a cycling moon.
 const sky = new SkyDome();
@@ -1752,6 +1752,11 @@ const REEK_SEED = 20250703;
 const REEK_HALF_INIT = 128; // 256×256 voxel initial area (was 512×512 = too much upfront)
 
 // Hook for POI callbacks
+// Trees are now authored GLTF props (see the imported-flora block below). GLTF
+// loads asynchronously, but worldgen runs synchronously right here — so the tree
+// hook just RECORDS each placement; the models are built once the assets land.
+const pendingTrees: { x: number; y: number; z: number; h: number }[] = [];
+
 const reekHooks = {
   grove: (x: number, y: number, z: number, h: number) =>
     makeGlowcap(x, smoothSurfaceY(x, z, y) - 0.08, z, h),
@@ -1765,8 +1770,7 @@ const reekHooks = {
     addPickup(x, smoothSurfaceY(Math.floor(x), Math.floor(z), Math.floor(y)) + 1.3, z),
   grass: (x: number, y: number, z: number) =>
     grassSpots.push([x, smoothSurfaceY(x, z, y) - 0.06, z]),
-  tree: (x: number, y: number, z: number, h: number) =>
-    makeSporeTree(x, smoothSurfaceY(x, z, y) - 0.15, z, h),
+  tree: (x: number, y: number, z: number, h: number) => pendingTrees.push({ x, y, z, h }),
   buttons: (x: number, y: number, z: number) =>
     makeButtons(x, smoothSurfaceY(x, z, y) - 0.04, z),
   strand: (x: number, cy: number, z: number, len: number) =>
@@ -1868,14 +1872,35 @@ if (boot) boot.remove();
   },
 };
 
-// --- Imported CC0 flora (test scatter) -----------------------------------
-// First pass at authored GLTF props alongside the procedural flora. Loads the
-// Quaternius CC0 nature models (public/assets/flora — see CREDITS.txt) and
-// scatters a sampler arc of each kind plus a loose grove of trees around spawn.
-// Each prop is routed through the SAME pulse-reveal, distance-culling, collider
-// and dark-game material path as native flora, so it lights and behaves in kind.
+// --- Imported CC0 flora ---------------------------------------------------
+// Authored GLTF props (Quaternius CC0 nature kit — public/assets/flora, see
+// CREDITS.txt) replace the procedural spore-trees and add ground foliage. Every
+// prop flows through the SAME systems as native flora: the echolocation
+// pulse-reveal patch, distance culling, and hit colliders. Trees also get a
+// lightweight brush+pulse SWAY (below) so the environment still reacts to the
+// orb — full native Verlet doesn't transfer to arbitrary meshes, so instead the
+// whole prop leans away when the orb presses in and shudders as the pulse
+// passes, then springs back upright.
 const floraLib = new FloraLibrary();
 const importedFlora: THREE.Group[] = [];
+
+interface SwayProp {
+  group: THREE.Group;
+  x: number;
+  z: number;
+  brushR: number; // orb within this radius (voxels) starts a lean
+  lx: number; // current lean (radians) + velocity, per axis
+  lz: number;
+  lvx: number;
+  lvz: number;
+}
+const swayProps: SwayProp[] = [];
+
+/** Deterministic 0..1 hash so a given (seed) always scatters the same foliage. */
+function frand(seed: number): number {
+  const s = Math.sin(seed * 127.1 + 311.7) * 43758.5453;
+  return s - Math.floor(s);
+}
 
 /** Topmost solid voxel under (x,z), smoothed — a robust seat for scattered props
  *  whose x/z we invent (native flora already know their surface y). */
@@ -1889,57 +1914,74 @@ function groundYAt(x: number, z: number): number {
   return top;
 }
 
-/** Dark-game surface pass for one imported prop, matching what native flora get
- *  at init (strip the IBL wash, deepen bright albedos so nothing floats lit). */
-function darkenImported(group: THREE.Group): void {
-  const seen = new Set<THREE.Material>();
-  group.traverse((o) => {
-    const mesh = o as THREE.Mesh;
-    if (!mesh.material) return;
-    const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
-    for (const raw of mats) {
-      const m = raw as THREE.MeshStandardMaterial;
-      if ('envMapIntensity' in m) m.envMapIntensity = 0;
-      if (m.color && !seen.has(m)) {
-        seen.add(m);
-        const lum = m.color.r * 0.299 + m.color.g * 0.587 + m.color.b * 0.114;
-        if (lum > ALBEDO_MAX_LUM) m.color.multiplyScalar(ALBEDO_MAX_LUM / lum);
-      }
-    }
-  });
+interface PlaceOpts {
+  height?: number;
+  collide?: boolean;
+  sway?: boolean;
+  brushR?: number;
 }
-
-function placeImported(name: FloraName, x: number, z: number, collide = true): void {
-  const inst = floraLib.make(name);
+function placeImported(name: FloraName, x: number, z: number, opts: PlaceOpts = {}): void {
+  const inst = floraLib.make(name, opts.height);
   if (!inst) return;
   const gy = groundYAt(x, z);
-  inst.group.position.set(x, gy, z);
-  inst.group.rotation.y = (x * 12.9898 + z * 78.233) % (Math.PI * 2); // varied facing
-  darkenImported(inst.group);
-  scene.add(inst.group);
-  registerFlora(inst.group); // pulse-reveal patch + distance culling
-  importedFlora.push(inst.group);
-  if (collide) addFloraCollider(x, z, gy, gy + inst.height * 0.9, Math.max(inst.radius * 0.6, 0.3));
+  const g = inst.group;
+  g.position.set(x, gy, z);
+  g.rotation.y = frand(x * 1.7 + z) * Math.PI * 2; // varied facing
+  scene.add(g);
+  registerFlora(g); // pulse-reveal patch + distance culling
+  importedFlora.push(g);
+  if (opts.collide) {
+    addFloraCollider(x, z, gy, gy + inst.height * 0.9, Math.max(inst.radius * 0.55, 0.35));
+  }
+  if (opts.sway) {
+    swayProps.push({ group: g, x, z, brushR: opts.brushR ?? inst.radius + 2, lx: 0, lz: 0, lvx: 0, lvz: 0 });
+  }
+}
+
+/** A tree plus a small ring of ground foliage clustered at its base. */
+function placeTreeCluster(x: number, z: number, h: number, seed: number): void {
+  placeImported(frand(seed) < 0.5 ? 'tree_01' : 'tree_02', x, z, {
+    height: h,
+    collide: true,
+    sway: true,
+    brushR: 3,
+  });
+  const kinds: FloraName[] = ['bush_01', 'fern_01', 'mushroom_01', 'mushroom_02', 'rock_01', 'rock_02', 'grass_01'];
+  const n = 2 + Math.floor(frand(seed + 5) * 3); // 2–4 props
+  for (let i = 0; i < n; i++) {
+    const ang = frand(seed + i * 7.3) * Math.PI * 2;
+    const rad = 1.6 + frand(seed + i * 13.1) * 3.4;
+    const kind = kinds[Math.floor(frand(seed + i * 5.7) * kinds.length)];
+    const collide = kind.startsWith('rock') || kind.startsWith('bush');
+    placeImported(kind, x + Math.cos(ang) * rad, z + Math.sin(ang) * rad, { collide });
+  }
 }
 
 void floraLib.preload().then(() => {
-  const [sx, , sz] = reek.spawn;
-  // Sampler arc: one of each kind, fanned ~80° in front of spawn.
-  const sampler: FloraName[] = [
-    'tree_01', 'bush_01', 'mushroom_01', 'fern_01', 'rock_01',
-    'mushroom_02', 'grass_01', 'rock_02', 'tree_02',
-  ];
-  sampler.forEach((name, i) => {
-    const a = (i / (sampler.length - 1) - 0.5) * 1.4;
-    placeImported(name, sx + Math.sin(a) * 14, sz + Math.cos(a) * 14);
-  });
-  // Loose grove of trees ringing spawn so the vista reads as forest.
-  for (let i = 0; i < 10; i++) {
-    const ang = (i / 10) * Math.PI * 2 + 0.3;
-    const rad = 22 + (i % 3) * 6;
-    placeImported(i % 2 ? 'tree_02' : 'tree_01', sx + Math.cos(ang) * rad, sz + Math.sin(ang) * rad);
+  // If the tree GLTFs failed to load, fall back to the native procedural
+  // spore-trees so the world is never treeless (assets are best-effort).
+  const treesLoaded = floraLib.has('tree_01') || floraLib.has('tree_02');
+  // Build every tree collected during worldgen (deferred: the GLTF is async),
+  // each with its clustered foliage.
+  for (const t of pendingTrees) {
+    if (treesLoaded) placeTreeCluster(t.x, t.z, t.h, t.x * 31.1 + t.z * 17.7);
+    else makeSporeTree(t.x, smoothSurfaceY(t.x, t.z, t.y) - 0.15, t.z, t.h);
   }
-  logger('flora-assets').info(`scattered ${importedFlora.length} imported props around spawn`);
+  if (!treesLoaded) {
+    logger('flora-assets').warn('tree GLTFs unavailable — fell back to procedural spore-trees');
+    return;
+  }
+  // A guaranteed stand right by spawn so the swap is visible the moment you wake
+  // (worldgen tree stands can be some distance off).
+  const [sx, , sz] = reek.spawn;
+  for (let i = 0; i < 4; i++) {
+    const ang = (i / 4) * Math.PI * 2 + 0.4;
+    const rad = 12 + (i % 2) * 4;
+    placeTreeCluster(sx + Math.cos(ang) * rad, sz + Math.sin(ang) * rad, 8 + i, sx + sz + i * 11);
+  }
+  logger('flora-assets').info(
+    `built ${pendingTrees.length} worldgen tree clusters + demo stand → ${importedFlora.length} props, ${swayProps.length} swayable`,
+  );
   // Attach to the dev handle here (in the async callback) so it lands on the
   // FINAL window.waiver — the synchronous handle assignments have all run by now.
   const dev = (window as unknown as { waiver: Record<string, unknown> }).waiver;
@@ -1947,9 +1989,50 @@ void floraLib.preload().then(() => {
   dev.toImported = () => {
     orb.pos.set(reek.spawn[0], reek.spawn[1] + 4, reek.spawn[2] + 4);
     orb.vel.set(0, 0, 0);
-    return `${importedFlora.length} props near spawn`;
+    return `${importedFlora.length} imported props, ${swayProps.length} swayable`;
   };
 });
+
+// Group-level brush + pulse sway for imported props (trees). Cheap: a spring per
+// prop, gated on visibility so off-screen props cost nothing. Mirrors the feel
+// of the native Verlet trees — lean away from the orb, shudder on the pulse.
+const SWAY_STIFF = 42;
+const SWAY_DAMP = 7;
+const SWAY_MAX_LEAN = 0.22; // radians (~12°) at hardest press
+const SWAY_PULSE_KICK = 5;
+function updateSwayProps(dt: number): void {
+  for (const p of swayProps) {
+    if (!p.group.visible) continue;
+    const dx = orb.pos.x - p.x;
+    const dz = orb.pos.z - p.z;
+    const d2 = dx * dx + dz * dz;
+    let tx = 0; // target lean about each axis
+    let tz = 0;
+    if (d2 < p.brushR * p.brushR) {
+      const d = Math.sqrt(d2) || 1e-3;
+      const push = (1 - d / p.brushR) * SWAY_MAX_LEAN;
+      tx = -(dx / d) * push; // lean AWAY from the orb
+      tz = -(dz / d) * push;
+    }
+    if (pulseActive) {
+      const pdx = p.x - pulseCenter.x;
+      const pdz = p.z - pulseCenter.z;
+      const pd = Math.sqrt(pdx * pdx + pdz * pdz) || 1e-3;
+      if (Math.abs(pd - pulseRadius) < LightConfig.pulse.thickness + 2) {
+        p.lvx += (pdx / pd) * SWAY_PULSE_KICK * dt;
+        p.lvz += (pdz / pd) * SWAY_PULSE_KICK * dt;
+      }
+    }
+    // Critically-ish damped spring toward the target lean.
+    p.lvx += ((tx - p.lx) * SWAY_STIFF - p.lvx * SWAY_DAMP) * dt;
+    p.lvz += ((tz - p.lz) * SWAY_STIFF - p.lvz * SWAY_DAMP) * dt;
+    p.lx += p.lvx * dt;
+    p.lz += p.lvz * dt;
+    // Lean maps to tilt: +x lean tips the crown toward +x → rotate about z.
+    p.group.rotation.z = -p.lx;
+    p.group.rotation.x = p.lz;
+  }
+}
 
 function box(x: number, y: number, z: number, w: number, h: number, d: number, m: Mat): void {
   for (let ix = x; ix < x + w; ix++) {
@@ -2412,7 +2495,7 @@ function frame(): void {
   // and close toward your immediate sphere of light. At peak it's a tight,
   // near-black shroud: nothing beyond the orb's own pool survives.
   const tideFog = scene.fog as THREE.FogExp2;
-  tideFog.density = 0.024 + 0.085 * tidePress; // calm 0.024 → tight ~0.11
+  tideFog.density = 0.055 + 0.06 * tidePress; // calm 0.055 (distance goes black on this small map) → tide ~0.115
   tideFog.color.setRGB(0.02 * (1 - tidePress), 0.031 * (1 - tidePress), 0.039 * (1 - tidePress));
 
   // --- Phosphorescence: glowcaps charge under light, glow as they fade. ---
@@ -3077,6 +3160,7 @@ function frame(): void {
     }
   }
   updateFloraCulling();
+  updateSwayProps(dt); // imported trees lean from the orb + shudder on the pulse
   // (dynamic light-volume re-flood removed — it repacked the whole atlas ~3×/s
   //  and spiked frames = the stutter. Solidity for shadows is static, built once
   //  at load; dynamic sources come back as real shader lights, not a repack.)
