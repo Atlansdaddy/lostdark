@@ -1183,9 +1183,9 @@ const leafGeo = makeLeafClusterGeometry();
 const leafMat = new THREE.MeshStandardMaterial({
   map: makeLeafTexture(),
   alphaTest: 0.42, // cut the soft texture into organic leaf edges (opaque, cheap)
-  color: 0xffffff, // let the texture carry the green
-  // NO emissive — foliage is lit only by real light (matches the trees'
-  // black-until-lit design; lighting is owned by another agent).
+  // DARK albedo (like the bark 0x3c3226) so foliage is black-until-lit and never
+  // blooms. No emissive — the lighting system (another agent) owns how it lights.
+  color: 0x24361f,
   roughness: 0.85,
   metalness: 0,
   side: THREE.DoubleSide,
@@ -1701,16 +1701,11 @@ console.info(
     ` (${lightVol.dim.x}x${lightVol.dim.y}x${lightVol.dim.z} voxels)`,
 );
 
-// Force flora dark — COLLISION-PROOF against the other window's flora rewrites.
-// Every flora material: kill the RoomEnvironment IBL, and zero the self-glow on
-// everything EXCEPT the bioluminescent glowcaps (whose charge drives their glow
-// each frame). So trees/trunks/canopies go black until a real light reaches
-// them, no matter what emissive the flora factories set upstream.
-const glowMats = new Set<THREE.Material>();
-for (const s of shrooms) {
-  glowMats.add(s.capMat);
-  glowMats.add(s.gillMat);
-}
+// Strip the RoomEnvironment IBL off every flora material so nothing floats
+// half-lit in the dark. Emissive is left ALONE — the bioluminescent bits
+// (glowcaps, mycelium beads, buttons) are meant to glow; the non-glowing bits
+// (trees, trunks, leaves) carry no emissive anyway, so with the environment off
+// and the moon wash off they go black until a real light reaches them.
 for (const f of floraCull) {
   f.group.traverse((o) => {
     const mesh = o as THREE.Mesh;
@@ -1719,7 +1714,6 @@ for (const f of floraCull) {
     for (const raw of mats) {
       const m = raw as THREE.MeshStandardMaterial;
       if ('envMapIntensity' in m) m.envMapIntensity = 0;
-      if ('emissiveIntensity' in m && !glowMats.has(m)) m.emissiveIntensity = 0;
     }
   });
 }
