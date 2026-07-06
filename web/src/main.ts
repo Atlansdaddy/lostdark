@@ -1517,8 +1517,8 @@ function makeStrandAt(px: number, py: number, pz: number, len: number): void {
 
   const strandMat = new THREE.MeshStandardMaterial({
     color: 0x0c1512, // near-black, matching the beads so the mycelium reads dark;
-    emissive: glow, //  the lighting system owns any glow (its force-darken zeros this)
-    emissiveIntensity: 0.32,
+    emissive: glow, //  the faintest bioluminescence — only noticeable up close
+    emissiveIntensity: 0.05,
     roughness: 0.9,
     metalness: 0,
     envMapIntensity: 0.03,
@@ -1538,7 +1538,7 @@ function makeStrandAt(px: number, py: number, pz: number, len: number): void {
   const beadMat = new THREE.MeshStandardMaterial({
     color: 0x0c1512,
     emissive: glow,
-    emissiveIntensity: 0.6, // spore-ball tips: soft, below the bloom threshold
+    emissiveIntensity: 0.1, // spore-ball tips: the faintest glimmer, close-only
     roughness: 0.6,
     metalness: 0,
   });
@@ -2303,16 +2303,19 @@ function frame(): void {
   // you SEE coming, above the ward's circle of held light.
   const skyDark = 1 - 0.98 * tidePress;
   sky.update(skyT, camera.position, moonDir, moonPhase, skyDark);
-  const phaseBright = 0.25 + 0.75 * (0.5 - 0.5 * Math.cos(moonPhase * Math.PI * 2));
-  const moonClear = 1 - cloudCoverAt(moonDir, skyT);
-  // The moon's light on the world dies with the sky — near-total at peak tide.
-  const moonTarget = moonClear * phaseBright * 0.42 * (1 - 0.97 * tidePress);
+  const fullness = 0.5 - 0.5 * Math.cos(moonPhase * Math.PI * 2); // 0 new → 1 full
+  const phaseBright = Math.pow(fullness, 3.5); // ~0 except near a FULL moon
+  const moonClear = Math.pow(1 - cloudCoverAt(moonDir, skyT), 2); // only a CLEAR sky counts
+  // The moon lifts the world ONLY at a full, cloudless moon (seldom) — otherwise
+  // the dark is total. Dies further under the tide.
+  const moonTarget = moonClear * phaseBright * 0.5 * (1 - 0.97 * tidePress);
   moonI += (moonTarget - moonI) * Math.min(1, dt * 0.8); // clouds drift, light eases
   uniforms.uMoonDir.value.copy(moonDir);
   uniforms.uMoonI.value = moonI;
   grassField.uniforms.uMoonI.value = moonI;
-  moonAmbient.intensity = 0; // OFF — flora stay black unless a real light hits them
-  // (the moon still lights the ground via the terrain shader's own moon term)
+  // Flora moon wash, gated by the (now full-clear-only) moonI: near-zero on any
+  // normal night, so flora stay black; only a rare full cloudless moon lifts them.
+  moonAmbient.intensity = moonI * 0.3;
 
   // God-rays: project the moon to screen; rays fire only when it's ahead of
   // the camera and the clouds are open (moonI already folds in phase + cover).

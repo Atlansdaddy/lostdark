@@ -13,9 +13,11 @@ export const World = {
 export const Light = {
   /** Voxel light levels are 0..MAX, Minecraft-style flood fill. */
   max: 15,
-  /** Ambient floor so the orb is never fully blind (SPEC §2 ~4–6 voxels).
-   *  Kept very low: the dark is near-overwhelming, lit only by orb + moon peeks. */
-  ambientFloor: 0.028,
+  /** Ambient floor — the barest sky-whisper on the world. Near-total black by
+   *  design: nothing is visible outside the orb's sphere, a ward, a charged
+   *  grove or built light, unless a full clear moon lifts it. Like a Dark Tide,
+   *  but with the sky still overhead. */
+  ambientFloor: 0.0015,
   /** Steady glow bubble the orb carries with it. */
   orbRadius: 7,
   orbIntensity: 0.9,
@@ -67,6 +69,19 @@ export const Camera = {
   maxPitch: 1.3,
   orbitSpeed: 0.0026, // radians per pixel of drag
   lookSmoothing: 11, // /s — look eases toward the drag target (soft, not harsh)
+  // --- Enclosure adaptation (caves) ---
+  // When the orb is boxed in (low ceiling / near walls) the open-sky boom is
+  // geometrically impossible, so it collides and whips. Instead we read the
+  // surrounding free space and draw the camera IN + DOWN toward these tights.
+  tightDistance: 6.5, // boom length in a snug cavern/tunnel
+  tightHeight: 2.4, // boom rise when enclosed (near eye-level, not top-down)
+  enclosureLerp: 3.5, // /s — how fast distance/height ease between open↔tight
+  headroomOpen: 11, // voxels of ceiling clearance that reads as fully "open"
+  lateralOpen: 9, // voxels of horizontal clearance that reads as fully "open"
+  // Over-shoulder alt-rig (press V to compare): a fixed close chase.
+  shoulderDistance: 4.2,
+  shoulderHeight: 1.6,
+  shoulderSide: 1.1, // lateral offset so the orb doesn't dead-center the view
 } as const;
 
 export const Perf = {
