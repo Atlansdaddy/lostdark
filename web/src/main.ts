@@ -110,11 +110,11 @@ renderer.domElement.addEventListener('webglcontextrestored', () => {
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x020205);
-// Thin atmosphere only. The shaders (terrain + flora) already crush distance to
-// black themselves; a dense FogExp2 on top just blends the whole frame toward
-// its blue-grey color, desaturating everything into flat mush. Keep it a faint
-// haze; the tide ramps it up when the dark actually rolls in.
-scene.fog = new THREE.FogExp2(0x05080a, 0.008);
+// Fog OFF at rest (density 0). The shaders (terrain + flora) already crush
+// distance to black themselves; a FogExp2 on top just blends the whole frame
+// toward its blue-grey color, flattening everything into mush. The object stays
+// so the tide can ramp it up when the dark actually rolls in.
+scene.fog = new THREE.FogExp2(0x05080a, 0.0);
 
 // The night above The Reek: clouds, star pockets, a cycling moon.
 const sky = new SkyDome();
@@ -409,7 +409,10 @@ orbAura.scale.setScalar(3.4);
 orbGroup.add(orbAura, orbHalo, orbCore);
 scene.add(orbGroup);
 
-const orbLight = new THREE.PointLight(0x8defff, 2.8, 10, 1.9);
+// distance 16 / decay 1.1: a full, soft SPHERE of light — not a physical
+// inverse-square pinprick. Flora within the bubble get genuinely revealed; it
+// still falls to black by the cutoff so distance stays dark.
+const orbLight = new THREE.PointLight(0x8defff, 2.8, 16, 1.1);
 scene.add(orbLight);
 
 // --- Orb trail: drifting light-motes in the orb's wake (secondary motion —
@@ -1837,7 +1840,7 @@ logger('lightvol').info(
 //      surfaces read as a soft reveal, not a glare; already-dark albedos are
 //      left alone. Emissive (the bioluminescence) is untouched.
 // Materials are shared across flora, so each is processed exactly once.
-const ALBEDO_MAX_LUM = 0.14; // deepest a lit flora surface may reflect
+const ALBEDO_MAX_LUM = 0.22; // deepest a lit flora surface may reflect (dark, but reads when the orb hits it)
 const seenMats = new Set<THREE.Material>();
 for (const f of floraCull) {
   f.group.traverse((o) => {
@@ -2423,7 +2426,7 @@ function frame(): void {
   orbAura.scale.setScalar(3.4 * orb.breathGlow * flashBoost);
   orbLight.position.copy(orb.pos);
   orbLight.color.copy(mood.color);
-  orbLight.intensity = 2.4 * orb.breathGlow * flashBoost * mood.brightness;
+  orbLight.intensity = 4.2 * orb.breathGlow * flashBoost * mood.brightness;
 
   for (const p of pickups) {
     if (p.taken) continue;
@@ -2512,7 +2515,7 @@ function frame(): void {
   // and close toward your immediate sphere of light. At peak it's a tight,
   // near-black shroud: nothing beyond the orb's own pool survives.
   const tideFog = scene.fog as THREE.FogExp2;
-  tideFog.density = 0.008 + 0.1 * tidePress; // calm: faint haze (shaders do the distance-black); tide rolls the shroud in to ~0.108
+  tideFog.density = 0.1 * tidePress; // OFF at rest; only the tide rolls the shroud in (to ~0.1 at peak)
   tideFog.color.setRGB(0.02 * (1 - tidePress), 0.031 * (1 - tidePress), 0.039 * (1 - tidePress));
 
   // --- Phosphorescence: glowcaps charge under light, glow as they fade. ---
