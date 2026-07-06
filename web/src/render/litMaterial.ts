@@ -80,7 +80,7 @@ export function createLitMaterial(): { material: THREE.ShaderMaterial; uniforms:
     uLightStep: { value: 2 },
     uLightDim: { value: new THREE.Vector3(1, 1, 1) },
     uLightTiles: { value: new THREE.Vector2(1, 1) },
-    uLightVolMix: { value: 0 }, // default OFF — terrain identical until toggled
+    uLightVolMix: { value: 1 }, // 3D volume lighting only — no baked A/B anymore
   };
 
   const material = new THREE.ShaderMaterial({

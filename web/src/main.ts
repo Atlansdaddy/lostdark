@@ -285,11 +285,7 @@ function addPulseReveal(mat: THREE.MeshStandardMaterial): void {
        }\n` +
       shader.fragmentShader.replace(
         '#include <opaque_fragment>',
-        `// Flora lit by the world's flood-fill light (groves, crystals, wards):
-         float volL = sampleLightVol(vPulseWP);
-         volL = volL * volL * 1.6; // quadratic — bright cores, fast fall into dark
-         outgoingLight += diffuseColor.rgb * volL * uHeldColor;
-         if (uPulseIntensity > 0.0 && uPulseRadius >= 0.0) {
+        `if (uPulseIntensity > 0.0 && uPulseRadius >= 0.0) {
            float pd = distance(vPulseWP, uPulseCenter);
            float ring = 1.0 - clamp(abs(pd - uPulseRadius) / uPulseThickness, 0.0, 1.0);
            ring = ring * ring * uPulseIntensity;
@@ -1286,12 +1282,11 @@ function makeLeafClusterGeometry(): THREE.BufferGeometry {
 
 const leafGeo = makeLeafClusterGeometry();
 const leafMat = new THREE.MeshStandardMaterial({
-  map: makeLeafTexture(),
+  map: makeLeafTexture(), // used only for its ALPHA (the leaf silhouette)
   alphaTest: 0.42, // cut the soft texture into organic leaf edges (opaque, cheap)
-  // A natural foliage-green albedo: dark enough to be black-until-lit (never
-  // blooms on its own) but reflective enough to catch light when it reaches it.
-  // No emissive — the lighting system (another agent) owns how it lights up.
-  color: 0x33502c,
+  // Fully BLACK albedo — foliage is a pure black silhouette until the lighting
+  // system (another agent) puts light on it. No emissive, no self-glow.
+  color: 0x000000,
   roughness: 0.85,
   metalness: 0,
   side: THREE.DoubleSide,
@@ -2136,7 +2131,13 @@ function updateHud(): void {
   if (gamepadDebug) gamepadDebug.textContent = padStatus;
 }
 
+/** Set by window.waiver.throwTest() to fault the next N frames on purpose. */
+let throwNextFrames = 0;
 function frame(): void {
+  if (throwNextFrames > 0) {
+    throwNextFrames--;
+    throw new Error('waiver.throwTest(): synthetic frame error');
+  }
   const dt = Math.min(0.05, clock.getDelta());
   input.update(dt); // poll gamepad + decay wheel impulses
 
@@ -3318,14 +3319,15 @@ frameLoop();
   hideLogs: () => devOverlay.hide(),
   /** Copyable text of the whole ring buffer (also returned for the console). */
   dumpLogs: () => dumpLogs(),
-  /** Exercise the frame-loop crash boundary from the console. */
-  throwTest: () => {
+  /** Exercise the frame-loop crash boundary: throw on the next `n` frames so the
+   *  boundary logs, streaks, and (at the limit) halts + shows the crash card. */
+  throwTest: (n: number = Debug.frameErrorLimit) => {
+    const wasHalted = loopHalted;
     loopHalted = false;
-    frameErrors = Debug.frameErrorLimit - 1; // next thrown frame trips the limit
-    const orig = frame;
-    // Not reachable normally; wrapping is overkill — just throw next frame.
-    throw new Error('waiver.throwTest(): synthetic error');
-    void orig;
+    frameErrors = 0;
+    throwNextFrames = n;
+    frameLog.warn(`throwTest: erroring on the next ${n} frame(s)`);
+    if (wasHalted) requestAnimationFrame(frameLoop);
   },
 };
 
