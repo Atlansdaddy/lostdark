@@ -29,6 +29,7 @@ import { buildSmoothChunkGeometry } from './render/SmoothMesher';
 import { Mat } from './world/Materials';
 import { Chunk, VoxelWorld } from './world/VoxelWorld';
 import { generateReek } from './world/ReekGen';
+import { Menu, type MenuBridge } from './ui/Menu';
 
 type Pickup = {
   mesh: THREE.Mesh;
@@ -42,6 +43,11 @@ type Ward = {
   core: THREE.Mesh;
   /** The visible field of protection — a soft dome showing WHERE you're safe. */
   dome: THREE.Mesh;
+  /** Voxel coords + floor height the ward was built at — enough to re-spawn it
+   *  exactly when a save is loaded onto a fresh world. */
+  vx: number;
+  vz: number;
+  floorY: number;
 };
 
 /** Ward protection radius (voxels). One number: dome size = mechanics = truth. */
@@ -235,6 +241,10 @@ const clock = new THREE.Clock();
 
 let spores = 0;
 let objective = 'Awaken in The Reek';
+// Gameplay is frozen (menu / intro / pause up) until the player takes control.
+// The world keeps rendering and idling behind the overlay — only player-driven
+// mutation (input, tide timeline, drains, pickups) is gated on this.
+let paused = true;
 // The Dark Tide runs on a timeline, not a quick swell: blackness sweeps IN
 // from far to close (onset), holds total black for a long dread (sustain),
 // then lifts (release). tideT is seconds since it began, −1 when none runs.
@@ -921,8 +931,14 @@ const stemBaseMat = new THREE.MeshStandardMaterial({
 // Thousands of individual flora meshes are the render loop's biggest draw-call
 // cost, and past the fog wall none of them are visible anyway. Every placed
 // group registers here and is toggled by distance, a slice per frame.
-const floraCull: { group: THREE.Group; x: number; z: number }[] = [];
-const FLORA_VIEW2 = 130 * 130; // culling radius² — safely past the fog wall
+const floraCull: { group: THREE.Group; x: number; y: number; z: number }[] = [];
+// Deep-cave render distance (voxels). The dark + light-gated fog hide the
+// boundary underground, so this can be tight — it's the main lever keeping the
+// deep world cheap: cave chunks/flora past it aren't drawn until the orb nears.
+const RENDER_RADIUS = 80;
+const RENDER_RADIUS2 = RENDER_RADIUS * RENDER_RADIUS;
+// Surface flora keep the original generous radius so the moonlit vista is intact.
+const SURFACE_FLORA_VIEW2 = 130 * 130;
 let floraCullCursor = 0;
 
 function registerFlora(group: THREE.Group): void {
@@ -937,7 +953,7 @@ function registerFlora(group: THREE.Group): void {
       addPulseReveal(m);
     }
   });
-  floraCull.push({ group, x: group.position.x, z: group.position.z });
+  floraCull.push({ group, x: group.position.x, y: group.position.y, z: group.position.z });
 }
 
 function updateFloraCulling(): void {
@@ -948,7 +964,10 @@ function updateFloraCulling(): void {
     const f = floraCull[floraCullCursor];
     const dx = f.x - orb.pos.x;
     const dz = f.z - orb.pos.z;
-    f.group.visible = dx * dx + dz * dz < FLORA_VIEW2;
+    // Surface flora keep the generous vista radius; deep cave flora (which are
+    // black past the orb's bubble) cull to the tight cave render distance.
+    const r2 = f.y > 0 ? SURFACE_FLORA_VIEW2 : RENDER_RADIUS2;
+    f.group.visible = dx * dx + dz * dz < r2;
   }
 }
 
@@ -1165,8 +1184,8 @@ const leafMat = new THREE.MeshStandardMaterial({
   map: makeLeafTexture(),
   alphaTest: 0.42, // cut the soft texture into organic leaf edges (opaque, cheap)
   color: 0xffffff, // let the texture carry the green
-  emissive: 0x123a20,
-  emissiveIntensity: 0.16, // faint self-glow so foliage reads in the gloom
+  // NO emissive — foliage is lit only by real light (matches the trees'
+  // black-until-lit design; lighting is owned by another agent).
   roughness: 0.85,
   metalness: 0,
   side: THREE.DoubleSide,
@@ -1492,9 +1511,9 @@ function makeStrandAt(px: number, py: number, pz: number, len: number): void {
   }
 
   const strandMat = new THREE.MeshStandardMaterial({
-    color: 0x2a3a30,
-    emissive: glow,
-    emissiveIntensity: 0.32, // hanging strands: always a soft, faint glow
+    color: 0x0c1512, // near-black, matching the beads so the mycelium reads dark;
+    emissive: glow, //  the lighting system owns any glow (its force-darken zeros this)
+    emissiveIntensity: 0.32,
     roughness: 0.9,
     metalness: 0,
     envMapIntensity: 0.03,
@@ -1781,23 +1800,17 @@ function addPickup(x: number, y: number, z: number): void {
   pickups.push({ mesh, pos: mesh.position.clone(), taken: false });
 }
 
-function placeWard(): void {
-  if (spores < 3) {
-    objective = 'Gather more glowspores before the first ward can hold.';
-    return;
-  }
-  spores -= 3;
-  const x = Math.round(orb.pos.x);
-  const z = Math.round(orb.pos.z);
+/** Raise a ward at voxel column (vx,vz) with its glow sunk to floorY. Builds
+ *  the terrain + all three meshes but charges NO spores — the shared body of
+ *  both live placement and save-restore. */
+function spawnWard(vx: number, vz: number, floorY: number): void {
   // Sink the glow INTO the floor (replace its top voxels) — never build a
   // platform at the orb's feet, which wedged the player inside solid ground.
-  let floorY = Math.floor(orb.pos.y);
-  while (floorY > -6 && !world.solid(x, floorY, z)) floorY--;
-  box(x - 1, floorY, z - 1, 3, 1, 3, Mat.Glowcap);
+  box(vx - 1, floorY, vz - 1, 3, 1, 3, Mat.Glowcap);
   lightGrid.update();
   remeshDirtyChunks();
 
-  const pos = new THREE.Vector3(x + 0.5, floorY + 2.3, z + 0.5);
+  const pos = new THREE.Vector3(vx + 0.5, floorY + 2.3, vz + 0.5);
   const light = new THREE.PointLight(0x7fffd1, 3.4, 24, 1.4);
   light.position.copy(pos);
   const core = new THREE.Mesh(
@@ -1825,16 +1838,109 @@ function placeWard(): void {
   );
   dome.position.set(pos.x, pos.y - 2.3, pos.z);
   scene.add(light, core, dome);
-  wards.push({ pos, light, core, dome });
+  wards.push({ pos, light, core, dome, vx, vz, floorY });
   fogLightRegistry.push({
     pos: pos.clone(),
     color: new THREE.Color(0.5, 1.0, 0.82),
     intensity: 1.3, // your held light owns the air around it
   });
+}
+
+function placeWard(): void {
+  if (spores < 3) {
+    objective = 'Gather more glowspores before the first ward can hold.';
+    return;
+  }
+  spores -= 3;
+  const vx = Math.round(orb.pos.x);
+  const vz = Math.round(orb.pos.z);
+  let floorY = Math.floor(orb.pos.y);
+  while (floorY > -6 && !world.solid(vx, floorY, vz)) floorY--;
+  spawnWard(vx, vz, floorY);
   mood.event('joy'); // made light — the proudest feeling the orb knows
   objective =
     'The ward holds a circle of light: inside its dome the dark cannot drain you, and your Lumen refills. Press T to test it against a tide.';
 }
+
+// --- Save / load: one slot in localStorage. The world is deterministic from a
+// fixed seed, so a save only needs the mutable player state + which wards were
+// raised where; restore re-spawns them onto the freshly generated world. ---
+const SAVE_KEY = 'waiver.save';
+interface WaiverSave {
+  v: number;
+  spores: number;
+  orb: [number, number, number];
+  lumen: number;
+  energy: number;
+  objective: string;
+  wards: [number, number, number][]; // [vx, vz, floorY] per ward
+  savedAt: number;
+}
+function readSave(): WaiverSave | null {
+  try {
+    const raw = localStorage.getItem(SAVE_KEY);
+    if (!raw) return null;
+    const s = JSON.parse(raw) as WaiverSave;
+    if (!s || s.v !== 1 || !Array.isArray(s.wards)) return null;
+    return s;
+  } catch {
+    return null;
+  }
+}
+function captureSave(): WaiverSave {
+  return {
+    v: 1,
+    spores,
+    orb: [orb.pos.x, orb.pos.y, orb.pos.z],
+    lumen: orb.lumen,
+    energy: orb.energy,
+    objective,
+    wards: wards.map((w) => [w.vx, w.vz, w.floorY] as [number, number, number]),
+    savedAt: Date.now(),
+  };
+}
+/** Apply a save onto a PRISTINE world (no wards yet) — see Menu's invariant. */
+function applySave(s: WaiverSave): void {
+  spores = s.spores;
+  orb.pos.set(s.orb[0], s.orb[1], s.orb[2]);
+  orb.vel.set(0, 0, 0);
+  orb.lumen = s.lumen;
+  orb.energy = s.energy;
+  objective = s.objective || objective;
+  for (const [vx, vz, fy] of s.wards) spawnWard(vx, vz, fy);
+}
+
+const menuBridge: MenuBridge = {
+  hasSave: () => readSave() != null,
+  saveInfo: () => {
+    const s = readSave();
+    return s ? { savedAt: s.savedAt, spores: s.spores, wards: s.wards.length } : null;
+  },
+  writeSave: () => {
+    try {
+      localStorage.setItem(SAVE_KEY, JSON.stringify(captureSave()));
+    } catch {
+      /* storage disabled — nothing else to do */
+    }
+  },
+  loadSaveInPlace: () => {
+    const s = readSave();
+    if (!s) return false;
+    applySave(s);
+    return true;
+  },
+  deleteSave: () => {
+    try {
+      localStorage.removeItem(SAVE_KEY);
+    } catch {
+      /* ignore */
+    }
+  },
+  setPaused: (p: boolean) => {
+    paused = p;
+  },
+};
+const menu = new Menu(menuBridge);
 
 function startTide(): void {
   tideT = 0; // begin the timeline — onset → sustain → release
@@ -1913,12 +2019,27 @@ function frame(): void {
   const dt = Math.min(0.05, clock.getDelta());
   input.update(dt); // poll gamepad + decay wheel impulses
 
-  // Frustum culling: hide chunks outside camera view — a cheap test against
-  // each chunk's precomputed world AABB (no per-vertex bounds rebuild).
+  // Render distance + frustum culling. The world is dark — beyond the orb's lit
+  // bubble everything is black — so we only draw chunks whose nearest point is
+  // within RENDER_RADIUS of the orb (Minecraft-style), then frustum-test those.
+  // This is what keeps the deep cave network from drawing the whole map at once.
   cullMatrix.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
   cullFrustum.setFromProjectionMatrix(cullMatrix);
+  const orbX = orb.pos.x;
+  const orbZ = orb.pos.z;
   for (const mesh of chunkMeshes.values()) {
-    mesh.visible = cullFrustum.intersectsBox(mesh.userData.aabb as THREE.Box3);
+    const aabb = mesh.userData.aabb as THREE.Box3;
+    // Surface chunks (any part at/above ground) keep the full moonlit vista —
+    // frustum-only, exactly as before. DEEP cave chunks are pitch-black past the
+    // orb's bubble, so they only draw within a tight radius (the fps fix).
+    if (aabb.max.y > 0) {
+      mesh.visible = cullFrustum.intersectsBox(aabb);
+    } else {
+      const ddx = Math.max(aabb.min.x - orbX, 0, orbX - aabb.max.x);
+      const ddz = Math.max(aabb.min.z - orbZ, 0, orbZ - aabb.max.z);
+      mesh.visible =
+        ddx * ddx + ddz * ddz < RENDER_RADIUS2 && cullFrustum.intersectsBox(aabb);
+    }
   }
 
   // Horizontal: drag right → yaw left (John's tested preference, R2).
@@ -1930,12 +2051,17 @@ function frame(): void {
     CameraConfig.minPitch,
     CameraConfig.maxPitch,
   );
+  // Behind the menu the camera slowly drifts — the Reek keeps turning, so the
+  // title screen is a live cinematic, not a frozen still.
+  if (paused) yawTarget += dt * 0.02;
   const lookEase = Math.min(1, dt * CameraConfig.lookSmoothing);
   yaw += (yawTarget - yaw) * lookEase;
   pitch += (pitchTarget - pitch) * lookEase;
+  // Always consume (clears the edge flags) so nothing fires the instant we
+  // unpause — but only ACT on input while the player is actually in control.
   const actions = input.consumeActions();
 
-  if (actions.pulse && orb.canPulse()) {
+  if (!paused && actions.pulse && orb.canPulse()) {
     orb.spendPulse();
     pulseActive = true;
     pulseRadius = 0;
@@ -1943,11 +2069,13 @@ function frame(): void {
     pulseFlash = 1; // the orb visibly surges as the wave leaves it
     objective = spores >= 3 ? objective : 'Pulse through the mist. Glowspores answer your light.';
   }
-  if (actions.buildWard) placeWard();
-  if (actions.tide) startTide();
+  if (!paused && actions.buildWard) placeWard();
+  if (!paused && actions.tide) startTide();
 
   orb.pulseRate = mood.pulseRate;
-  orb.update(dt, input.moveVector(), yaw, actions.jump, input.sprinting());
+  // Frozen input while paused — the orb just hovers in place, idling.
+  const moveIntent = paused ? { x: 0, z: 0 } : input.moveVector();
+  orb.update(dt, moveIntent, yaw, !paused && actions.jump, !paused && input.sprinting());
   if (orb.jumped) {
     pulseFlash = Math.max(pulseFlash, 0.55); // wave-jump = a small pulse
     mood.event('effort');
@@ -1988,7 +2116,7 @@ function frame(): void {
     if (p.taken) continue;
     p.mesh.rotation.y += dt * 1.8;
     p.mesh.position.y = p.pos.y + Math.sin(clock.elapsedTime * 2.3 + p.pos.x) * 0.18;
-    if (p.mesh.position.distanceTo(orb.pos) < 1.45) {
+    if (!paused && p.mesh.position.distanceTo(orb.pos) < 1.45) {
       p.taken = true;
       spores += 1;
       scene.remove(p.mesh);
@@ -2017,7 +2145,7 @@ function frame(): void {
   // darkness level; every tide effect rides it so they black out as one wave.
   let tidePress = 0;
   if (tideT >= 0) {
-    tideT += dt;
+    if (!paused) tideT += dt; // the tide clock freezes with the menu
     if (tideT >= TIDE_TOTAL) {
       tideT = -1; // the tide has passed
     } else if (tideT < TIDE_ONSET) {
@@ -2042,14 +2170,16 @@ function frame(): void {
 
   if (tideActive) {
     mood.setThreat(tidePress); // sustained dread rides the darkness
-    const protectedByWard = nearestWardDistance() < WARD_RADIUS;
-    if (!protectedByWard) {
-      orb.lumen = Math.max(0, orb.lumen - dt * 10 * tidePress);
-      objective = 'The dark drains fast away from held light.';
-    } else if (tideT > TIDE_ONSET + TIDE_SUSTAIN) {
-      objective = 'The tide breaks against the ward. The loop is alive.';
+    if (!paused) {
+      const protectedByWard = nearestWardDistance() < WARD_RADIUS;
+      if (!protectedByWard) {
+        orb.lumen = Math.max(0, orb.lumen - dt * 10 * tidePress);
+        objective = 'The dark drains fast away from held light.';
+      } else if (tideT > TIDE_ONSET + TIDE_SUSTAIN) {
+        objective = 'The tide breaks against the ward. The loop is alive.';
+      }
     }
-  } else {
+  } else if (!paused) {
     orb.lumen = Math.min(100, orb.lumen + dt * (nearestWardDistance() < WARD_RADIUS ? 8 : 2));
   }
 
@@ -2155,7 +2285,8 @@ function frame(): void {
   uniforms.uMoonDir.value.copy(moonDir);
   uniforms.uMoonI.value = moonI;
   grassField.uniforms.uMoonI.value = moonI;
-  moonAmbient.intensity = moonI * 0.1; // barest moon hint — the dark stays the default
+  moonAmbient.intensity = 0; // OFF — flora stay black unless a real light hits them
+  // (the moon still lights the ground via the terrain shader's own moon term)
 
   // God-rays: project the moon to screen; rays fire only when it's ahead of
   // the camera and the clouds are open (moonI already folds in phase + cover).
@@ -2914,6 +3045,9 @@ window.addEventListener('resize', () => {
   depthRT.setSize(Math.floor((window.innerWidth * ratio) / 2), Math.floor((window.innerHeight * ratio) / 2));
 });
 
+// Decide the opening beat (resume a save, or show the title) BEFORE the first
+// frame, so `paused` is correct from frame one.
+menu.boot();
 frame();
 
 // Dev console handle (GDD §8c sandbox tooling): drive the camera / fire actions
