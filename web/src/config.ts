@@ -43,9 +43,18 @@ export const Move = {
   accel: 72, // how hard we chase the target velocity (snappy but not harsh)
   maxSpeed: 16.5, // horizontal glide speed (John: 25% calmer)
   damping: 5, // velocity decay when no input (the "glide"/drift tail)
-  // Dash = HOLD-to-sprint at the old cruise speed (not a blink-burst).
+  // Sprint = HOLD to cruise faster, paid per-second in energy.
   sprintSpeed: 22,
   sprintCostPerSec: 6, // energy drain while sprinting — speed stays a spend
+  // Dash = a dedicated blink-burst on TAP, distinct from sprint. Works on the
+  // ground and in the air; air dashes are limited and refresh on landing.
+  dash: {
+    speed: 46, // burst velocity along the dash direction
+    duration: 0.16, // seconds the burst holds (float, no gravity) before glide resumes
+    cooldown: 0.45, // min seconds between dashes — a beat, not spammable
+    cost: 14, // energy per dash — a real spend, like the pulse
+    airMax: 1, // air dashes allowed per airtime (refreshes when grounded)
+  },
   // Hover: a spring holds the orb ~hoverHeight above the nearest floor,
   // slightly underdamped so it bobs — the hover reads as effort, not a rail.
   gravity: 34,
@@ -87,4 +96,20 @@ export const Camera = {
 export const Perf = {
   targetFps: 60, // 60 PC / ≥30 mid-range phone (hard gate, SPEC §4)
   fixedTickHz: 25, // element/physics sim tick, decoupled from render (SPEC §4)
+} as const;
+
+/** Diagnostics: logging verbosity + the error-resilience knobs. See core/log.ts
+ *  and ui/DevOverlay.ts. Overridable at runtime via ?log= / localStorage /
+ *  window.waiver.setLogLevel(). */
+export const Debug = {
+  /** Default log level in dev / prod when nothing overrides it. */
+  logLevelDev: 'debug',
+  logLevelProd: 'warn',
+  /** Entries kept in the ring buffer that backs the overlay + dumpLogs(). */
+  ringBufferSize: 500,
+  /** Key that toggles the on-screen log panel (invisible-devtools testing). */
+  overlayHotkey: '`',
+  /** Consecutive frame() throws before the loop halts and shows the crash card.
+   *  One bad frame is a hiccup; a stuck stream of them is a fatal loop. */
+  frameErrorLimit: 5,
 } as const;

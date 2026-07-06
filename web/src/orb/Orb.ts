@@ -40,6 +40,24 @@ export class Orb {
   /** Set true for one frame when a wave-jump fires (drives the jump pulse FX). */
   jumped = false;
 
+  // --- Dash: a dedicated blink-burst, on the ground or in the air. ---
+  /** Remaining seconds of the active burst window (float, gravity-suppressed). */
+  private dashTimer = 0;
+  /** Remaining cooldown before another dash can fire. */
+  private dashCooldown = 0;
+  /** Air dashes spent since last grounded — refreshes on landing. */
+  private airDashesUsed = 0;
+  /** Unit horizontal direction the current burst travels. */
+  private dashDir = new THREE.Vector3();
+  /** True while a burst is active (drives the dash streak/FX). */
+  dashing = false;
+  /** Set true for one frame the moment a dash fires (FX trigger). */
+  dashStarted = false;
+  /** When inside a climbable vertical shaft (set by the scene), the wave-jump
+   *  refreshes for free every frame — so any chimney you dropped down can be
+   *  climbed back out by tapping up, while descending is just not jumping. */
+  liftZone = false;
+
   constructor(private world: VoxelWorld) {}
 
   spawn(x: number, y: number, z: number): void {
@@ -51,9 +69,17 @@ export class Orb {
    * @param move   normalized horizontal intent in camera space
    * @param yaw    camera yaw so intent maps to world directions
    * @param jump   edge-triggered wave-jump this frame
-   * @param sprint dash HELD: glide at the old cruise speed, draining energy
+   * @param sprint sprint HELD: glide at the old cruise speed, draining energy
+   * @param dash   edge-triggered dash this frame: a blink-burst (ground or air)
    */
-  update(dt: number, move: { x: number; z: number }, yaw: number, jump: boolean, sprint: boolean): void {
+  update(
+    dt: number,
+    move: { x: number; z: number },
+    yaw: number,
+    jump: boolean,
+    sprint: boolean,
+    dash: boolean,
+  ): void {
     // Camera-space intent → world direction.
     // Camera sits at azimuth `yaw` behind the orb, so its view axes are:
     //   forward = (-sin yaw, 0, -cos yaw)   right = (cos yaw, 0, -sin yaw)
@@ -63,51 +89,102 @@ export class Orb {
     const wx = move.x * cos + move.z * sin;
     const wz = -move.x * sin + move.z * cos;
 
-    // Sprint (dash held): the old cruise speed, paid for in energy.
+    // --- Ground state first: dash and jump both read it. ---
+    const floorDist = this.probeFloor();
+    this.grounded = floorDist <= Move.hoverHeight + 0.6;
+    if (this.grounded) {
+      this.jumpsUsed = 0;
+      this.airDashesUsed = 0; // landing refreshes the air dash
+    }
+    // In a climb shaft the chain refreshes every frame and jumps are free, so a
+    // deep drop is never a trap — tap up to bounce out the chimney.
+    if (this.liftZone) this.jumpsUsed = 0;
+
+    // --- Dash: a dedicated blink-burst. Fires on the ground or in the air
+    //     (air dashes limited per airtime), separate from hold-to-sprint. ---
+    this.dashCooldown = Math.max(0, this.dashCooldown - dt);
+    this.dashStarted = false;
+    if (
+      dash &&
+      this.dashTimer <= 0 &&
+      this.dashCooldown <= 0 &&
+      this.energy >= Move.dash.cost &&
+      (this.grounded || this.airDashesUsed < Move.dash.airMax)
+    ) {
+      // Direction: current move intent; if standing still, dash camera-forward.
+      let dx = wx;
+      let dz = wz;
+      if (dx === 0 && dz === 0) {
+        dx = -sin;
+        dz = -cos;
+      }
+      const len = Math.hypot(dx, dz) || 1;
+      this.dashDir.set(dx / len, 0, dz / len);
+      this.energy -= Move.dash.cost;
+      this.dashTimer = Move.dash.duration;
+      this.dashCooldown = Move.dash.cooldown;
+      if (!this.grounded) this.airDashesUsed++;
+      this.dashStarted = true;
+    }
+    const dashing = this.dashTimer > 0;
+    this.dashing = dashing;
+
+    // Sprint (held): the old cruise speed, paid for in energy.
     const moving = wx !== 0 || wz !== 0;
-    const sprinting = sprint && moving && this.energy > 1;
+    const sprinting = !dashing && sprint && moving && this.energy > 1;
     if (sprinting) this.energy = Math.max(0, this.energy - Move.sprintCostPerSec * dt);
     const speed = sprinting ? Move.sprintSpeed : Move.maxSpeed;
 
-    // Horizontal glide: chase target velocity (snappy), then drift (momentum).
-    const targetX = wx * speed;
-    const targetZ = wz * speed;
-    this.vel.x += (targetX - this.vel.x) * Math.min(1, Move.accel * dt * 0.02);
-    this.vel.z += (targetZ - this.vel.z) * Math.min(1, Move.accel * dt * 0.02);
-    if (!moving) {
-      const d = Math.max(0, 1 - Move.damping * dt);
-      this.vel.x *= d;
-      this.vel.z *= d;
+    // Horizontal: the dash overrides glide with an authoritative burst; the
+    // residual velocity bleeds off into the normal drift when the window ends.
+    if (dashing) {
+      this.vel.x = this.dashDir.x * Move.dash.speed;
+      this.vel.z = this.dashDir.z * Move.dash.speed;
+    } else {
+      // Chase target velocity (snappy), then drift (momentum).
+      const targetX = wx * speed;
+      const targetZ = wz * speed;
+      this.vel.x += (targetX - this.vel.x) * Math.min(1, Move.accel * dt * 0.02);
+      this.vel.z += (targetZ - this.vel.z) * Math.min(1, Move.accel * dt * 0.02);
+      if (!moving) {
+        const d = Math.max(0, 1 - Move.damping * dt);
+        this.vel.x *= d;
+        this.vel.z *= d;
+      }
     }
 
     // --- Vertical: gravity + hover spring + wave-jump. Not flight. ---
-    const floorDist = this.probeFloor();
-    this.grounded = floorDist <= Move.hoverHeight + 0.6;
-    if (this.grounded) this.jumpsUsed = 0;
-
     this.jumped = false;
-    if (jump && this.jumpsUsed < Move.jumpChain && this.energy >= Move.jumpCost) {
+    if (jump && this.jumpsUsed < Move.jumpChain && (this.liftZone || this.energy >= Move.jumpCost)) {
       // The wave-jump: a downward pulse that kicks the orb up. Each chained
-      // jump is weaker — height is earned, never held.
-      this.energy -= Move.jumpCost;
+      // jump is weaker — height is earned, never held (free while climbing out).
+      if (!this.liftZone) this.energy -= Move.jumpCost;
       this.vel.y = Move.jumpSpeed * Math.pow(Move.jumpDecay, this.jumpsUsed);
       this.jumpsUsed++;
       this.jumped = true;
+      this.dashTimer = 0; // a jump breaks the dash float — leap out of the blink
     }
 
-    this.vel.y -= Move.gravity * dt;
-    // Hover spring engages near the floor — but never fights an active jump
-    // (a fast upward velocity is ballistic; the spring only catches the fall).
-    if (floorDist < GROUND_PROBE && this.vel.y < 4) {
-      const stretch = Move.hoverHeight - floorDist;
-      if (stretch > -0.5) {
-        // Gravity-compensated so it settles at exactly hoverHeight, bobbing.
-        this.vel.y +=
-          (stretch * Move.hoverStiffness + Move.gravity - this.vel.y * Move.hoverDamping) * dt;
+    if (this.dashTimer > 0) {
+      // During the burst the orb floats: gravity and the hover spring are held
+      // off so the dash reads as a clean horizontal blink, ground or air.
+      this.vel.y *= Math.max(0, 1 - 12 * dt);
+      this.dashTimer = Math.max(0, this.dashTimer - dt);
+    } else {
+      this.vel.y -= Move.gravity * dt;
+      // Hover spring engages near the floor — but never fights an active jump
+      // (a fast upward velocity is ballistic; the spring only catches the fall).
+      if (floorDist < GROUND_PROBE && this.vel.y < 4) {
+        const stretch = Move.hoverHeight - floorDist;
+        if (stretch > -0.5) {
+          // Gravity-compensated so it settles at exactly hoverHeight, bobbing.
+          this.vel.y +=
+            (stretch * Move.hoverStiffness + Move.gravity - this.vel.y * Move.hoverDamping) * dt;
+        }
       }
+      // The orb is light itself — it drifts down, it never plummets.
+      if (this.vel.y < -Move.fallGlide) this.vel.y = -Move.fallGlide;
     }
-    // The orb is light itself — it drifts down, it never plummets.
-    if (this.vel.y < -Move.fallGlide) this.vel.y = -Move.fallGlide;
 
     // Integrate with per-axis collision so we slide along walls.
     this.moveAxis('x', this.vel.x * dt);

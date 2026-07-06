@@ -18,6 +18,9 @@ import { World } from '../config';
 import { Mat, MATERIALS, isSolid } from '../world/Materials';
 import { VoxelWorld, Chunk } from '../world/VoxelWorld';
 import { LightGrid } from '../lighting/LightGrid';
+import { logger } from '../core/log';
+
+const meshLog = logger('mesher');
 
 const CS = World.chunkSize;
 const VS = World.voxelSize;
@@ -146,13 +149,13 @@ export function buildChunkGeometry(
   if (import.meta.env.DEV) {
     for (let i = 0; i < positions.length; i++) {
       if (Number.isNaN(positions[i])) {
-        console.warn(`[mesher] NaN position in chunk ${chunk.cx},${chunk.cy},${chunk.cz} at ${i}`);
+        meshLog.once('nan-pos', 'warn', `NaN position in chunk ${chunk.cx},${chunk.cy},${chunk.cz} at ${i}`);
         break;
       }
     }
     for (let i = 0; i < alight.length; i++) {
       if (Number.isNaN(alight[i]) || Number.isNaN(aao[i])) {
-        console.warn(`[mesher] NaN light/ao in chunk ${chunk.cx},${chunk.cy},${chunk.cz} at ${i}`);
+        meshLog.once('nan-light', 'warn', `NaN light/ao in chunk ${chunk.cx},${chunk.cy},${chunk.cz} at ${i}`);
         break;
       }
     }

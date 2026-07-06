@@ -220,6 +220,11 @@ function addPulseReveal(mat: THREE.MeshStandardMaterial): void {
     shader.uniforms.uLightDim = uniforms.uLightDim;
     shader.uniforms.uLightTiles = uniforms.uLightTiles;
     shader.uniforms.uHeldColor = uniforms.uHeldColor;
+    // Share the moon strength so flora crush to black with distance on EXACTLY
+    // the same curve as the terrain shader (litMaterial "darkness is the draw
+    // distance"). Without this, distant flora stay lit while the ground behind
+    // them is already black — that mismatch is the "distant foliage" pop.
+    shader.uniforms.uMoonI = uniforms.uMoonI;
     let vtxHead = 'varying vec3 vPulseWP;\n';
     if (isLeaf) {
       shader.uniforms.uLeafTime = { value: 0 };
@@ -265,6 +270,7 @@ function addPulseReveal(mat: THREE.MeshStandardMaterial): void {
        uniform vec3 uLightDim;
        uniform vec2 uLightTiles;
        uniform vec3 uHeldColor;
+       uniform float uMoonI;
        varying vec3 vPulseWP;
        // Same 2D-atlas flood-fill sampler as the terrain shader.
        float sampleLightVol(vec3 wp) {
@@ -292,7 +298,12 @@ function addPulseReveal(mat: THREE.MeshStandardMaterial): void {
            ring = ring * ring * uPulseIntensity;
            outgoingLight += diffuseColor.rgb * ring * uPulseColor * 1.7;
          }
-         #include <opaque_fragment>`,
+         #include <opaque_fragment>
+         // DARKNESS IS THE DRAW DISTANCE (matches terrain litMaterial): light
+         // dies with distance from the eye, so distant flora fall to black at the
+         // same rate as the ground — only silhouetted-against-sky or near-lit
+         // flora survive. Applied in linear HDR, before tonemap/fog.
+         gl_FragColor.rgb *= exp(-distance(cameraPosition, vPulseWP) * 0.016 / (1.0 + uMoonI * 2.5));`,
       );
   };
   // Leaf variant compiles as its own program; the rest share one cache key.

@@ -4,8 +4,8 @@
     {
       "name": "waiver-web",
       "runtimeExecutable": "npm",
-      "runtimeArgs": ["--prefix", "web", "run", "dev"],
-      "autoPort": true
+      "runtimeArgs": ["--prefix", "web", "run", "dev", "--", "--port", "5190", "--strictPort", "--host", "127.0.0.1"],
+      "port": 5190
     }
   ]
 }

@@ -5,8 +5,8 @@
  * camera-orbit deltas, and edge-triggered actions. Three device schemes feed
  * the same intents:
  *
- *   KEYBOARD+MOUSE   WASD glide · SPACE wave-jump · F pulse · Shift dash
- *                    LMB-drag look · B ward · T tide
+ *   KEYBOARD+MOUSE   WASD glide · SPACE wave-jump · F pulse · Shift dash/sprint
+ *                    (tap = blink-dash, hold = sprint) · LMB-drag look · B ward · T tide
  *   ONE-HANDED MOUSE (design goal: full play with one hand)
  *                    LMB-drag look · RMB-hold glide forward · wheel-up jump
  *                    MMB pulse
@@ -18,7 +18,10 @@
  * Call update(dt) once per frame before reading intents (polls the gamepad).
  */
 
+import { logger } from './log';
+
 const TOUCH_STICK_RADIUS = 56; // px of drag for full speed
+const inputLog = logger('input');
 
 export class Input {
   private target: HTMLElement;
@@ -34,6 +37,10 @@ export class Input {
   private touchMove = { x: 0, z: 0 };
   private touchLookId: number | null = null;
   private touchLookLast = { x: 0, y: 0 };
+
+  /** Visible dynamic joystick — a ring + nub that track the left thumb. */
+  private stickBase: HTMLElement | null = null;
+  private stickNub: HTMLElement | null = null;
 
   /** Accumulated camera-orbit delta (consumed each frame). */
   orbitDX = 0;
@@ -84,32 +91,60 @@ export class Input {
   }
 
   private buildTouchButtons(): void {
+    // Visible dynamic joystick: a ring that the left thumb summons (styled in
+    // main.ts). The nub is a child so it re-centres with the base automatically.
+    const base = document.createElement('div');
+    base.className = 'touch-stick-base';
+    const nub = document.createElement('div');
+    nub.className = 'touch-stick-nub';
+    base.appendChild(nub);
+    document.body.appendChild(base);
+    this.stickBase = base;
+    this.stickNub = nub;
+
+    // Right-thumb action cluster: a 2×2 grid of secondary verbs plus a large
+    // primary PULSE dropped in the corner where the resting thumb already is.
     const wrap = document.createElement('div');
     wrap.className = 'touch-actions';
-    const mk = (label: string, fire: () => void, tone = '') => {
+    const secondary = document.createElement('div');
+    secondary.className = 'touch-secondary';
+    const mk = (label: string, fire: () => void, opts: { tone?: string; primary?: boolean } = {}) => {
       const b = document.createElement('button');
       b.type = 'button';
       b.textContent = label;
-      b.className = `touch-action ${tone}`.trim();
+      b.className = `touch-action ${opts.tone ?? ''} ${opts.primary ? 'primary' : ''}`.replace(/\s+/g, ' ').trim();
       b.addEventListener('pointerdown', (e) => {
         e.stopPropagation();
         e.preventDefault();
         fire();
       });
-      wrap.appendChild(b);
+      (opts.primary ? wrap : secondary).appendChild(b);
       return b;
     };
-    mk('PULSE', () => (this._pulse = true));
     mk('JUMP', () => (this._jump = true));
     const dashBtn = mk('DASH', () => (this._dash = true));
-    // DASH is also a HOLD: finger down = sprinting, finger up = cruise.
+    // DASH taps a blink-burst; HELD it also sprints (finger up = cruise).
     dashBtn.addEventListener('pointerdown', () => (this.touchDashHeld = true));
     dashBtn.addEventListener('pointerup', () => (this.touchDashHeld = false));
     dashBtn.addEventListener('pointercancel', () => (this.touchDashHeld = false));
     dashBtn.addEventListener('pointerleave', () => (this.touchDashHeld = false));
     mk('WARD', () => (this._buildWard = true));
-    mk('TIDE', () => (this._tide = true), 'danger');
+    wrap.appendChild(secondary); // grid sits left of the primary in the flex row
+    mk('PULSE', () => (this._pulse = true), { primary: true });
     document.body.appendChild(wrap);
+
+    // TIDE is a build-time debug trigger, not a shipped verb — keep it off in a
+    // corner by itself so it never reads as part of the player action cluster.
+    const dev = document.createElement('button');
+    dev.type = 'button';
+    dev.textContent = 'TIDE';
+    dev.className = 'touch-dev';
+    dev.addEventListener('pointerdown', (e) => {
+      e.stopPropagation();
+      e.preventDefault();
+      this._tide = true;
+    });
+    document.body.appendChild(dev);
   }
 
   private onKeyDown = (e: KeyboardEvent) => {
@@ -144,6 +179,12 @@ export class Input {
         this.touchMoveId = e.pointerId;
         this.touchMoveOrigin = { x: e.clientX, y: e.clientY };
         this.touchMove = { x: 0, z: 0 };
+        if (this.stickBase) {
+          this.stickBase.style.left = `${e.clientX}px`;
+          this.stickBase.style.top = `${e.clientY}px`;
+          this.stickBase.classList.add('active');
+        }
+        if (this.stickNub) this.stickNub.style.transform = 'translate(-50%, -50%)';
       } else if (this.touchLookId === null) {
         this.touchLookId = e.pointerId;
         this.touchLookLast = { x: e.clientX, y: e.clientY };
@@ -158,9 +199,11 @@ export class Input {
         // (Some embeds forbid pointer lock — swallow the rejection; the
         // drag fallback below covers those environments.)
         try {
-          (this.target.requestPointerLock?.() as Promise<void> | undefined)?.catch(() => {});
-        } catch {
-          /* drag fallback */
+          (this.target.requestPointerLock?.() as Promise<void> | undefined)?.catch((err) =>
+            inputLog.trace('pointer lock denied — using drag fallback', err),
+          );
+        } catch (err) {
+          inputLog.trace('pointer lock threw — using drag fallback', err);
         }
         this.orbitDrag = true; // drag fallback if lock is denied
         this.lastX = e.clientX;
@@ -179,6 +222,7 @@ export class Input {
       if (e.pointerId === this.touchMoveId) {
         this.touchMoveId = null;
         this.touchMove = { x: 0, z: 0 };
+        if (this.stickBase) this.stickBase.classList.remove('active');
       }
       if (e.pointerId === this.touchLookId) this.touchLookId = null;
       return;
@@ -196,6 +240,11 @@ export class Input {
         const len = Math.hypot(dx, dy);
         const s = len > 1 ? 1 / len : 1;
         this.touchMove = { x: dx * s, z: dy * s };
+        if (this.stickNub) {
+          const px = this.touchMove.x * TOUCH_STICK_RADIUS;
+          const py = this.touchMove.z * TOUCH_STICK_RADIUS;
+          this.stickNub.style.transform = `translate(calc(-50% + ${px}px), calc(-50% + ${py}px))`;
+        }
       } else if (e.pointerId === this.touchLookId) {
         // Thumbs sweep bigger arcs than mouse wrists — scale touch look down.
         this.orbitDX += (e.clientX - this.touchLookLast.x) * 0.75;
@@ -311,7 +360,7 @@ export class Input {
     this.gpPrev = nextPrev;
   }
 
-  /** Dash HELD on any device → sprint at the old cruise speed. */
+  /** Dash key HELD on any device → sprint at the old cruise speed (tap = dash). */
   sprinting(): boolean {
     return (
       this.keys.has('ShiftLeft') ||
@@ -414,7 +463,8 @@ function pressed(gp: Gamepad, index: number): boolean {
 function isFramed(): boolean {
   try {
     return window.self !== window.top;
-  } catch {
+  } catch (err) {
+    inputLog.trace('window.top blocked (cross-origin) — assuming framed', err);
     return true;
   }
 }

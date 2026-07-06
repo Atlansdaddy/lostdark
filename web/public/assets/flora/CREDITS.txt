@@ -1,0 +1,10 @@
+﻿wAIver flora assets - all CC0 (public domain) by Quaternius, via poly.pizza
+tree_01.glb	CC0	https://poly.pizza/m/QVOop92WmG
+tree_02.glb	CC0	https://poly.pizza/m/n8FhMgMldD
+mushroom_01.glb	CC0	https://poly.pizza/m/aOW08oSrd4
+mushroom_02.glb	CC0	https://poly.pizza/m/mxDOl0n6zt
+rock_01.glb	CC0	https://poly.pizza/m/icVsN3lmVy
+rock_02.glb	CC0	https://poly.pizza/m/2YtLzwgsWp
+bush_01.glb	CC0	https://poly.pizza/m/EoTERLq3z2
+fern_01.glb	CC0	https://poly.pizza/m/jqcanvH7D6
+grass_01.glb	CC0	https://poly.pizza/m/JSIYtscPmP
