@@ -93,6 +93,9 @@ let camDistSmooth = CameraConfig.distance;
 let camHeightSmooth = CameraConfig.height;
 // 0 = adaptive third-person (default), 1 = fixed over-shoulder (press V to A/B).
 let camMode: 0 | 1 = 0;
+// Set each frame by the chunk-cull roof probe: true when a rock ceiling is
+// overhead (in a cave), false under open sky. Shared with the flora cull.
+let orbRoofed = false;
 
 // HDR bloom → ACES output. The glowing orb and emissives NEED this to read
 // as light sources instead of flat sprites (GDD §5j: non-negotiable).
@@ -964,9 +967,9 @@ function updateFloraCulling(): void {
     const f = floraCull[floraCullCursor];
     const dx = f.x - orb.pos.x;
     const dz = f.z - orb.pos.z;
-    // Surface flora keep the generous vista radius; deep cave flora (which are
-    // black past the orb's bubble) cull to the tight cave render distance.
-    const r2 = f.y > 0 ? SURFACE_FLORA_VIEW2 : RENDER_RADIUS2;
+    // Surface flora keep the generous vista radius WHILE the orb is above ground;
+    // underground everything (surface flora included) is occluded, so cull tight.
+    const r2 = f.y > 0 && !orbRoofed ? SURFACE_FLORA_VIEW2 : RENDER_RADIUS2;
     f.group.visible = dx * dx + dz * dz < r2;
   }
 }
@@ -1183,9 +1186,10 @@ const leafGeo = makeLeafClusterGeometry();
 const leafMat = new THREE.MeshStandardMaterial({
   map: makeLeafTexture(),
   alphaTest: 0.42, // cut the soft texture into organic leaf edges (opaque, cheap)
-  // DARK albedo (like the bark 0x3c3226) so foliage is black-until-lit and never
-  // blooms. No emissive — the lighting system (another agent) owns how it lights.
-  color: 0x24361f,
+  // A natural foliage-green albedo: dark enough to be black-until-lit (never
+  // blooms on its own) but reflective enough to catch light when it reaches it.
+  // No emissive — the lighting system (another agent) owns how it lights up.
+  color: 0x33502c,
   roughness: 0.85,
   metalness: 0,
   side: THREE.DoubleSide,
@@ -1373,6 +1377,7 @@ function makeButtons(x: number, y: number, z: number): void {
     metalness: 0,
     envMapIntensity: 0.04,
   });
+  mat.userData.keepGlow = true; // ground caps keep their faint glow (for lighting)
   for (let i = 0; i < n; i++) {
     const s = Math.abs(Math.sin(x * 3.3 + i * 7.9));
     const r = 0.1 + s * 0.16;
@@ -1593,6 +1598,7 @@ function makeShelf(x: number, y: number, z: number, dx: number, dz: number): voi
     metalness: 0,
     envMapIntensity: 0.04,
   });
+  mat.userData.keepGlow = true; // shelf fungi keep their faint glow (for lighting)
   const facing = Math.atan2(dx, dz);
   const n = 2 + Math.floor(Math.abs(Math.sin(x * 7.7 + z * 3.9)) * 2);
   for (let i = 0; i < n; i++) {
@@ -1701,11 +1707,16 @@ console.info(
     ` (${lightVol.dim.x}x${lightVol.dim.y}x${lightVol.dim.z} voxels)`,
 );
 
-// Strip the RoomEnvironment IBL off every flora material so nothing floats
-// half-lit in the dark. Emissive is left ALONE — the bioluminescent bits
-// (glowcaps, mycelium beads, buttons) are meant to glow; the non-glowing bits
-// (trees, trunks, leaves) carry no emissive anyway, so with the environment off
-// and the moon wash off they go black until a real light reaches them.
+// Dark-game surface pass over every flora material:
+//   1. Strip the RoomEnvironment IBL — nothing floats half-lit in the dark.
+//   2. DEEPEN bright albedos — in a dark game a surface only shows what light
+//      reflects off it, so a bright albedo (the white leaf cards) blows out the
+//      instant any light touches it. Clamp each albedo's luminance down so lit
+//      surfaces read as a soft reveal, not a glare; already-dark albedos are
+//      left alone. Emissive (the bioluminescence) is untouched.
+// Materials are shared across flora, so each is processed exactly once.
+const ALBEDO_MAX_LUM = 0.14; // deepest a lit flora surface may reflect
+const seenMats = new Set<THREE.Material>();
 for (const f of floraCull) {
   f.group.traverse((o) => {
     const mesh = o as THREE.Mesh;
@@ -1714,6 +1725,11 @@ for (const f of floraCull) {
     for (const raw of mats) {
       const m = raw as THREE.MeshStandardMaterial;
       if ('envMapIntensity' in m) m.envMapIntensity = 0;
+      if (m.color && !seenMats.has(m)) {
+        seenMats.add(m);
+        const lum = m.color.r * 0.299 + m.color.g * 0.587 + m.color.b * 0.114;
+        if (lum > ALBEDO_MAX_LUM) m.color.multiplyScalar(ALBEDO_MAX_LUM / lum);
+      }
     }
   });
 }
@@ -2021,12 +2037,27 @@ function frame(): void {
   cullFrustum.setFromProjectionMatrix(cullMatrix);
   const orbX = orb.pos.x;
   const orbZ = orb.pos.z;
+  // Frustum culling has NO occlusion: underground, the whole far surface is still
+  // inside the frustum (behind solid rock) and would draw. So the gate keys off
+  // the ORB. Open sky overhead = surface → above-ground chunks keep the full
+  // moonlit vista (frustum-only). A ROCK ROOF overhead = in a cave → everything
+  // past a tight radius is occluded and pitch-black, so cull it hard (the fps
+  // fix). Roof-probe, not a y-threshold, so low valley floors still read surface.
+  orbRoofed = false;
+  {
+    const ox = Math.floor(orb.pos.x);
+    const oz = Math.floor(orb.pos.z);
+    for (let u = 2; u <= 11; u++) {
+      if (world.solid(ox, Math.floor(orb.pos.y + u), oz)) {
+        orbRoofed = true;
+        break;
+      }
+    }
+  }
+  const orbUnderground = orbRoofed;
   for (const mesh of chunkMeshes.values()) {
     const aabb = mesh.userData.aabb as THREE.Box3;
-    // Surface chunks (any part at/above ground) keep the full moonlit vista —
-    // frustum-only, exactly as before. DEEP cave chunks are pitch-black past the
-    // orb's bubble, so they only draw within a tight radius (the fps fix).
-    if (aabb.max.y > 0) {
+    if (!orbUnderground && aabb.max.y > 0) {
       mesh.visible = cullFrustum.intersectsBox(aabb);
     } else {
       const ddx = Math.max(aabb.min.x - orbX, 0, orbX - aabb.max.x);
@@ -2067,6 +2098,7 @@ function frame(): void {
   if (!paused && actions.tide) startTide();
 
   orb.pulseRate = mood.pulseRate;
+  orb.liftZone = computeLiftZone();
   // Frozen input while paused — the orb just hovers in place, idling.
   const moveIntent = paused ? { x: 0, z: 0 } : input.moveVector();
   orb.update(dt, moveIntent, yaw, !paused && actions.jump, !paused && input.sprinting());
@@ -2942,6 +2974,42 @@ function orbOpenness(): number {
   const headO = Math.min(1, head / CameraConfig.headroomOpen);
   const latO = Math.min(1, minClear / CameraConfig.lateralOpen);
   return Math.min(headO, latO);
+}
+
+// Entrance columns (surface→cave shafts) as a flat [x,z,x,z,…] for cheap tests.
+const ENTRANCE_R2 = 11 * 11; // a touch wider than the carved funnel radius (9)
+const entranceCols = reek.entrances;
+
+/** True when the orb sits in a climbable vertical shaft: open air overhead with
+ *  enclosing walls (a chimney), OR anywhere inside an entrance funnel. Either
+ *  way there's a route up, so the free-jump climb turns on. Surface only needs
+ *  it near shafts, so we gate to below ground. */
+function computeLiftZone(): boolean {
+  if (orb.pos.y > 3) return false; // above ground — normal jump economy
+  const ox = Math.floor(orb.pos.x);
+  const oy = orb.pos.y;
+  const oz = Math.floor(orb.pos.z);
+  // Inside an entrance funnel? Guaranteed to reach the surface.
+  for (let e = 0; e < entranceCols.length; e++) {
+    const dx = orb.pos.x - entranceCols[e][0];
+    const dz = orb.pos.z - entranceCols[e][1];
+    if (dx * dx + dz * dz < ENTRANCE_R2) return true;
+  }
+  // A chimney: tall open air above AND enclosed on ≥2 sides (not an open room).
+  for (let up = 1; up <= 4; up++) {
+    if (world.solid(ox, Math.floor(oy + 1.2 + up), oz)) return false;
+  }
+  let walls = 0;
+  const D: [number, number][] = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+  for (const [dx, dz] of D) {
+    for (let s = 1; s <= 2; s++) {
+      if (world.solid(Math.floor(orb.pos.x + dx * s), Math.floor(oy + 0.3), Math.floor(orb.pos.z + dz * s))) {
+        walls++;
+        break;
+      }
+    }
+  }
+  return walls >= 2;
 }
 
 function updateCamera(dt: number): void {
