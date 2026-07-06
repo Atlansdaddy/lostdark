@@ -65,11 +65,15 @@ export class LightVolume {
   }
 
   /**
-   * Repopulate the whole atlas from the flood-fill. `sampleLevel(x,y,z)` gives a
-   * 0..15 light level at a world voxel; written grayscale for now (the shader
-   * tints it with the biome's held-light color — matching today's terrain).
+   * Repopulate the whole atlas. `sampleLevel(x,y,z)` gives a 0..15 flood-fill
+   * light level (written to RGB, tinted in-shader). `sampleSolid(x,y,z)` marks
+   * occluders — written to ALPHA (255 solid, 0 open) so the shader can
+   * ray-march real shadows through the world.
    */
-  rebuild(sampleLevel: (x: number, y: number, z: number) => number): void {
+  rebuild(
+    sampleLevel: (x: number, y: number, z: number) => number,
+    sampleSolid?: (x: number, y: number, z: number) => boolean,
+  ): void {
     const { nx, ny, nz, tx, aw, min, step, data } = this;
     for (let j = 0; j < ny; j++) {
       const wy = Math.round(min.y + (j + 0.5) * step);
@@ -85,7 +89,7 @@ export class LightVolume {
           data[idx] = v;
           data[idx + 1] = v;
           data[idx + 2] = v;
-          data[idx + 3] = 255;
+          data[idx + 3] = sampleSolid && sampleSolid(wx, wy, wz) ? 255 : 0;
         }
       }
     }

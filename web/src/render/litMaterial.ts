@@ -169,6 +169,37 @@ export function createLitMaterial(): { material: THREE.ShaderMaterial; uniforms:
         return mix(l0, l1, wy);
       }
 
+      // Solidity (0 open, 1 solid) from the volume's ALPHA — nearest Y-slice so
+      // walls stay crisp vertically. Used to ray-march real shadows.
+      float sampleSolid(vec3 wp) {
+        vec3 v = (wp - uLightMin) / uLightStep;
+        float nx = uLightDim.x, ny = uLightDim.y, nz = uLightDim.z;
+        float tX = uLightTiles.x, tY = uLightTiles.y;
+        float aw = tX * nx, ah = tY * nz;
+        float cx = clamp(v.x, 0.5, nx - 0.5);
+        float cz = clamp(v.z, 0.5, nz - 0.5);
+        float s = clamp(floor(v.y), 0.0, ny - 1.0);
+        vec2 t = vec2(mod(s, tX), floor(s / tX));
+        vec2 uv = vec2(t.x * nx + cx, t.y * nz + cz) / vec2(aw, ah);
+        return texture2D(uLightAtlas, uv).a;
+      }
+
+      // Real shadow from the orb: march the world from this surface toward the
+      // orb; if a solid voxel blocks the way, the surface is in shadow. Only
+      // marches within the lit bubble, so it costs nothing in the dark.
+      float orbShadow(vec3 p) {
+        vec3 d = uOrbPos - p;
+        float dist = length(d);
+        if (dist < 1.5) return 1.0;
+        vec3 dir = d / dist;
+        float march = min(dist - 1.0, 16.0);
+        for (int i = 1; i <= 16; i++) {
+          if (float(i) >= march) break;
+          if (sampleSolid(p + dir * (float(i) + 0.5)) > 0.5) return 0.0;
+        }
+        return 1.0;
+      }
+
       // --- procedural texture helpers ---
       float hash3(vec3 p) {
         p = fract(p * 0.3183099 + vec3(0.1, 0.17, 0.13));
@@ -290,13 +321,15 @@ export function createLitMaterial(): { material: THREE.ShaderMaterial; uniforms:
         }
 
         // ---- lighting (bump normal: the texture catches raking light) ----
-        // Orb bubble, facing-aware.
+        // Orb as a REAL directional light: distance falloff × N·L facing ×
+        // ray-marched shadow (solid voxels between surface and orb block it).
         float od = distance(p, uOrbPos);
         float bubble = 1.0 - clamp(od / uOrbRadius, 0.0, 1.0);
         bubble = bubble * bubble * uOrbIntensity;
         vec3 toOrb = normalize(uOrbPos - vWorld + 1e-4);
         float facing = 0.45 + 0.55 * clamp(dot(bumpN, toOrb), 0.0, 1.0);
         bubble *= facing;
+        if (bubble > 0.001) bubble *= orbShadow(p + vNormal * 1.5); // cast the orb's shadow (normal-biased vs self-shadow)
 
         // Pulse shell.
         float pulse = 0.0;

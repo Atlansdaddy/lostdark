@@ -1,10 +1,23 @@
-// Dev error trap: surface boot-time failures in the tab title (the vite
-// console can drown real errors in HMR reconnect spam).
+import { assert, dumpLogs, logger, setLogLevel, type LogLevel } from './core/log';
+import { DevOverlay } from './ui/DevOverlay';
+
+// Global error trap. Keeps the tab-title breadcrumb (the vite console can drown
+// real errors in HMR reconnect spam, and the phones we test on have no console
+// at all), and also routes through the logger + a crash overlay once one exists.
+const bootLog = logger('boot');
+let crashSink: ((err: unknown, message?: string) => void) | null = null;
 window.addEventListener('error', (e) => {
   document.title = `wAIver ERR: ${e.message} @ ${(e.filename || '').split('/').pop()}:${e.lineno}`;
+  bootLog.error('uncaught', e.error ?? e.message);
+  crashSink?.(e.error ?? new Error(e.message), 'An unexpected error interrupted the game.');
 });
 window.addEventListener('unhandledrejection', (e) => {
   document.title = `wAIver REJ: ${String(e.reason).slice(0, 120)}`;
+  bootLog.error('unhandledrejection', e.reason);
+  crashSink?.(
+    e.reason instanceof Error ? e.reason : new Error(String(e.reason)),
+    'A background task failed.',
+  );
 });
 
 import * as THREE from 'three';
@@ -17,7 +30,7 @@ import { VolumetricFogPass, MAX_FOG_LIGHTS } from './render/VolumetricFogPass';
 import { GrassField } from './render/GrassField';
 import { SkyDome, cloudCoverAt } from './render/SkyDome';
 import { GodRaysPass } from './render/GodRaysPass';
-import { Camera as CameraConfig, Light as LightConfig, World } from './config';
+import { Camera as CameraConfig, Debug, Light as LightConfig, World } from './config';
 import { Input } from './core/Input';
 import { LightGrid } from './lighting/LightGrid';
 import { Orb } from './orb/Orb';
@@ -55,7 +68,14 @@ const WARD_RADIUS = 12;
 
 const app = document.querySelector<HTMLDivElement>('#app');
 const boot = document.querySelector<HTMLDivElement>('#boot');
-if (!app) throw new Error('Missing #app root');
+assert(app, 'Missing #app root');
+
+// Diagnostics overlay first — so the crash card is reachable from the global
+// error handlers above and the frame-loop boundary below.
+const devOverlay = new DevOverlay();
+crashSink = (err, message) => devOverlay.showCrash(err, message);
+/** Set true to stop the render loop: fatal frame errors or WebGL context loss. */
+let loopHalted = false;
 
 const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2)); // crisp without 2.5² fragment cost
@@ -66,6 +86,26 @@ renderer.toneMappingExposure = 1.15;
 renderer.domElement.tabIndex = 0;
 renderer.domElement.setAttribute('aria-label', 'wAIver game canvas');
 app.appendChild(renderer.domElement);
+
+// A GPU/driver reset (common on laptops and the phones we test on) fires
+// webglcontextlost. Without preventDefault the context can never be restored and
+// the game freezes forever, so pause the loop and show a recoverable notice; on
+// restore we reload (rebuilding every procedural GPU resource in place is a
+// bigger job — tracked as a follow-up).
+const glLog = logger('gl');
+renderer.domElement.addEventListener('webglcontextlost', (e) => {
+  e.preventDefault();
+  loopHalted = true;
+  glLog.warn('WebGL context lost — graphics paused');
+  devOverlay.showNotice(
+    'Graphics paused',
+    'The graphics context was lost (usually a GPU or driver hiccup). It will reload automatically once the context returns.',
+  );
+});
+renderer.domElement.addEventListener('webglcontextrestored', () => {
+  glLog.info('WebGL context restored — reloading');
+  location.reload();
+});
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x020205);
@@ -545,7 +585,7 @@ function applyQualityTier(): void {
   composer.setSize(window.innerWidth, window.innerHeight);
   bloomPass.setSize(window.innerWidth, window.innerHeight);
   depthRT.setSize(Math.floor((window.innerWidth * ratio) / 2), Math.floor((window.innerHeight * ratio) / 2));
-  console.info(`[quality] tier ${qualityTier}`);
+  logger('quality').debug(`tier ${qualityTier}`);
 }
 
 const hud = document.createElement('div');
@@ -561,14 +601,6 @@ hud.innerHTML = `
   <div id="gamepad-debug" class="gamepad-debug">pad: none</div>
 `;
 document.body.appendChild(hud);
-
-const controllerStatus = document.createElement('button');
-controllerStatus.type = 'button';
-controllerStatus.className = 'controller-status';
-controllerStatus.textContent = 'Controller: click to arm';
-controllerStatus.addEventListener('pointerdown', () => input.activateGamepadSurface());
-controllerStatus.addEventListener('click', () => input.activateGamepadSurface());
-document.body.appendChild(controllerStatus);
 
 const style = document.createElement('style');
 style.textContent = `
@@ -652,38 +684,60 @@ style.textContent = `
     white-space: pre-wrap;
     word-break: break-word;
   }
-  .controller-status {
+  /* Visible dynamic joystick (CoD-Mobile/Genshin pattern): a ring appears where
+     the left thumb lands and the nub tracks the drag. Purely cosmetic — the
+     Input class positions it; movement intent still comes from the touch math. */
+  .touch-stick-base {
     position: fixed;
-    left: 50%;
-    bottom: 16px;
-    transform: translateX(-50%);
-    z-index: 80;
-    max-width: calc(100vw - 24px);
-    padding: 8px 12px;
-    color: #dffcf1;
-    background: rgba(2, 6, 7, 0.84);
-    border: 1px solid rgba(127, 220, 255, 0.42);
-    border-radius: 6px;
-    box-shadow: 0 0 18px rgba(80, 216, 255, 0.12);
-    font: 10.5px/1.35 ui-monospace, Menlo, Consolas, monospace;
-    text-align: center;
-    white-space: normal;
-    cursor: pointer;
+    z-index: 22;
+    width: 132px;
+    height: 132px;
+    border-radius: 50%;
+    border: 1.5px solid rgba(127, 220, 255, 0.32);
+    background: radial-gradient(circle, rgba(80, 216, 255, 0.1), rgba(2, 10, 14, 0.04) 70%);
+    box-shadow: inset 0 0 26px rgba(80, 216, 255, 0.1);
+    transform: translate(-50%, -50%);
+    opacity: 0;
+    transition: opacity 0.12s ease;
+    pointer-events: none;
   }
+  .touch-stick-base.active {
+    opacity: 1;
+  }
+  .touch-stick-nub {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 58px;
+    height: 58px;
+    border-radius: 50%;
+    background: rgba(80, 216, 255, 0.22);
+    border: 1px solid rgba(127, 220, 255, 0.6);
+    box-shadow: inset 0 0 16px rgba(80, 216, 255, 0.25), 0 0 18px rgba(80, 216, 255, 0.18);
+    transform: translate(-50%, -50%);
+    pointer-events: none;
+  }
+  /* Right-thumb action cluster: a large primary PULSE in the corner (closest to
+     a resting right thumb) with the secondary verbs grouped just up-and-left. */
   .touch-actions {
     position: fixed;
     right: max(12px, env(safe-area-inset-right));
     bottom: max(14px, env(safe-area-inset-bottom));
     z-index: 24;
-    display: grid;
-    grid-template-columns: repeat(2, 62px);
-    gap: 10px;
-    pointer-events: auto;
+    display: flex;
+    align-items: flex-end;
+    gap: 12px;
+    pointer-events: none;
     touch-action: none;
   }
+  .touch-secondary {
+    display: grid;
+    grid-template-columns: repeat(2, 54px);
+    gap: 10px;
+  }
   .touch-action {
-    width: 62px;
-    height: 62px;
+    width: 54px;
+    height: 54px;
     border-radius: 50%;
     display: flex;
     align-items: center;
@@ -692,18 +746,47 @@ style.textContent = `
     background: rgba(60, 160, 200, 0.16);
     border: 1px solid rgba(127, 220, 255, 0.45);
     box-shadow: inset 0 0 18px rgba(80, 216, 255, 0.09), 0 0 20px rgba(80, 216, 255, 0.12);
-    font: 700 10.5px/1 ui-monospace, Menlo, Consolas, monospace;
+    font: 700 10px/1 ui-monospace, Menlo, Consolas, monospace;
     letter-spacing: 0.08em;
     text-shadow: 0 0 8px rgba(127, 220, 255, 0.7);
+    pointer-events: auto;
     -webkit-user-select: none;
     user-select: none;
     touch-action: none;
+  }
+  .touch-action.primary {
+    width: 80px;
+    height: 80px;
+    font-size: 12px;
+    color: #eaffff;
+    background: rgba(80, 216, 255, 0.24);
+    border-color: rgba(159, 232, 255, 0.75);
+    box-shadow: inset 0 0 22px rgba(80, 216, 255, 0.2), 0 0 26px rgba(80, 216, 255, 0.22);
   }
   .touch-action.danger {
     color: #ffe2cc;
     background: rgba(176, 80, 40, 0.18);
     border-color: rgba(255, 168, 108, 0.5);
     text-shadow: 0 0 8px rgba(255, 150, 92, 0.75);
+  }
+  /* Isolated build-time debug trigger — deliberately drab and off on its own so
+     it never reads as part of the player action cluster. Delete before ship. */
+  .touch-dev {
+    position: fixed;
+    top: calc(env(safe-area-inset-top) + 30px);
+    right: max(8px, env(safe-area-inset-right));
+    z-index: 24;
+    padding: 5px 9px;
+    border-radius: 5px;
+    color: rgba(200, 210, 214, 0.72);
+    background: rgba(20, 24, 26, 0.55);
+    border: 1px dashed rgba(150, 165, 170, 0.4);
+    font: 700 9px/1 ui-monospace, Menlo, Consolas, monospace;
+    letter-spacing: 0.1em;
+    pointer-events: auto;
+    -webkit-user-select: none;
+    user-select: none;
+    touch-action: none;
   }
   @media (max-width: 720px), (pointer: coarse) {
     .metrics-bar {
@@ -744,26 +827,9 @@ style.textContent = `
       font-size: 10.5px;
       line-height: 1.35;
     }
+    /* Raw controller telemetry is a desktop setup aid — pure noise on a phone. */
     .gamepad-debug {
-      margin-top: 6px;
-      max-width: min(62vw, 360px);
-      padding: 5px 6px;
-      font-size: 8.5px;
-      line-height: 1.3;
-    }
-    .controller-status {
-      bottom: 82px;
-      padding: 6px 8px;
-      font-size: 8.5px;
-    }
-    .touch-actions {
-      grid-template-columns: repeat(2, 58px);
-      gap: 9px;
-    }
-    .touch-action {
-      width: 58px;
-      height: 58px;
-      font-size: 9.5px;
+      display: none;
     }
   }
 `;
@@ -1714,9 +1780,9 @@ const reekHooks = {
 };
 
 // Generate the large initial area with full POI placement.
-console.info(`[world] Generating initial ${REEK_HALF_INIT * 2}×${REEK_HALF_INIT * 2} voxel area...`);
+logger('world').info(`generating initial ${REEK_HALF_INIT * 2}×${REEK_HALF_INIT * 2} voxel area…`);
 const reek = generateReek(world, REEK_SEED, REEK_HALF_INIT, reekHooks);
-console.info(`[world] Initial area loaded. Chunks: ${world.chunks.size}`);
+logger('world').info(`initial area loaded — ${world.chunks.size} chunks`);
 
 lightGrid.update();
 remeshDirtyChunks();
@@ -1732,14 +1798,17 @@ const lightVol = new LightVolume(
   new THREE.Vector3(REEK_HALF_INIT, 20, REEK_HALF_INIT),
   2,
 );
-lightVol.rebuild((x, y, z) => lightGrid.sample(x, y, z));
+lightVol.rebuild(
+  (x, y, z) => lightGrid.sample(x, y, z),
+  (x, y, z) => world.solid(x, y, z), // solidity → alpha, for ray-marched shadows
+);
 uniforms.uLightAtlas.value = lightVol.texture;
 uniforms.uLightMin.value.copy(lightVol.min);
 uniforms.uLightStep.value = lightVol.step;
 uniforms.uLightDim.value.copy(lightVol.dim);
 uniforms.uLightTiles.value.copy(lightVol.tiles);
-console.info(
-  `[lightvol] ${lightVol.texture.image.width}x${lightVol.texture.image.height} atlas` +
+logger('lightvol').info(
+  `${lightVol.texture.image.width}x${lightVol.texture.image.height} atlas` +
     ` (${lightVol.dim.x}x${lightVol.dim.y}x${lightVol.dim.z} voxels)`,
 );
 
@@ -1793,7 +1862,10 @@ function updateLightVolume(dt: number): void {
     }
   }
   lightGrid.reflood(chargedEmitters);
-  lightVol.rebuild((x, y, z) => lightGrid.sampleFast(x, y, z));
+  lightVol.rebuild(
+    (x, y, z) => lightGrid.sampleFast(x, y, z),
+    (x, y, z) => world.solid(x, y, z),
+  );
 }
 
 // Grass builds AFTER the light flood so each tuft bakes its held light.
@@ -1802,7 +1874,7 @@ for (const [gx0, gy0, gz0] of grassSpots) {
   grassField.addTuft(gx0, gy0, gz0, lightGrid.sample(gx0, gy0 + 1, gz0) / 15);
 }
 const bladeCount = grassField.build(scene);
-console.info(`[grass] ${bladeCount} blades`);
+logger('grass').info(`${bladeCount} blades`);
 orb.spawn(reek.spawn[0], reek.spawn[1], reek.spawn[2]);
 if (boot) boot.remove();
 
@@ -1927,9 +1999,13 @@ function readSave(): WaiverSave | null {
     const raw = localStorage.getItem(SAVE_KEY);
     if (!raw) return null;
     const s = JSON.parse(raw) as WaiverSave;
-    if (!s || s.v !== 1 || !Array.isArray(s.wards)) return null;
+    if (!s || s.v !== 1 || !Array.isArray(s.wards)) {
+      logger('save').warn('ignoring corrupt/incompatible save — starting fresh');
+      return null;
+    }
     return s;
-  } catch {
+  } catch (err) {
+    logger('save').warn('could not read save (storage blocked or corrupt)', err);
     return null;
   }
 }
@@ -1965,8 +2041,9 @@ const menuBridge: MenuBridge = {
   writeSave: () => {
     try {
       localStorage.setItem(SAVE_KEY, JSON.stringify(captureSave()));
-    } catch {
-      /* storage disabled — nothing else to do */
+      logger('save').debug('saved');
+    } catch (err) {
+      logger('save').warn('could not write save (storage disabled or full)', err);
     }
   },
   loadSaveInPlace: () => {
@@ -1978,8 +2055,8 @@ const menuBridge: MenuBridge = {
   deleteSave: () => {
     try {
       localStorage.removeItem(SAVE_KEY);
-    } catch {
-      /* ignore */
+    } catch (err) {
+      logger('save').debug('could not delete save', err);
     }
   },
   setPaused: (p: boolean) => {
@@ -2057,11 +2134,9 @@ function updateHud(): void {
   if (sporeEl) sporeEl.textContent = spores.toString();
   if (obj) obj.textContent = objective;
   if (gamepadDebug) gamepadDebug.textContent = padStatus;
-  controllerStatus.textContent = `Controller: ${padStatus}`;
 }
 
 function frame(): void {
-  requestAnimationFrame(frame);
   const dt = Math.min(0.05, clock.getDelta());
   input.update(dt); // poll gamepad + decay wheel impulses
 
@@ -2304,8 +2379,8 @@ function frame(): void {
     // reach, so the tide doesn't corrupt and the grove keeps its glow.
     const leech = insideWard ? 1 : 1 + 5 * tidePress; // up to ~5s afterglow at peak
     s.charge *= Math.exp((-dt / 30) * leech); // ~30s afterglow, like phosphor paint
-    s.capMat.emissiveIntensity = 0.05 + s.charge * 0.85;
-    s.gillMat.emissiveIntensity = 0.04 + s.charge * 0.6;
+    s.capMat.emissiveIntensity = s.charge * 0.95; // BLACK uncharged; glows only when a light charges it
+    s.gillMat.emissiveIntensity = s.charge * 0.65;
     fogLightRegistry[s.fogIdx].intensity = 0.04 + s.charge * 0.65;
   }
 
@@ -2994,6 +3069,31 @@ function frame(): void {
   }
 }
 
+// Crash boundary for the render loop. frame() no longer schedules itself; this
+// wrapper does, in a finally-free path that only re-arms rAF when we haven't
+// halted. A single throw is a hiccup we log and skip; a sustained run of them is
+// a broken frame that would otherwise re-throw 60×/s into a frozen black screen
+// and a flooded console, so after frameErrorLimit we stop and show the crash card.
+const frameLog = logger('frame');
+let frameErrors = 0;
+function frameLoop(): void {
+  if (loopHalted) return;
+  try {
+    frame();
+    frameErrors = 0; // a clean frame clears the streak
+  } catch (err) {
+    frameErrors++;
+    frameLog.throttle('threw', 1000, 'error', `frame threw (${frameErrors})`, err);
+    if (frameErrors >= Debug.frameErrorLimit) {
+      loopHalted = true;
+      frameLog.error(`halting render loop after ${frameErrors} consecutive errors`);
+      devOverlay.showCrash(err, 'The render loop hit repeated errors and was stopped.');
+      return; // do NOT re-arm — the loop is dead until reload
+    }
+  }
+  requestAnimationFrame(frameLoop);
+}
+
 const camOrigin = new THREE.Vector3();
 const camDir = new THREE.Vector3();
 
@@ -3159,7 +3259,7 @@ window.addEventListener('resize', () => {
 // Decide the opening beat (resume a save, or show the title) BEFORE the first
 // frame, so `paused` is correct from frame one.
 menu.boot();
-frame();
+frameLoop();
 
 // Dev console handle (GDD §8c sandbox tooling): drive the camera / fire actions
 // deterministically from the console or automation.
@@ -3197,20 +3297,35 @@ frame();
     for (const c of world.chunks.values()) c.dirty = true;
     const t0 = performance.now();
     remeshDirtyChunks();
-    console.info(`[terrain] ${v ? 'smooth' : 'blocky'} remesh in ${(performance.now() - t0).toFixed(0)}ms`);
+    logger('terrain').debug(`${v ? 'smooth' : 'blocky'} remesh in ${(performance.now() - t0).toFixed(0)}ms`);
   },
   /** A/B the sampled light volume against the baked terrain light. 0 = baked
    *  (default), 1 = fully volume-driven. If terrain looks the same at 1, the
    *  volume is correct and ready to carry dynamic (charge) light. */
   lightVol(mix: number): void {
     uniforms.uLightVolMix.value = mix;
-    console.info(`[lightvol] mix = ${mix}`);
+    logger('lightvol').debug(`mix = ${mix}`);
   },
   /** A/B the cave camera: 'adaptive' (default) draws the boom in as the space
    *  tightens; 'shoulder' is a fixed close over-shoulder chase. Or press V. */
   camMode(mode: 'adaptive' | 'shoulder'): void {
     camMode = mode === 'shoulder' ? 1 : 0;
-    console.info(`[camera] mode = ${mode}`);
+    logger('camera').debug(`mode = ${mode}`);
+  },
+  // --- diagnostics (see core/log.ts, ui/DevOverlay.ts) ---
+  setLogLevel: (level: LogLevel) => setLogLevel(level),
+  showLogs: () => devOverlay.show(),
+  hideLogs: () => devOverlay.hide(),
+  /** Copyable text of the whole ring buffer (also returned for the console). */
+  dumpLogs: () => dumpLogs(),
+  /** Exercise the frame-loop crash boundary from the console. */
+  throwTest: () => {
+    loopHalted = false;
+    frameErrors = Debug.frameErrorLimit - 1; // next thrown frame trips the limit
+    const orig = frame;
+    // Not reachable normally; wrapping is overkill — just throw next frame.
+    throw new Error('waiver.throwTest(): synthetic error');
+    void orig;
   },
 };
 
@@ -3218,6 +3333,6 @@ frame();
 window.addEventListener('keydown', (e) => {
   if (e.code === 'KeyV') {
     camMode = camMode === 0 ? 1 : 0;
-    console.info(`[camera] mode = ${camMode === 1 ? 'shoulder' : 'adaptive'}`);
+    logger('camera').debug(`mode = ${camMode === 1 ? 'shoulder' : 'adaptive'}`);
   }
 });
