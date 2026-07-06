@@ -110,7 +110,11 @@ renderer.domElement.addEventListener('webglcontextrestored', () => {
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x020205);
-scene.fog = new THREE.FogExp2(0x05080a, 0.055); // dense enough that distance goes black
+// Thin atmosphere only. The shaders (terrain + flora) already crush distance to
+// black themselves; a dense FogExp2 on top just blends the whole frame toward
+// its blue-grey color, desaturating everything into flat mush. Keep it a faint
+// haze; the tide ramps it up when the dark actually rolls in.
+scene.fog = new THREE.FogExp2(0x05080a, 0.008);
 
 // The night above The Reek: clouds, star pockets, a cycling moon.
 const sky = new SkyDome();
@@ -220,11 +224,6 @@ function addPulseReveal(mat: THREE.MeshStandardMaterial): void {
     shader.uniforms.uLightDim = uniforms.uLightDim;
     shader.uniforms.uLightTiles = uniforms.uLightTiles;
     shader.uniforms.uHeldColor = uniforms.uHeldColor;
-    // Share the moon strength so flora crush to black with distance on EXACTLY
-    // the same curve as the terrain shader (litMaterial "darkness is the draw
-    // distance"). Without this, distant flora stay lit while the ground behind
-    // them is already black — that mismatch is the "distant foliage" pop.
-    shader.uniforms.uMoonI = uniforms.uMoonI;
     let vtxHead = 'varying vec3 vPulseWP;\n';
     if (isLeaf) {
       shader.uniforms.uLeafTime = { value: 0 };
@@ -270,7 +269,6 @@ function addPulseReveal(mat: THREE.MeshStandardMaterial): void {
        uniform vec3 uLightDim;
        uniform vec2 uLightTiles;
        uniform vec3 uHeldColor;
-       uniform float uMoonI;
        varying vec3 vPulseWP;
        // Same 2D-atlas flood-fill sampler as the terrain shader.
        float sampleLightVol(vec3 wp) {
@@ -299,11 +297,11 @@ function addPulseReveal(mat: THREE.MeshStandardMaterial): void {
            outgoingLight += diffuseColor.rgb * ring * uPulseColor * 1.7;
          }
          #include <opaque_fragment>
-         // DARKNESS IS THE DRAW DISTANCE (matches terrain litMaterial): light
-         // dies with distance from the eye, so distant flora fall to black at the
-         // same rate as the ground — only silhouetted-against-sky or near-lit
-         // flora survive. Applied in linear HDR, before tonemap/fog.
-         gl_FragColor.rgb *= exp(-distance(cameraPosition, vPulseWP) * 0.016 / (1.0 + uMoonI * 2.5));`,
+         // DARKNESS IS THE DRAW DISTANCE. Distant flora fall to black — UNLIKE
+         // the terrain, flora get NO moon "horizon opens" reprieve: foliage must
+         // vanish at range in ALL conditions (John's call), leaving only near-lit
+         // flora and, against the lit sky, clean black silhouettes. Linear HDR.
+         gl_FragColor.rgb *= exp(-distance(cameraPosition, vPulseWP) * 0.02);`,
       );
   };
   // Leaf variant compiles as its own program; the rest share one cache key.
@@ -348,7 +346,14 @@ let pulseCenter = new THREE.Vector3();
 // not in the body. Reflections come from a generated room environment so the
 // glassy black reads even though the world shader is custom.
 const pmrem = new THREE.PMREMGenerator(renderer);
-scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+// The room-image light (IBL) is reserved for the ORB alone — it's the one object
+// meant to catch a soft studio reflection. It is deliberately NOT assigned to
+// scene.environment: that lights EVERY surface uniformly from all directions
+// (all flora, all terrain, at any distance) — the "I can see every plant on the
+// map" wash. Nothing but real lights (the orb's bubble, wards, charged glow,
+// built) may reveal the world, so the orb carries this map on its own material.
+const orbEnv = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+scene.environment = null;
 
 // The moon as a faint global wash: a dim, cool hemisphere light that lifts the
 // whole map *remotely* under a fuller/clearer moon and goes pitch black at new
@@ -367,6 +372,7 @@ const orbCore = new THREE.Mesh(
     roughness: 0.42, // satin: broad, soft reflections…
     clearcoat: 0.65, // …with a thin glossy coat on top
     clearcoatRoughness: 0.28,
+    envMap: orbEnv, // its OWN reflection — scene.environment is null so nothing else catches it
     envMapIntensity: 0.75,
     sheen: 0.4, // faint fabric-like rim softness
     sheenRoughness: 0.6,
@@ -2506,7 +2512,7 @@ function frame(): void {
   // and close toward your immediate sphere of light. At peak it's a tight,
   // near-black shroud: nothing beyond the orb's own pool survives.
   const tideFog = scene.fog as THREE.FogExp2;
-  tideFog.density = 0.055 + 0.06 * tidePress; // calm 0.055 (distance goes black on this small map) → tide ~0.115
+  tideFog.density = 0.008 + 0.1 * tidePress; // calm: faint haze (shaders do the distance-black); tide rolls the shroud in to ~0.108
   tideFog.color.setRGB(0.02 * (1 - tidePress), 0.031 * (1 - tidePress), 0.039 * (1 - tidePress));
 
   // --- Phosphorescence: glowcaps charge under light, glow as they fade. ---
@@ -2594,9 +2600,12 @@ function frame(): void {
   uniforms.uMoonDir.value.copy(moonDir);
   uniforms.uMoonI.value = moonI;
   grassField.uniforms.uMoonI.value = moonI;
-  // Flora moon wash, gated by the (now full-clear-only) moonI: near-zero on any
-  // normal night, so flora stay black; only a rare full cloudless moon lifts them.
-  moonAmbient.intensity = moonI * 0.3;
+  // Flora moon wash. A HemisphereLight is a FLAT omnidirectional fill (ART: "no
+  // flat ambient fill"), so keep it a whisper — quadratic in moonI so only a
+  // genuinely full, clear moon barely lifts flora, and even then it never becomes
+  // the blue silhouette-soup that flattened the grove. The orb is the hero light;
+  // the moon is a hint, not a floodlight.
+  moonAmbient.intensity = moonI * moonI * 0.1;
 
   // God-rays: project the moon to screen; rays fire only when it's ahead of
   // the camera and the clouds are open (moonI already folds in phase + cover).
