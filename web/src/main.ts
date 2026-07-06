@@ -42,6 +42,7 @@ import { buildSmoothChunkGeometry } from './render/SmoothMesher';
 import { Mat } from './world/Materials';
 import { Chunk, VoxelWorld } from './world/VoxelWorld';
 import { generateReek } from './world/ReekGen';
+import { FloraLibrary, type FloraName } from './world/FloraAssets';
 import { Menu, type MenuBridge } from './ui/Menu';
 
 type Pickup = {
@@ -1834,34 +1835,10 @@ for (const f of floraCull) {
   });
 }
 
-// Dynamic light: a few times a second, re-flood the grid using the charged caps
-// as extra light sources and repack the volume — so the world light brightens
-// where flora are charged and fades as they decay, all occlusion-shaped. Only
-// runs while the volume is actually in use (toggle on), so it costs nothing off.
-let lightVolTimer = 0;
-const chargedEmitters: { x: number; y: number; z: number; level: number }[] = [];
-function updateLightVolume(dt: number): void {
-  if (uniforms.uLightVolMix.value <= 0) return;
-  lightVolTimer += dt;
-  if (lightVolTimer < 0.3) return;
-  lightVolTimer = 0;
-  chargedEmitters.length = 0;
-  for (const s of shrooms) {
-    if (s.charge > 0.12) {
-      chargedEmitters.push({
-        x: Math.round(s.pos.x),
-        y: Math.round(s.pos.y),
-        z: Math.round(s.pos.z),
-        level: Math.round(4 + s.charge * 10),
-      });
-    }
-  }
-  lightGrid.reflood(chargedEmitters);
-  lightVol.rebuild(
-    (x, y, z) => lightGrid.sampleFast(x, y, z),
-    (x, y, z) => world.solid(x, y, z),
-  );
-}
+// (Removed the per-frame dynamic re-flood: repacking the whole light atlas ~3×/s
+//  spiked frames = the stutter. The volume's solidity — all the shaders need for
+//  ray-marched shadows — is static and built once at load. Dynamic sources come
+//  back as real shader lights next, not a texture repack.)
 
 // Grass builds AFTER the light flood so each tuft bakes its held light.
 const grassField = new GrassField();
@@ -1890,6 +1867,89 @@ if (boot) boot.remove();
     return t.anchor.toArray();
   },
 };
+
+// --- Imported CC0 flora (test scatter) -----------------------------------
+// First pass at authored GLTF props alongside the procedural flora. Loads the
+// Quaternius CC0 nature models (public/assets/flora — see CREDITS.txt) and
+// scatters a sampler arc of each kind plus a loose grove of trees around spawn.
+// Each prop is routed through the SAME pulse-reveal, distance-culling, collider
+// and dark-game material path as native flora, so it lights and behaves in kind.
+const floraLib = new FloraLibrary();
+const importedFlora: THREE.Group[] = [];
+
+/** Topmost solid voxel under (x,z), smoothed — a robust seat for scattered props
+ *  whose x/z we invent (native flora already know their surface y). */
+function groundYAt(x: number, z: number): number {
+  const ix = Math.floor(x);
+  const iz = Math.floor(z);
+  const top = Math.round(reek.spawn[1]);
+  for (let y = top + 24; y > top - 48; y--) {
+    if (world.solid(ix, y, iz)) return smoothSurfaceY(ix, iz, y);
+  }
+  return top;
+}
+
+/** Dark-game surface pass for one imported prop, matching what native flora get
+ *  at init (strip the IBL wash, deepen bright albedos so nothing floats lit). */
+function darkenImported(group: THREE.Group): void {
+  const seen = new Set<THREE.Material>();
+  group.traverse((o) => {
+    const mesh = o as THREE.Mesh;
+    if (!mesh.material) return;
+    const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+    for (const raw of mats) {
+      const m = raw as THREE.MeshStandardMaterial;
+      if ('envMapIntensity' in m) m.envMapIntensity = 0;
+      if (m.color && !seen.has(m)) {
+        seen.add(m);
+        const lum = m.color.r * 0.299 + m.color.g * 0.587 + m.color.b * 0.114;
+        if (lum > ALBEDO_MAX_LUM) m.color.multiplyScalar(ALBEDO_MAX_LUM / lum);
+      }
+    }
+  });
+}
+
+function placeImported(name: FloraName, x: number, z: number, collide = true): void {
+  const inst = floraLib.make(name);
+  if (!inst) return;
+  const gy = groundYAt(x, z);
+  inst.group.position.set(x, gy, z);
+  inst.group.rotation.y = (x * 12.9898 + z * 78.233) % (Math.PI * 2); // varied facing
+  darkenImported(inst.group);
+  scene.add(inst.group);
+  registerFlora(inst.group); // pulse-reveal patch + distance culling
+  importedFlora.push(inst.group);
+  if (collide) addFloraCollider(x, z, gy, gy + inst.height * 0.9, Math.max(inst.radius * 0.6, 0.3));
+}
+
+void floraLib.preload().then(() => {
+  const [sx, , sz] = reek.spawn;
+  // Sampler arc: one of each kind, fanned ~80° in front of spawn.
+  const sampler: FloraName[] = [
+    'tree_01', 'bush_01', 'mushroom_01', 'fern_01', 'rock_01',
+    'mushroom_02', 'grass_01', 'rock_02', 'tree_02',
+  ];
+  sampler.forEach((name, i) => {
+    const a = (i / (sampler.length - 1) - 0.5) * 1.4;
+    placeImported(name, sx + Math.sin(a) * 14, sz + Math.cos(a) * 14);
+  });
+  // Loose grove of trees ringing spawn so the vista reads as forest.
+  for (let i = 0; i < 10; i++) {
+    const ang = (i / 10) * Math.PI * 2 + 0.3;
+    const rad = 22 + (i % 3) * 6;
+    placeImported(i % 2 ? 'tree_02' : 'tree_01', sx + Math.cos(ang) * rad, sz + Math.sin(ang) * rad);
+  }
+  logger('flora-assets').info(`scattered ${importedFlora.length} imported props around spawn`);
+  // Attach to the dev handle here (in the async callback) so it lands on the
+  // FINAL window.waiver — the synchronous handle assignments have all run by now.
+  const dev = (window as unknown as { waiver: Record<string, unknown> }).waiver;
+  dev.importedFlora = importedFlora;
+  dev.toImported = () => {
+    orb.pos.set(reek.spawn[0], reek.spawn[1] + 4, reek.spawn[2] + 4);
+    orb.vel.set(0, 0, 0);
+    return `${importedFlora.length} props near spawn`;
+  };
+});
 
 function box(x: number, y: number, z: number, w: number, h: number, d: number, m: Mat): void {
   for (let ix = x; ix < x + w; ix++) {
@@ -2055,7 +2115,12 @@ const menuBridge: MenuBridge = {
     }
   },
   setPaused: (p: boolean) => {
+    const resuming = paused && !p;
     paused = p;
+    // Handing control back: the very keypress/button that dismissed the menu
+    // (Space on "Resume", A on the pad) also armed a game action edge in Input.
+    // Flush those pending edges so the orb doesn't jump/pulse on frame one of play.
+    if (resuming) input.consumeActions();
   },
 };
 const menu = new Menu(menuBridge);
@@ -3012,7 +3077,9 @@ function frame(): void {
     }
   }
   updateFloraCulling();
-  updateLightVolume(dt);
+  // (dynamic light-volume re-flood removed — it repacked the whole atlas ~3×/s
+  //  and spiked frames = the stutter. Solidity for shadows is static, built once
+  //  at load; dynamic sources come back as real shader lights, not a repack.)
   updateCamera(dt);
   updateHud();
   renderer.info.reset();
