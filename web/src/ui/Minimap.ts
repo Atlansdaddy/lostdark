@@ -38,6 +38,8 @@ export interface MapPrefs {
   shape: 'square' | 'round';
   /** true = the map rotates so your view direction is up; false = north-up. */
   rotate: boolean;
+  /** Minimized to a small tap-to-open icon (default true on phones). */
+  collapsed: boolean;
 }
 
 const PREF_KEY = 'waiver.map.prefs';
@@ -53,6 +55,10 @@ export class Minimap {
   private readonly canvas: HTMLCanvasElement;
   private readonly ctx: CanvasRenderingContext2D;
   private readonly labelEl: HTMLDivElement;
+  /** ⛶/– control that minimizes the map to an icon and back. */
+  private readonly toggleBtn: HTMLButtonElement;
+  /** Touch device? Phones open the map collapsed and draw it smaller. */
+  private readonly coarse: boolean;
   private readonly base: HTMLCanvasElement;
   private readonly fogCanvas: HTMLCanvasElement;
   private readonly fogCtx: CanvasRenderingContext2D;
@@ -60,7 +66,7 @@ export class Minimap {
   private readonly DR: number;
   private readonly disc: Uint8Array;
   private markers: MapMarker[] = [];
-  private prefs: MapPrefs = { visible: true, size: 'M', shape: 'round', rotate: true };
+  private prefs: MapPrefs = { visible: true, size: 'M', shape: 'round', rotate: true, collapsed: false };
   private lastRevealX = 1e9;
   private lastRevealZ = 1e9;
   private discDirty = false;
@@ -80,7 +86,20 @@ export class Minimap {
     this.canvas = document.createElement('canvas');
     this.labelEl = document.createElement('div');
     this.labelEl.className = 'waiver-minimap-label';
-    this.container.append(this.canvas, this.labelEl);
+    // Phones open the map as a small icon so it isn't hogging the screen.
+    this.coarse = typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches;
+    if (this.coarse) this.prefs.collapsed = true;
+    // Minimize/maximize control — a normal flex child above the map (right-
+    // aligned), and the ONLY thing shown while collapsed.
+    this.toggleBtn = document.createElement('button');
+    this.toggleBtn.type = 'button';
+    this.toggleBtn.className = 'waiver-minimap-toggle';
+    this.toggleBtn.addEventListener('pointerdown', (e) => {
+      e.stopPropagation();
+      e.preventDefault();
+      this.setPrefs({ collapsed: !this.prefs.collapsed });
+    });
+    this.container.append(this.toggleBtn, this.canvas, this.labelEl);
     document.body.appendChild(this.container);
     const style = document.createElement('style');
     style.textContent = `
@@ -99,6 +118,29 @@ export class Minimap {
         border: 1px solid rgba(127, 220, 255, 0.35);
         background: rgba(2, 5, 7, 0.85);
         box-shadow: 0 0 24px rgba(0, 0, 0, 0.55), inset 0 0 18px rgba(80, 216, 255, 0.05);
+      }
+      .waiver-minimap-toggle {
+        width: 34px;
+        height: 34px;
+        border-radius: 9px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: #bfefff;
+        background: rgba(2, 10, 14, 0.6);
+        border: 1px solid rgba(127, 220, 255, 0.4);
+        box-shadow: 0 0 14px rgba(80, 216, 255, 0.12);
+        font: 15px/1 ui-monospace, Menlo, Consolas, monospace;
+        pointer-events: auto;
+        cursor: pointer;
+        -webkit-user-select: none;
+        user-select: none;
+        touch-action: none;
+      }
+      /* Collapsed: hide the map + label, leaving just the tap-to-open icon. */
+      .waiver-minimap.collapsed canvas,
+      .waiver-minimap.collapsed .waiver-minimap-label {
+        display: none;
       }
       .waiver-minimap-label {
         max-width: 260px;
@@ -177,6 +219,9 @@ export class Minimap {
       this.saveT = 0;
       this.saveDisc();
     }
+    // Minimized to an icon: keep revealing fog above so the map is current when
+    // reopened, but skip the (costly) canvas redraw + label work entirely.
+    if (this.prefs.collapsed) return;
     this.drawT += dt;
     if (this.drawT >= 1 / 30) {
       this.drawT = 0;
@@ -299,13 +344,23 @@ export class Minimap {
 
   private applyPrefs(): void {
     this.container.style.display = this.prefs.visible ? 'flex' : 'none';
-    const px = SIZE_PX[this.prefs.size];
+    this.container.classList.toggle('collapsed', this.prefs.collapsed);
+    this.toggleBtn.textContent = this.prefs.collapsed ? '🗺' : '–';
+    this.toggleBtn.setAttribute('aria-label', this.prefs.collapsed ? 'Open map' : 'Minimize map');
+    const px = this.sizePx();
     this.canvas.style.width = this.canvas.style.height = `${px}px`;
     this.canvas.style.borderRadius = this.prefs.shape === 'round' ? '50%' : '10px';
   }
 
+  /** Expanded map footprint. The desktop S/M/L sizes are too big for a thumb
+   *  screen, so phones render at ~60% — still readable, far less in the way. */
+  private sizePx(): number {
+    const base = SIZE_PX[this.prefs.size];
+    return this.coarse ? Math.round(base * 0.6) : base;
+  }
+
   private draw(pos: { x: number; z: number }, yaw: number): void {
-    const px = SIZE_PX[this.prefs.size];
+    const px = this.sizePx();
     const span = SIZE_SPAN[this.prefs.size];
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
     if (this.canvas.width !== px * dpr) {

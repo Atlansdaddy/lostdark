@@ -261,8 +261,10 @@ export function buildSmoothChunkGeometry(
     const in1 = d1 >= ISO;
     if (in0 === in1) return;
     if (quad[0] < 0 || quad[1] < 0 || quad[2] < 0 || quad[3] < 0) return;
-    // Winding: surface faces the AIR side.
-    const [a, b, c, d] = in1 ? quad : [quad[3], quad[2], quad[1], quad[0]];
+    // Winding: surface faces the AIR side. (Was inverted — every triangle came
+    // out clockwise from the air, so front-face culling erased the terrain.
+    // Proven by the worldlab winding test: 0 CCW / 2228 CW up-faces before.)
+    const [a, b, c, d] = in1 ? [quad[3], quad[2], quad[1], quad[0]] : quad;
     indices.push(a, b, c, a, c, d);
   }
 

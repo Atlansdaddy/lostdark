@@ -25,6 +25,56 @@ const meshLog = logger('mesher');
 const CS = World.chunkSize;
 const VS = World.voxelSize;
 
+// Solidity lookup table — avoids a MATERIALS object walk per sample.
+const SOLID_LUT = new Uint8Array(32);
+for (const m of Object.values(MATERIALS)) SOLID_LUT[m.id] = m.solid ? 1 : 0;
+
+// Reusable slabs: local copies of materials + baked light covering [-1..CS]
+// on each axis. Every neighbour/AO/light sample below reads these flat arrays
+// instead of going through world.get()/light.sample() — each of those is a
+// string-keyed Map lookup, and a chunk mesh makes ~10⁵ of them (this was
+// ~80% of mesh time; the SmoothMesher learned the same lesson first).
+const SLAB = CS + 2;
+const slabMats = new Uint8Array(SLAB * SLAB * SLAB);
+const slabLight = new Uint8Array(SLAB * SLAB * SLAB);
+const sIdx = (x: number, y: number, z: number): number => ((y + 1) * SLAB + (z + 1)) * SLAB + (x + 1);
+
+/** Copy the chunk + a 1-voxel border of its neighbours into the slabs. */
+function fillSlabs(world: VoxelWorld, chunk: Chunk): void {
+  slabMats.fill(0);
+  slabLight.fill(0);
+  const x0 = chunk.cx * CS - 1;
+  const y0 = chunk.cy * CS - 1;
+  const z0 = chunk.cz * CS - 1;
+  for (let ncy = Math.floor(y0 / CS); ncy * CS <= y0 + SLAB - 1; ncy++) {
+    for (let ncz = Math.floor(z0 / CS); ncz * CS <= z0 + SLAB - 1; ncz++) {
+      for (let ncx = Math.floor(x0 / CS); ncx * CS <= x0 + SLAB - 1; ncx++) {
+        const nc = world.getChunk(ncx, ncy, ncz);
+        if (!nc) continue; // missing chunk = air + dark (zeros already)
+        const wx0 = Math.max(x0, ncx * CS);
+        const wx1 = Math.min(x0 + SLAB, (ncx + 1) * CS);
+        const wy0 = Math.max(y0, ncy * CS);
+        const wy1 = Math.min(y0 + SLAB, (ncy + 1) * CS);
+        const wz0 = Math.max(z0, ncz * CS);
+        const wz1 = Math.min(z0 + SLAB, (ncz + 1) * CS);
+        for (let wy = wy0; wy < wy1; wy++) {
+          const ly = wy - ncy * CS;
+          for (let wz = wz0; wz < wz1; wz++) {
+            const rowBase = (ly * CS + (wz - ncz * CS)) * CS;
+            const slabBase = ((wy - y0) * SLAB + (wz - z0)) * SLAB;
+            for (let wx = wx0; wx < wx1; wx++) {
+              const i = rowBase + (wx - ncx * CS);
+              const si = slabBase + (wx - x0);
+              slabMats[si] = nc.voxels[i];
+              slabLight[si] = nc.light[i];
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
 interface Face {
   n: [number, number, number];
   corners: [number, number, number][];
@@ -46,6 +96,10 @@ export function buildChunkGeometry(
   light: LightGrid,
   chunk: Chunk,
 ): THREE.BufferGeometry | null {
+  // Light values are read from the same chunk.light arrays the LightGrid
+  // samples — via the slab copy below, not per-sample calls.
+  void light;
+  fillSlabs(world, chunk);
   const positions: number[] = [];
   const normals: number[] = [];
   const colors: number[] = [];
@@ -71,11 +125,11 @@ export function buildChunkGeometry(
         const wz = baseZ + lz;
 
         for (const f of FACES) {
-          // Air cell this face looks into.
-          const ax = wx + f.n[0];
-          const ay = wy + f.n[1];
-          const az = wz + f.n[2];
-          const nm = world.get(ax, ay, az);
+          // Air cell this face looks into (slab-local coordinates).
+          const ax = lx + f.n[0];
+          const ay = ly + f.n[1];
+          const az = lz + f.n[2];
+          const nm = slabMats[sIdx(ax, ay, az)] as Mat;
           if (isSolid(nm) && !(nm === Mat.Glass && m !== Mat.Glass)) continue;
 
           // Tangent axes of this face (the two axes that aren't the normal).
@@ -102,16 +156,16 @@ export function buildChunkGeometry(
             o1[ta] = sa;
             o2[tb] = sb;
 
-            const s1 = world.solid(ax + o1[0], ay + o1[1], az + o1[2]);
-            const s2 = world.solid(ax + o2[0], ay + o2[1], az + o2[2]);
-            const sc = world.solid(ax + o1[0] + o2[0], ay + o1[1] + o2[1], az + o1[2] + o2[2]);
+            const i1 = sIdx(ax + o1[0], ay + o1[1], az + o1[2]);
+            const i2 = sIdx(ax + o2[0], ay + o2[1], az + o2[2]);
+            const ic = sIdx(ax + o1[0] + o2[0], ay + o1[1] + o2[1], az + o1[2] + o2[2]);
+            const s1 = SOLID_LUT[slabMats[i1]] === 1;
+            const s2 = SOLID_LUT[slabMats[i2]] === 1;
+            const sc = SOLID_LUT[slabMats[ic]] === 1;
 
             // Smooth light: average the 4 cells meeting at this corner.
-            const l0 = light.sample(ax, ay, az);
-            const l1 = light.sample(ax + o1[0], ay + o1[1], az + o1[2]);
-            const l2 = light.sample(ax + o2[0], ay + o2[1], az + o2[2]);
-            const l3 = light.sample(ax + o1[0] + o2[0], ay + o1[1] + o2[1], az + o1[2] + o2[2]);
-            cornerLight.push(LightGrid.normalize((l0 + l1 + l2 + l3) / 4));
+            const l0 = slabLight[sIdx(ax, ay, az)];
+            cornerLight.push(LightGrid.normalize((l0 + slabLight[i1] + slabLight[i2] + slabLight[ic]) / 4));
 
             // AO from corner solidity (fully closed corner = darkest).
             const open = s1 && s2 ? 0 : 3 - ((s1 ? 1 : 0) + (s2 ? 1 : 0) + (sc ? 1 : 0));

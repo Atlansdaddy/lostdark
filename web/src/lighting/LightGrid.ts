@@ -85,8 +85,31 @@ export class LightGrid {
     this.propagate(queue);
   }
 
+  /**
+   * ADDITIVE local flood for newly-placed emissive voxels (ward placement).
+   * Exact when the edit only adds light — replaced voxels stay opaque, so
+   * max-combine relaxation reaches the same fixpoint as a global reflood
+   * while touching ~6 chunks instead of every chunk in the world (placing a
+   * ward was re-lighting and re-meshing the entire map: ~5s on the phone).
+   * Touched chunks are marked dirty (remesh) and light-clean.
+   */
+  addLight(cells: readonly { x: number; y: number; z: number }[]): void {
+    this.staticSeeds = null; // new static emitters — reflood()'s cache is stale
+    const queue: QItem[] = [];
+    const touched = new Set<Chunk>();
+    for (const c of cells) {
+      const em = MATERIALS[this.world.get(c.x, c.y, c.z)].emission;
+      if (em > 0) this.seedAt(c.x, c.y, c.z, em, queue, touched);
+    }
+    this.propagate(queue, touched);
+    for (const c of touched) {
+      c.dirty = true;
+      c.lightDirty = false;
+    }
+  }
+
   /** Force a light level at a world voxel and queue it for propagation. */
-  private seedAt(x: number, y: number, z: number, level: number, queue: QItem[]): void {
+  private seedAt(x: number, y: number, z: number, level: number, queue: QItem[], touched?: Set<Chunk>): void {
     const c = this.world.getChunk(Math.floor(x / CS), Math.floor(y / CS), Math.floor(z / CS));
     if (!c) return;
     const lx = ((x % CS) + CS) % CS;
@@ -95,6 +118,7 @@ export class LightGrid {
     const i = Chunk.index(lx, ly, lz);
     if (level > c.light[i]) {
       c.light[i] = level;
+      touched?.add(c);
       queue.push({ x, y, z, l: level });
     }
   }
@@ -117,22 +141,22 @@ export class LightGrid {
     }
   }
 
-  private propagate(queue: QItem[]): void {
+  private propagate(queue: QItem[], touched?: Set<Chunk>): void {
     let head = 0;
     while (head < queue.length) {
       const { x, y, z, l } = queue[head++];
       if (l <= 1) continue;
       const next = l - 1;
-      this.spread(x + 1, y, z, next, queue);
-      this.spread(x - 1, y, z, next, queue);
-      this.spread(x, y + 1, z, next, queue);
-      this.spread(x, y - 1, z, next, queue);
-      this.spread(x, y, z + 1, next, queue);
-      this.spread(x, y, z - 1, next, queue);
+      this.spread(x + 1, y, z, next, queue, touched);
+      this.spread(x - 1, y, z, next, queue, touched);
+      this.spread(x, y + 1, z, next, queue, touched);
+      this.spread(x, y - 1, z, next, queue, touched);
+      this.spread(x, y, z + 1, next, queue, touched);
+      this.spread(x, y, z - 1, next, queue, touched);
     }
   }
 
-  private spread(x: number, y: number, z: number, level: number, queue: QItem[]): void {
+  private spread(x: number, y: number, z: number, level: number, queue: QItem[], touched?: Set<Chunk>): void {
     // Light only travels through open (non-opaque) space. Opaque solids stop it,
     // but their air-facing neighbours are what the mesher samples, so faces of a
     // wall next to a lit cell still read as lit.
@@ -150,6 +174,7 @@ export class LightGrid {
     const i = Chunk.index(lx, ly, lz);
     if (c.light[i] >= level) return;
     c.light[i] = level;
+    touched?.add(c);
     queue.push({ x, y, z, l: level });
   }
 

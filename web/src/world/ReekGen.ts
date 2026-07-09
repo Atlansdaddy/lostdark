@@ -114,7 +114,7 @@ function vnoise3(x: number, y: number, z: number, seed: number): number {
   return y0 + (y1 - y0) * fz;
 }
 
-function fbm3(x: number, y: number, z: number, seed: number, octaves = 2): number {
+export function fbm3(x: number, y: number, z: number, seed: number, octaves = 2): number {
   let v = 0;
   let amp = 0.55;
   let f = 1;

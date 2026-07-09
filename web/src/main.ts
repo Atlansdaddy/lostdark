@@ -32,6 +32,8 @@ import { SkyDome, cloudCoverAt } from './render/SkyDome';
 import { GodRaysPass } from './render/GodRaysPass';
 import { Camera as CameraConfig, Debug, Light as LightConfig, World } from './config';
 import { Input } from './core/Input';
+import { haptics } from './core/Haptics';
+import { mobileShell } from './core/MobileShell';
 import { LightGrid } from './lighting/LightGrid';
 import { Orb } from './orb/Orb';
 import { OrbMood } from './orb/Mood';
@@ -109,6 +111,23 @@ const WARD_DRESSING = {
 
 const app = document.querySelector<HTMLDivElement>('#app');
 const boot = document.querySelector<HTMLDivElement>('#boot');
+
+/** Update the boot overlay's status line and yield two frames so it PAINTS —
+ *  the init below otherwise blocks the main thread for seconds with no
+ *  feedback (John: "we need an initial loading on startup"). */
+function bootStatus(msg: string): Promise<void> {
+  if (boot) {
+    let el = boot.querySelector<HTMLDivElement>('.status');
+    if (!el) {
+      el = document.createElement('div');
+      el.className = 'status';
+      el.style.cssText = 'position:absolute;margin-top:52px;font-size:10px;letter-spacing:0.22em;color:#3d6a82;';
+      boot.appendChild(el);
+    }
+    el.textContent = msg;
+  }
+  return new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r())));
+}
 assert(app, 'Missing #app root');
 
 // Diagnostics overlay first — so the crash card is reachable from the global
@@ -119,7 +138,11 @@ crashSink = (err, message) => devOverlay.showCrash(err, message);
 let loopHalted = false;
 
 const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
-renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2)); // crisp without 2.5² fragment cost
+// Start conservative (DRS climbs from here). Booting at 2× on a phone means the
+// moment fullscreen reclaims the bars — a bigger viewport — frame time blows the
+// 16.6ms budget and 120Hz vsync slams to 30. Begin safe, then sharpen into any
+// headroom. See the DRS block below.
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
@@ -793,25 +816,34 @@ renderer.info.autoReset = false; // we reset per frame so counts span ALL passes
 let fpsEma = 60;
 let metricsTimer = 0;
 
-// Adaptive quality (GDD §5f graceful degradation): if fps sags, step down —
-// resolution first, volumetrics second. Reduce fidelity, never break rules.
-let qualityTier = 0; // 0 = full, 1 = lower res, 2 = no volumetrics
-let lowFpsTime = 0;
-function applyQualityTier(): void {
-  if (qualityTier === 1) {
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.3));
-  } else if (qualityTier === 2) {
-    renderer.setPixelRatio(1);
-    fogPass.enabled = false;
-    bloomPass.strength = 0.4;
-  }
+// --- Dynamic resolution scaling (DRS) ---------------------------------------
+// The S24 is powerful: it should look AMAZING and never cliff to a blurry mess.
+// So instead of a one-way "drop to potato" ratchet, we continuously scale the
+// RENDER resolution to the crispest the GPU can sustain while holding ≥60fps,
+// and spend any spare 60→120Hz headroom on MORE resolution — never on culling
+// the effects that make it beautiful. Bloom/grass/glow stay full; only pixel
+// density flexes, BOTH directions, so it self-corrects the instant load eases.
+const deviceDpr = Math.max(1, window.devicePixelRatio || 1);
+const MIN_SCALE = Math.min(deviceDpr, 1.25); // floor that still looks good — never potato
+const MAX_SCALE = Math.min(deviceDpr, 2.5); //  ceiling — crisp headroom above the old hard 2×
+let renderScale = Math.min(deviceDpr, 1.5); // matches the conservative initial setPixelRatio; DRS climbs
+let drsTimer = 0;
+// Kept only because the world/fire LOD readers still take a tier; pinned to 0
+// (full effects) because DRS — not effect-culling — governs sharpness now.
+const qualityTier = 0;
+
+function applyRenderScale(scale: number): void {
+  renderScale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, scale));
+  renderer.setPixelRatio(renderScale);
   const ratio = renderer.getPixelRatio();
-  renderer.setSize(window.innerWidth, window.innerHeight);
+  const w = window.innerWidth;
+  const h = window.innerHeight;
+  renderer.setSize(w, h);
   composer.setPixelRatio(ratio);
-  composer.setSize(window.innerWidth, window.innerHeight);
-  bloomPass.setSize(window.innerWidth, window.innerHeight);
-  depthRT.setSize(Math.floor((window.innerWidth * ratio) / 2), Math.floor((window.innerHeight * ratio) / 2));
-  logger('quality').debug(`tier ${qualityTier}`);
+  composer.setSize(w, h);
+  bloomPass.setSize(w, h);
+  depthRT.setSize(Math.floor((w * ratio) / 2), Math.floor((h * ratio) / 2));
+  logger('quality').debug(`render scale ${renderScale.toFixed(2)}×`);
 }
 
 const hud = document.createElement('div');
@@ -947,23 +979,26 @@ style.textContent = `
      a resting right thumb) with the secondary verbs grouped just up-and-left. */
   .touch-actions {
     position: fixed;
-    right: max(12px, env(safe-area-inset-right));
-    bottom: max(14px, env(safe-area-inset-bottom));
+    right: max(16px, env(safe-area-inset-right));
+    bottom: max(24px, env(safe-area-inset-bottom));
     z-index: 24;
     display: flex;
     align-items: flex-end;
-    gap: 12px;
+    gap: 16px;
     pointer-events: none;
     touch-action: none;
   }
+  /* JUMP · DASH · WARD in a row to the LEFT of PULSE (row-reverse so JUMP — the
+     most-tapped verb — sits closest to the big primary and the resting thumb). */
   .touch-secondary {
-    display: grid;
-    grid-template-columns: repeat(2, 54px);
-    gap: 10px;
+    display: flex;
+    flex-direction: row-reverse;
+    align-items: flex-end;
+    gap: 12px;
   }
   .touch-action {
-    width: 54px;
-    height: 54px;
+    width: 60px;
+    height: 60px;
     border-radius: 50%;
     display: flex;
     align-items: center;
@@ -981,9 +1016,9 @@ style.textContent = `
     touch-action: none;
   }
   .touch-action.primary {
-    width: 80px;
-    height: 80px;
-    font-size: 12px;
+    width: 88px;
+    height: 88px;
+    font-size: 13px;
     color: #eaffff;
     background: rgba(80, 216, 255, 0.24);
     border-color: rgba(159, 232, 255, 0.75);
@@ -999,7 +1034,7 @@ style.textContent = `
      it never reads as part of the player action cluster. Delete before ship. */
   .touch-dev {
     position: fixed;
-    top: calc(env(safe-area-inset-top) + 30px);
+    top: calc(env(safe-area-inset-top) + 54px);
     right: max(8px, env(safe-area-inset-right));
     z-index: 24;
     padding: 5px 9px;
@@ -2057,17 +2092,31 @@ const reekHooks = {
 
 // Generate the large initial area with full POI placement.
 logger('world').info(`generating initial ${REEK_HALF_INIT * 2}×${REEK_HALF_INIT * 2} voxel area…`);
+await bootStatus('growing the reek…');
 const reek = generateReek(world, REEK_SEED, REEK_HALF_INIT, reekHooks);
 logger('world').info(`initial area loaded — ${world.chunks.size} chunks`);
 
 // Elemental testbeds — carve the water / forge / build-sandbox stages into three
 // map corners BEFORE the light flood so their emissives (Water, Ember) light and
 // mesh with everything else. The visual systems are built from `testbeds` below.
+await bootStatus('carving the testbeds…');
 const testbeds = carveTestbeds(world);
 logger('world').info('testbeds carved (water NW · forge NE · sandbox SW)');
 
+await bootStatus('first light…');
 lightGrid.update();
-remeshDirtyChunks();
+// Meshing is the long block (~600 chunks) — do it in slices with a live
+// percentage so the loading screen moves instead of freezing.
+{
+  let dirtyTotal = 0;
+  for (const c of world.chunks.values()) if (c.dirty) dirtyTotal++;
+  let done = 0;
+  while (done < dirtyTotal) {
+    remeshDirtyChunks(36);
+    done = Math.min(dirtyTotal, done + 36);
+    await bootStatus(`shaping the world… ${Math.round((done / dirtyTotal) * 100)}%`);
+  }
+}
 
 // Sampled light volume: pack the flood-fill into a 2D atlas the terrain shader
 // can read per-fragment. Wired but OFF by default (uLightVolMix = 0) — flip it
@@ -2971,8 +3020,15 @@ function spawnWard(vx: number, vz: number, floorY: number): void {
   // Sink the glow INTO the floor (replace its top voxels) — never build a
   // platform at the orb's feet, which wedged the player inside solid ground.
   box(vx - 1, floorY, vz - 1, 3, 1, 3, Mat.Glowcap);
-  lightGrid.update();
-  remeshDirtyChunks();
+  // Localized additive flood + scoped remesh: the old global update() dirtied
+  // EVERY chunk and re-meshed the whole map (~5s per ward on the phone).
+  const wardSeeds: { x: number; y: number; z: number }[] = [];
+  for (let dz = -1; dz <= 1; dz++) {
+    for (let dx = -1; dx <= 1; dx++) wardSeeds.push({ x: vx + dx, y: floorY, z: vz + dz });
+  }
+  lightGrid.addLight(wardSeeds);
+  for (const c of world.chunks.values()) c.lightDirty = false; // no stray flags
+  remeshDirtyChunks(); // only the light-touched chunks are dirty now
 
   const dressing = WARD_DRESSING.reek; // biome hook — only The Reek exists yet
   const base = new THREE.Vector3(vx + 0.5, floorY + 1, vz + 0.5); // top of the sunk slab
@@ -3221,6 +3277,7 @@ const menu = new Menu(menuBridge);
 function startTide(): void {
   tideT = 0; // begin the timeline — onset → sustain → release
   mood.event('fear'); // heard-before-seen — the orb goes cold before you do
+  haptics.fire('tide'); // low rolling rumble — dread felt before it's seen
   objective = 'The first Dark Tide is here. Stay near held light.';
 }
 
@@ -3364,9 +3421,13 @@ function frame(): void {
     pulseRadius = 0;
     pulseCenter.copy(orb.pos);
     pulseFlash = 1; // the orb visibly surges as the wave leaves it
+    haptics.fire('pulse'); // crisp tick as the wave leaves the orb
     objective = spores >= 3 ? objective : 'Pulse through the mist. Glowspores answer your light.';
   }
-  if (!paused && actions.buildWard) placeWard();
+  if (!paused && actions.buildWard) {
+    placeWard();
+    haptics.fire('ward'); // two-beat confirm — the anchor seats
+  }
   if (!paused && actions.tide) startTide();
   // L3 / KeyV flip the camera rig; the pad routes it through here.
   if (!paused && actions.camToggle) {
@@ -3390,10 +3451,12 @@ function frame(): void {
   );
   if (orb.jumped) {
     pulseFlash = Math.max(pulseFlash, 0.55); // wave-jump = a small pulse
+    haptics.fire('jump'); // thump as the downward wave-kick launches the orb
     mood.event('effort');
   }
   if (orb.dashStarted) {
     pulseFlash = Math.max(pulseFlash, 0.7); // the dash surges the aura as it fires
+    haptics.fire('dash'); // a blink that lands hard in the thumb
     mood.event('effort');
   }
   // Landing: a quick squash — weight without weight.
@@ -4361,8 +4424,7 @@ function frame(): void {
     metricsBar.textContent =
       `${fpsEma.toFixed(0)} fps · ${(1000 / Math.max(fpsEma, 1)).toFixed(1)} ms · ` +
       `${info.calls} calls · ${(info.triangles / 1000).toFixed(0)}k tris · ` +
-      `${chunkMeshes.size} chunks · ${fogLightRegistry.length + 1} lights` +
-      (qualityTier > 0 ? ` · Q${qualityTier}` : '') +
+      `${chunkMeshes.size} chunks · ${fogLightRegistry.length + 1} lights · ${renderScale.toFixed(2)}×` +
       (showPadDebug ? ` · ${input.debugGamepadStatus()}` : '');
   }
 
@@ -4370,20 +4432,25 @@ function frame(): void {
     const info = renderer.info.render;
     metricsBar.textContent =
       `${fpsEma.toFixed(0)} fps | ${(1000 / Math.max(fpsEma, 1)).toFixed(1)} ms | ` +
-      `${(info.triangles / 1000).toFixed(0)}k tri | Q${qualityTier}` +
+      `${(info.triangles / 1000).toFixed(0)}k tri | ${renderScale.toFixed(2)}×` +
       (showPadDebug ? ` | ${input.debugGamepadStatus()}` : '');
   }
 
-  // Adaptive step-down: sustained low fps drops one tier at a time.
-  if (fpsEma < 35 && qualityTier < 2) {
-    lowFpsTime += dt;
-    if (lowFpsTime > 2.5) {
-      qualityTier++;
-      lowFpsTime = 0;
-      applyQualityTier();
-    }
-  } else {
-    lowFpsTime = Math.max(0, lowFpsTime - dt);
+  // Dynamic resolution: converge on the crispest scale that holds ≥60fps, and
+  // climb toward MAX when there's 60→120Hz headroom to spend. A hard sag (e.g.
+  // the viewport jump when fullscreen reclaims the bars) gets a BIG immediate
+  // cut checked faster, so it never sits stuck at a vsync-quantised 30; mild
+  // moves use a 58–74fps dead-band + small steps so it settles, not hunts.
+  drsTimer += dt;
+  const drsInterval = fpsEma < 50 ? 0.25 : 0.55; // react faster while badly sagging
+  if (drsTimer > drsInterval) {
+    drsTimer = 0;
+    let next = renderScale;
+    if (fpsEma < 45) next = renderScale * 0.8; //                     hard sag → big cut, recover in ~1s
+    else if (fpsEma < 58) next = renderScale - 0.1; //               mild sag → ease density down
+    else if (fpsEma > 74 && renderScale < MAX_SCALE) next = renderScale + 0.08; // spare GPU → sharpen up
+    next = Math.round(Math.max(MIN_SCALE, Math.min(MAX_SCALE, next)) * 20) / 20;
+    if (Math.abs(next - renderScale) > 0.001) applyRenderScale(next);
   }
 }
 
@@ -4559,24 +4626,15 @@ function updateCamera(dt: number): void {
 window.addEventListener('resize', () => {
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
-  if (qualityTier === 1) {
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.3));
-  } else if (qualityTier >= 2) {
-    renderer.setPixelRatio(1);
-  } else {
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-  }
-  renderer.setSize(window.innerWidth, window.innerHeight);
-  const ratio = renderer.getPixelRatio();
-  composer.setPixelRatio(ratio);
-  composer.setSize(window.innerWidth, window.innerHeight);
-  bloomPass.setSize(window.innerWidth, window.innerHeight);
-  depthRT.setSize(Math.floor((window.innerWidth * ratio) / 2), Math.floor((window.innerHeight * ratio) / 2));
+  applyRenderScale(renderScale); // keep the current DRS density; just re-fit the buffers
 });
 
 // Decide the opening beat (resume a save, or show the title) BEFORE the first
 // frame, so `paused` is correct from frame one.
 menu.boot();
+// Take the phone: hold the screen awake, and on touch reclaim the browser/OS
+// bars by going fullscreen on the first tap (no-ops on desktop + iPhone).
+mobileShell.start();
 frameLoop();
 
 // Dev console handle (GDD §8c sandbox tooling): drive the camera / fire actions
