@@ -52,6 +52,8 @@ import { FloraLibrary, type FloraName } from './world/FloraAssets';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { Menu, type MenuBridge } from './ui/Menu';
 import { Minimap } from './ui/Minimap';
+import { FolkManager } from './entity/FolkManager';
+import { AnimatorUI } from './entity/AnimatorUI';
 
 type Pickup = {
   mesh: THREE.Mesh;
@@ -409,14 +411,23 @@ function addPulseReveal(mat: THREE.MeshStandardMaterial): void {
          vec2 uv = vec2(t.x * nx + cx, t.y * nz + cz) / vec2(aw, ah);
          return texture2D(uLightAtlas, uv).a;
        }
+       // Jittered sample offsets — same anti-ring treatment as litMaterial
+       // (fixed-step binary marches paint concentric rings around any light
+       // near solid voxels). Reach unchanged: walls are 1 voxel thick, so the
+       // march must sample right up to the light or it leaks through them.
+       float marchJitter(vec3 p) {
+         return fract(sin(dot(p, vec3(12.9898, 78.233, 37.719))) * 43758.5453);
+       }
        float ptShadow(vec3 p, vec3 lp) {
          vec3 d = lp - p; float dist = length(d);
          if (dist < 1.5) return 1.0;
          vec3 dir = d / dist;
          float march = min(dist - 1.0, 14.0);
+         float j = marchJitter(p);
          for (int i = 1; i <= 14; i++) {
-           if (float(i) >= march) break;
-           if (sampleSolid(p + dir * (float(i) + 0.5)) > 0.5) return 0.0;
+           float s = float(i) + j;
+           if (s >= march) break;
+           if (sampleSolid(p + dir * s) > 0.5) return 0.0;
          }
          return 1.0;
        }
@@ -572,13 +583,39 @@ const orbHalo = new THREE.Mesh(
     side: THREE.BackSide, // only the rim, so the black face stays black
   }),
 );
-// Aura layer 2: wide soft glow sprite — the "light around the dark".
-const orbAura = new THREE.Sprite(
-  new THREE.SpriteMaterial({
-    map: null, // set after moteTexture exists below
-    color: 0x66d9ff,
+// Aura layer 2: wide soft glow billboard — the "light around the dark".
+// A custom-shader plane (not a Sprite): since the billboard is slid toward the
+// camera to clear walls, the opaque core no longer depth-occludes its centre —
+// so the shader punches a soft HOLE where the core sits (uHole, driven per
+// frame), keeping the body clean satin black with the glow only around it.
+const orbAura = new THREE.Mesh(
+  new THREE.PlaneGeometry(1, 1),
+  new THREE.ShaderMaterial({
+    uniforms: {
+      uMap: { value: null as THREE.Texture | null }, // set after moteTexture exists below
+      uColor: { value: new THREE.Color(0x66d9ff) },
+      uOpacity: { value: 0.55 },
+      uHole: { value: 0.28 }, // core apparent radius / aura half-size (per-frame)
+    },
+    vertexShader: /* glsl */ `
+      varying vec2 vUv;
+      void main() {
+        vUv = uv;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }`,
+    fragmentShader: /* glsl */ `
+      uniform sampler2D uMap;
+      uniform vec3 uColor;
+      uniform float uOpacity;
+      uniform float uHole;
+      varying vec2 vUv;
+      void main() {
+        vec4 tex = texture2D(uMap, vUv);
+        float r = length(vUv - 0.5) * 2.0; // 0 centre -> 1 edge
+        float hole = smoothstep(uHole, uHole * 1.35, r); // dark core stays dark
+        gl_FragColor = vec4(uColor * tex.rgb, tex.a * uOpacity * hole);
+      }`,
     transparent: true,
-    opacity: 0.55,
     blending: THREE.AdditiveBlending,
     depthWrite: false,
   }),
@@ -592,6 +629,10 @@ orbAura.scale.setScalar(3.4);
 orbAura.layers.set(1);
 orbHalo.layers.set(1);
 orbGroup.add(orbAura, orbHalo, orbCore);
+// Scratch for the aura's camera-pull (see the frame loop): the billboard is
+// slid toward the camera so it never sinks into a wall behind the orb.
+const auraOffset = new THREE.Vector3();
+const auraQuat = new THREE.Quaternion();
 scene.add(orbGroup);
 
 // UNIFIED FALLOFF LAW (the lighting engine rule): every point light in the game
@@ -639,8 +680,7 @@ moteCanvas.width = moteCanvas.height = 64;
   ctx.fillRect(0, 0, 64, 64);
 }
 const moteTexture = new THREE.CanvasTexture(moteCanvas);
-(orbAura.material as THREE.SpriteMaterial).map = moteTexture;
-(orbAura.material as THREE.SpriteMaterial).needsUpdate = true;
+orbAura.material.uniforms.uMap.value = moteTexture;
 
 const trailGeo = new THREE.BufferGeometry();
 trailGeo.setAttribute('position', new THREE.BufferAttribute(trailPos, 3));
@@ -1729,12 +1769,11 @@ function makeSporeTree(x: number, y: number, z: number, h: number): void {
 
 // --- Micro phosphor glows: button-caps + shelf fungi run the SAME charge
 // system as the big shrooms (orb trickle / pulse surge / slow decay / tide
-// leach) with MICRO properties: a tiny halo sprite and a short light reach.
+// leach) with MICRO properties: emissive-only glow and a short light reach.
 // One lighting engine; per-thing scale. ---
 interface MicroGlow {
   pos: THREE.Vector3;
   mat: THREE.MeshStandardMaterial; // shared clump material — the clump glows as one
-  halo: THREE.Sprite;
   baseEmissive: number; // resting "barely alive" glimmer
   charge: number;
 }
@@ -1745,24 +1784,9 @@ function registerMicroGlow(
   yOff: number,
   baseEmissive: number,
 ): void {
-  const halo = new THREE.Sprite(
-    new THREE.SpriteMaterial({
-      map: moteTexture,
-      color: mat.emissive.clone(),
-      transparent: true,
-      opacity: 0, // dark until charged
-      blending: THREE.AdditiveBlending,
-      depthWrite: false,
-    }),
-  );
-  halo.scale.setScalar(0.6); // tiny — these are button caps, not lamps
-  halo.position.y = yOff;
-  halo.layers.set(1); // effects layer, like every other glow sprite
-  g.add(halo);
   microGlows.push({
     pos: g.position.clone().add(new THREE.Vector3(0, yOff, 0)),
     mat,
-    halo,
     baseEmissive,
     charge: 0,
   });
@@ -1966,6 +1990,12 @@ function makeStrandAt(px: number, py: number, pz: number, len: number): void {
   g.position.set(px, py, pz);
   scene.add(g);
   registerFlora(g);
+  // The mycelium is fungus too — strand + spore beads run the SAME phosphor
+  // charge law as every other cap (orb trickle / pulse surge / decay / tide
+  // leach) at micro scale. Charge points sit down the strand where it actually
+  // hangs: mid-rope for the filament, near the tip where the beads cluster.
+  registerMicroGlow(g, strandMat, -len * 0.55, 0.05);
+  registerMicroGlow(g, beadMat, -len * 0.85, 0.1);
 
   const rope: StrandRope = {
     group: g,
@@ -2196,6 +2226,34 @@ minimap.setMarkers([
   { x: reek.spawn[0], z: reek.spawn[2], icon: '✦', label: 'Spawn', color: '#7fffd1' },
 ]);
 
+// --- Mushroom folk: the Reek's own people. Meshy-rigged GLBs (assets/folk)
+// driven by the channel rig in entity/ — spawned in an arc at the spawn point
+// so they're the first living things the orb meets. K opens the Animator UI
+// (pose/keyframe/export), M cycles their STILL/WALK/MOVE/ATTACK toggle.
+// The orb's DASH and the sandbox FORCE WAVE damage them (see frame loop +
+// onForceWave below); their attacks shove the orb but never kill it.
+const folk = new FolkManager({
+  scene,
+  solid: (x, y, z) => world.solid(x, y, z),
+  moteTexture,
+  getOrbPos: () => orb.pos,
+  onOrbHit: (from, power) => {
+    const dir = orb.pos.clone().sub(from).setY(0).normalize();
+    orb.vel.x += dir.x * power;
+    orb.vel.z += dir.z * power;
+    orb.vel.y += power * 0.35;
+    pulseFlash = Math.max(pulseFlash, 0.5); // the aura flinches
+    mood.event('effort');
+  },
+});
+const animatorUI = new AnimatorUI(folk, () => orb.pos);
+void folk.load().then(() => {
+  folk.spawnAll(
+    new THREE.Vector3(reek.spawn[0] + 4.5, reek.spawn[1], reek.spawn[2] - 2),
+    new THREE.Vector3(reek.spawn[0], reek.spawn[1], reek.spawn[2]),
+  );
+});
+
 const buildSandbox = new BuildSandbox({
   scene,
   world,
@@ -2210,7 +2268,10 @@ const buildSandbox = new BuildSandbox({
     for (const [x, y, z, m] of edits) world.set(x, y, z, m);
     remeshDirtyChunks();
   },
-  onForceWave: (origin) => waterZone.splash(origin),
+  onForceWave: (origin) => {
+    waterZone.splash(origin);
+    folk.applyForceWave(origin); // the wave shoves + hurts the mushroom folk
+  },
 });
 
 // Dark-game surface pass over every flora material:
@@ -2343,22 +2404,6 @@ interface SwayProp {
   lvz: number;
 }
 const swayProps: SwayProp[] = [];
-
-// Glow halos for imported phosphorescent shrooms — the additive "volumetric"
-// emission read. Its size/opacity EASE toward the charge (no snap) and breathe
-// gently, so it reads as a soft living glow instead of a popping billboard.
-const phosphorHalos: { sprite: THREE.Sprite; shroom: Shroom; base: number; cur: number }[] = [];
-function updatePhosphorHalos(dt: number, time: number): void {
-  const k = Math.min(1, dt * 3.5); // ease rate toward the target charge
-  for (const h of phosphorHalos) {
-    if (!h.sprite.parent?.visible) continue; // culled shroom → skip
-    h.cur += (h.shroom.charge - h.cur) * k;
-    const breathe = 1 + Math.sin(time * 1.1 + h.base * 3.1) * 0.07;
-    const mat = h.sprite.material as THREE.SpriteMaterial;
-    mat.opacity = Math.min(0.5, h.cur * 0.55); // softer than before
-    h.sprite.scale.setScalar(h.base * (0.7 + h.cur * 1.2) * breathe);
-  }
-}
 
 // --- Imported-mushroom rig -------------------------------------------------
 // A single GLTF mushroom is one mesh, so to move cap and stalk on separate axes
@@ -2501,9 +2546,7 @@ interface PlaceOpts {
   tint?: THREE.Color;
 }
 // Which imported props are fungi — these enlist in the phosphorescence loop.
-const MUSHROOM_KINDS = new Set<FloraName>([
-  'mushroom_01', 'mushroom_02', 'bigshroom_01', 'bigshroom_02', 'bigshroom_03',
-]);
+const MUSHROOM_KINDS = new Set<FloraName>(['mushroom_01', 'mushroom_02']);
 
 /** The shroom's own dominant colour, sampled from its base texture — saturation-
  *  weighted so the vivid cap wins over pale spots/stalk, then normalised to a
@@ -2577,7 +2620,7 @@ function registerImportedPhosphor(group: THREE.Group, x: number, z: number, capY
     m.needsUpdate = true; // adding the emissive map needs a shader recompile
   }
   // Emission COLOUR = the tint if given, else the shroom's OWN dominant texture
-  // colour, so it casts light + a halo in that colour (blue shroom → blue light).
+  // colour, so it casts light in that colour (blue shroom → blue light).
   const primaryMap = mats.find((m) => m.map)?.map ?? null;
   const texCol = primaryMap ? dominantTextureColor(primaryMap) : null;
   const emitColor =
@@ -2596,24 +2639,6 @@ function registerImportedPhosphor(group: THREE.Group, x: number, z: number, capY
     charge: 0.15, // a faint residual charge at world-start, like native caps
   };
   shrooms.push(s);
-  // Additive glow halo — the "volumetric" emission read (the raymarched fog pass
-  // is off by design). A soft camera-facing sprite at the cap that swells and
-  // brightens with charge (driven in updatePhosphorHalos each frame).
-  const haloLocalY = capY - group.position.y;
-  const halo = new THREE.Sprite(
-    new THREE.SpriteMaterial({
-      map: moteTexture,
-      color: emitColor.clone(),
-      transparent: true,
-      opacity: 0,
-      blending: THREE.AdditiveBlending,
-      depthWrite: false,
-    }),
-  );
-  halo.position.set(0, haloLocalY, 0);
-  halo.layers.set(1); // effects layer — skipped by the depth prepass
-  group.add(halo);
-  phosphorHalos.push({ sprite: halo, shroom: s, base: Math.max(1.6, haloLocalY * 0.9), cur: 0 });
 }
 
 function placeImported(
@@ -2719,16 +2744,6 @@ function placeTreeCluster(x: number, z: number, h: number, seed: number): void {
     const kind = kinds[Math.floor(frand(seed + i * 5.7) * kinds.length)];
     const collide = kind.startsWith('rock') || kind.startsWith('bush');
     placeImported(kind, x + Math.cos(ang) * rad, z + Math.sin(ang) * rad, { collide });
-  }
-  // Occasional BIG phosphorescent toadstool at the cluster edge (charges + glows
-  // through the same loop as the native glowcaps).
-  if (frand(seed + 71) < 0.4) {
-    const ba = frand(seed + 79) * Math.PI * 2;
-    const br = 2.4 + frand(seed + 83) * 2.2;
-    const bk = (['bigshroom_01', 'bigshroom_02', 'bigshroom_03'] as FloraName[])[
-      Math.floor(frand(seed + 89) * 3)
-    ];
-    placeImported(bk, x + Math.cos(ba) * br, z + Math.sin(ba) * br, { collide: true, brushR: 2 });
   }
 }
 
@@ -2878,7 +2893,10 @@ function addPickup(x: number, y: number, z: number): void {
   const mesh = new THREE.Mesh(
     new THREE.IcosahedronGeometry(0.38, 1),
     new THREE.MeshBasicMaterial({
-      color: 0x8dffd2,
+      // Mint glow held UNDER the bloom threshold (0.62): at full 0x8dffd2 the
+      // bloom pass drew a soft halo around every spore — same unnatural read
+      // as the removed shroom halos. Dimmer body, same hue, zero corona.
+      color: new THREE.Color(0x8dffd2).multiplyScalar(0.55),
       transparent: true,
       opacity: 0.88,
     }),
@@ -2992,12 +3010,14 @@ function makeWardDomeMaterial(color: number): THREE.ShaderMaterial {
       varying vec3 vWorld;
       varying vec3 vNormalW;
       void main() {
+        // Fresnel rim ONLY — no spatial pattern on the shell. Any repeating
+        // bands (the old sin(worldY) ripple) project as concentric rings on
+        // the ground from the top-down camera. Liveliness comes from the
+        // temporal flicker already driven through uStrength.
         vec3 V = normalize(cameraPosition - vWorld);
         float facing = abs(dot(normalize(vNormalW), V));
         float rim = pow(1.0 - facing, 2.0);
-        // ripple bands sliding down the shell — the tide breaking on it
-        float band = 0.8 + 0.2 * sin(vWorld.y * 2.6 - uTime * 5.0);
-        float a = uStrength * band * (0.08 + 0.92 * rim);
+        float a = uStrength * (0.05 + 0.95 * rim);
         gl_FragColor = vec4(uColor * (0.35 + 0.65 * rim), a);
       }`,
     transparent: true,
@@ -3459,6 +3479,9 @@ function frame(): void {
     haptics.fire('dash'); // a blink that lands hard in the thumb
     mood.event('effort');
   }
+  // The folk live in the same frame: animation, combat, projectiles. The dash
+  // flags make the orb's blink-burst a weapon against them.
+  folk.update(dt, camera, { paused, dashing: orb.dashing, dashStarted: orb.dashStarted });
   // Landing: a quick squash — weight without weight.
   if (!wasGrounded && orb.grounded) landSquash = 1;
   wasGrounded = orb.grounded;
@@ -3482,10 +3505,28 @@ function frame(): void {
   const haloMat = orbHalo.material as THREE.MeshBasicMaterial;
   haloMat.color.copy(mood.color);
   haloMat.opacity = 0.3 * orb.breathGlow * flashBoost * mood.brightness;
-  const auraMat = orbAura.material as THREE.SpriteMaterial;
-  auraMat.color.copy(mood.color);
-  auraMat.opacity = 0.55 * orb.breathGlow * mood.brightness;
-  orbAura.scale.setScalar(3.4 * orb.breathGlow * flashBoost);
+  const auraU = orbAura.material.uniforms;
+  (auraU.uColor.value as THREE.Color).copy(mood.color);
+  auraU.uOpacity.value = 0.55 * orb.breathGlow * mood.brightness;
+  // Pull the aura toward the camera: the flat billboard otherwise sinks into
+  // any wall behind the orb and the depth test slices a straight edge through
+  // the glow. Sliding it up the view ray (scale-compensated, so the on-screen
+  // size is unchanged) keeps its depth clear of the wall while real occluders
+  // between camera and orb still hide it.
+  const camDist = camera.position.distanceTo(orb.pos);
+  const auraPull = Math.min(1.3, Math.max(0, camDist - 1.5));
+  auraOffset.copy(camera.position).sub(orb.pos).normalize().multiplyScalar(auraPull);
+  auraOffset.applyQuaternion(auraQuat.copy(orbGroup.quaternion).invert());
+  orbAura.position.copy(auraOffset);
+  // Billboard: cancel the parent's lean, then face the camera (a plane, unlike
+  // a Sprite, doesn't auto-face).
+  orbAura.quaternion.copy(auraQuat).multiply(camera.quaternion);
+  const auraScale = 3.4 * orb.breathGlow * flashBoost;
+  orbAura.scale.setScalar(auraScale * ((camDist - auraPull) / Math.max(camDist, 1e-3)));
+  // The hole tracks the core's APPARENT size inside the pulled billboard. The
+  // perspective compensation cancels out of the ratio, so it only depends on
+  // the aura's own breathing: hole = coreR / auraHalf, padded slightly.
+  auraU.uHole.value = (ORB_HALO_RADIUS * 0.9) / (auraScale * 0.5);
   orbLight.position.copy(orb.pos);
   orbLight.color.copy(mood.color);
   // Physical 1/d² falloff eats light fast, so the base is higher — brightness at
@@ -3546,7 +3587,7 @@ function frame(): void {
   const orbTideBoost = 1 + 0.25 * tidePress;
   orbLight.intensity *= orbTideBoost;
   (orbHalo.material as THREE.MeshBasicMaterial).opacity *= orbTideBoost;
-  (orbAura.material as THREE.SpriteMaterial).opacity *= orbTideBoost;
+  orbAura.material.uniforms.uOpacity.value *= orbTideBoost;
 
   if (tideActive) {
     mood.setThreat(tidePress); // sustained dread rides the darkness
@@ -3619,7 +3660,7 @@ function frame(): void {
 
   // Micro phosphor caps (buttons + shelf fungi): the SAME charge law as the big
   // shrooms — orb trickle, pulse surge, slow decay, faster leach under the tide —
-  // at micro scale: a tiny halo blooms with the charge, never a lamp.
+  // at micro scale: the cap material itself brightens with the charge, never a lamp.
   for (const m of microGlows) {
     const md = m.pos.distanceTo(orb.pos);
     if (md < 6) m.charge += dt * 0.5 * (1 - md / 6);
@@ -3630,9 +3671,6 @@ function frame(): void {
     if (m.charge > 1) m.charge = 1;
     m.charge *= Math.exp((-dt / 26) * (1 + 5 * tidePress));
     m.mat.emissiveIntensity = m.baseEmissive + m.charge * 1.15;
-    const hm = m.halo.material as THREE.SpriteMaterial;
-    hm.opacity = m.charge * 0.38;
-    m.halo.scale.setScalar(0.5 + 0.55 * m.charge);
   }
 
   // Feed the charged glow sources NEAREST the orb to the shader as real point
@@ -4389,7 +4427,6 @@ function frame(): void {
   }
   updateFloraCulling();
   updateSwayProps(dt); // imported trees lean from the orb + shudder on the pulse
-  updatePhosphorHalos(dt, clock.elapsedTime); // charged imported shrooms swell their glow
   // (dynamic light-volume re-flood removed — it repacked the whole atlas ~3×/s
   //  and spiked frames = the stutter. Solidity for shadows is static, built once
   //  at load; dynamic sources come back as real shader lights, not a repack.)
@@ -4670,6 +4707,8 @@ frameLoop();
   testbeds, // dev: inspect carved zone metadata
   waterZone, // dev: live-tune the water shader uniforms + flipFish()
   fireZone, // dev: inspect the hearth
+  folk, // dev: mushroom folk — folk.setMode('attack'), folk.folk[0].damage(…), folk.clips()
+  animator: animatorUI, // dev: the K panel — animator.toggle() from the console
   minimap, // dev: map prefs/markers from the console
   read: () => ({
     orb: orb.pos.toArray(),

@@ -233,15 +233,24 @@ export class WaterZone {
       }
       // A wall of land between the water surface and a light blocks it — kills
       // the unoccluded radius discs the orb/crystal/wards drew on the water.
+      // Jittered sample offsets — same anti-ring treatment as litMaterial
+      // (fixed-step binary marches paint concentric rings around any light
+      // near solid voxels). Reach unchanged: walls are 1 voxel thick, so the
+      // march must sample right up to the light or it leaks through them.
+      float marchJitter(vec3 p) {
+        return fract(sin(dot(p, vec3(12.9898, 78.233, 37.719))) * 43758.5453);
+      }
       float ptShadow(vec3 p, vec3 lp) {
         vec3 d = lp - p;
         float dist = length(d);
         if (dist < 1.5) return 1.0;
         vec3 dir = d / dist;
         float march = min(dist - 1.0, 12.0);
+        float j = marchJitter(p);
         for (int i = 1; i <= 12; i++) {
-          if (float(i) >= march) break;
-          if (sampleSolid(p + dir * (float(i) + 0.5)) > 0.5) return 0.0;
+          float s = float(i) + j;
+          if (s >= march) break;
+          if (sampleSolid(p + dir * s) > 0.5) return 0.0;
         }
         return 1.0;
       }

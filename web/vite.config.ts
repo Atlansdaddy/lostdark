@@ -1,8 +1,10 @@
+import { fileURLToPath } from 'node:url';
 import { defineConfig } from 'vite';
 
 // wAIver dev/build config. Kept intentionally lean — one codebase, PC→phone.
 // (This is the ONLY vite config; a stray vite.config.mjs used to shadow it and
-//  bind localhost-only, which broke phone/LAN testing. Don't reintroduce one.)
+//  bind localhost-only, which broke phone/LAN testing. Don't reintroduce one —
+//  the studio build input the PC added there lives HERE now.)
 export default defineConfig({
   resolve: {
     // three/examples/jsm can drag in a second copy of three; one instance only.
@@ -20,5 +22,12 @@ export default defineConfig({
   build: {
     target: 'es2022',
     sourcemap: true,
+    rollupOptions: {
+      input: {
+        // Two separate apps: the game, and the Animator Studio tool page.
+        main: fileURLToPath(new URL('./index.html', import.meta.url)),
+        studio: fileURLToPath(new URL('./studio.html', import.meta.url)),
+      },
+    },
   },
 });
