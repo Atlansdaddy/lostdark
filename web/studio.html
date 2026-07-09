@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#0a0c10" />
+    <title>wAIver — Animator Studio</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --panel: rgba(12, 16, 22, 0.92);
+        --edge: #1d2733;
+        --ink: #b8ccd8;
+        --dim: #5c707e;
+        --hot: #7fe3ff;
+        --warn: #ffb36b;
+      }
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: #0a0c10;
+        color: var(--ink);
+        font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+        font-size: 12px;
+        user-select: none;
+      }
+      #app {
+        position: fixed;
+        inset: 0;
+      }
+      canvas {
+        display: block;
+      }
+      .panel {
+        position: fixed;
+        background: var(--panel);
+        border: 1px solid var(--edge);
+        border-radius: 6px;
+        padding: 8px;
+        overflow-y: auto;
+        backdrop-filter: blur(4px);
+      }
+      #pose {
+        left: 10px;
+        top: 10px;
+        bottom: 86px;
+        width: 250px;
+      }
+      #rig {
+        right: 10px;
+        top: 10px;
+        bottom: 86px;
+        width: 250px;
+      }
+      #transport {
+        left: 10px;
+        right: 10px;
+        bottom: 10px;
+        height: 68px;
+        overflow: hidden;
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        flex-wrap: wrap;
+      }
+      h3 {
+        color: var(--hot);
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.14em;
+        margin: 10px 0 4px;
+      }
+      h3:first-child {
+        margin-top: 0;
+      }
+      .row {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        margin: 2px 0;
+      }
+      .row label {
+        flex: 0 0 96px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        color: var(--dim);
+        cursor: pointer;
+      }
+      .row input[type='range'] {
+        flex: 1;
+        accent-color: #3fa8c8;
+        min-width: 0;
+      }
+      .row .val {
+        flex: 0 0 40px;
+        text-align: right;
+        color: var(--ink);
+      }
+      .row.keyed .val {
+        color: var(--warn);
+      }
+      button,
+      select,
+      input[type='text'],
+      input[type='number'] {
+        background: #131a22;
+        color: var(--ink);
+        border: 1px solid var(--edge);
+        border-radius: 4px;
+        padding: 3px 8px;
+        font: inherit;
+        cursor: pointer;
+      }
+      button:hover {
+        border-color: var(--hot);
+        color: var(--hot);
+      }
+      select {
+        max-width: 130px;
+      }
+      .bone {
+        color: var(--dim);
+        cursor: pointer;
+        padding: 1px 4px;
+        border-radius: 3px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .bone:hover {
+        color: var(--hot);
+        background: #131a22;
+      }
+      .slot-missing {
+        color: var(--warn);
+      }
+      #drop {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        align-items: center;
+        justify-content: center;
+        color: var(--hot);
+        letter-spacing: 0.25em;
+        text-transform: uppercase;
+        pointer-events: none;
+        text-align: center;
+      }
+      #drop small {
+        color: var(--dim);
+        letter-spacing: 0.1em;
+        text-transform: none;
+      }
+      #timeline {
+        flex: 1 1 240px;
+        accent-color: #3fa8c8;
+      }
+      .tname {
+        color: var(--dim);
+      }
+      #tracks .row label {
+        flex-basis: 150px;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app"></div>
+    <div id="drop">
+      <div>Animator Studio</div>
+      <small>drop a rigged .glb here — or use Load GLB</small>
+    </div>
+    <script type="module" src="/src/studio/main.ts"></script>
+  </body>
+</html>

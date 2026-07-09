@@ -24,9 +24,6 @@ export const FLORA_MANIFEST = {
   tree_02: 'tree_02.glb', // dead/bare tree — reads well in The Reek
   mushroom_01: 'mushroom_01.glb',
   mushroom_02: 'mushroom_02.glb', // Laetiporus shelf fungus
-  bigshroom_01: 'bigshroom_01.glb', // large toadstool
-  bigshroom_02: 'bigshroom_02.glb',
-  bigshroom_03: 'bigshroom_03.glb',
   meshy_glowshroom: 'meshy_glowshroom.glb', // Meshy-generated giant glowing toadstool
   meshy_glowshroom_02: 'meshy_glowshroom_02.glb', // cluster of small blue glowcaps
   meshy_glowshroom_03: 'meshy_glowshroom_03.glb', // tall violet amanita
@@ -99,9 +96,6 @@ const DEFAULT_HEIGHT: Record<FloraName, number> = {
   tree_02: 8,
   mushroom_01: 1.4,
   mushroom_02: 1.1,
-  bigshroom_01: 3.6,
-  bigshroom_02: 3.0,
-  bigshroom_03: 2.6,
   meshy_glowshroom: 4.2, // giant — the generated hero toadstool
   meshy_glowshroom_02: 1.8, // low cluster
   meshy_glowshroom_03: 3.4, // tall amanita

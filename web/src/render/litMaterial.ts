@@ -208,18 +208,33 @@ export function createLitMaterial(): { material: THREE.ShaderMaterial; uniforms:
         return texture2D(uLightAtlas, uv).a;
       }
 
+      // Per-fragment dither for the shadow march (defined before its callers —
+      // GLSL has no hoisting). Without it every fragment samples at the SAME
+      // fixed offsets, so when a light sits within a step of solid voxels the
+      // samples slide past the solid in lockstep with receiver distance and
+      // whole annuli flip shadowed/lit — the concentric-ring artifact. World-
+      // space hash → the grain is stable, not swimming.
+      float marchJitter(vec3 p) {
+        return fract(sin(dot(p, vec3(12.9898, 78.233, 37.719))) * 43758.5453);
+      }
+
       // Real shadow from the orb: march the world from this surface toward the
       // orb; if a solid voxel blocks the way, the surface is in shadow. Only
       // marches within the lit bubble, so it costs nothing in the dark.
+      // Same reach as always (walls are 1 voxel thick — stopping short of the
+      // light leaks light straight through an adjacent wall); ONLY the sample
+      // offsets are jittered, which is what dissolves the ring banding.
       float orbShadow(vec3 p) {
         vec3 d = uOrbPos - p;
         float dist = length(d);
         if (dist < 1.5) return 1.0;
         vec3 dir = d / dist;
         float march = min(dist - 1.0, 16.0);
+        float j = marchJitter(p);
         for (int i = 1; i <= 16; i++) {
-          if (float(i) >= march) break;
-          if (sampleSolid(p + dir * (float(i) + 0.5)) > 0.5) return 0.0;
+          float s = float(i) + j;
+          if (s >= march) break;
+          if (sampleSolid(p + dir * s) > 0.5) return 0.0;
         }
         return 1.0;
       }
@@ -233,9 +248,11 @@ export function createLitMaterial(): { material: THREE.ShaderMaterial; uniforms:
         if (dist < 1.5) return 1.0;
         vec3 dir = d / dist;
         float march = min(dist - 1.0, 14.0);
+        float j = marchJitter(p);
         for (int i = 1; i <= 14; i++) {
-          if (float(i) >= march) break;
-          if (sampleSolid(p + dir * (float(i) + 0.5)) > 0.5) return 0.0;
+          float s = float(i) + j;
+          if (s >= march) break;
+          if (sampleSolid(p + dir * s) > 0.5) return 0.0;
         }
         return 1.0;
       }
