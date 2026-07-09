@@ -3370,6 +3370,37 @@ function updateHud(): void {
 
 /** Set by window.waiver.throwTest() to fault the next N frames on purpose. */
 let throwNextFrames = 0;
+// --- World border: "the darkness here is impenetrable" (John) ---------------
+// Early-build soft wall at the rim cliffs: within EDGE_SOFT of the border the
+// dark presses the orb back toward the valley and a whisper explains why.
+const EDGE_SOFT = 10; // voxels inside ±REEK_HALF_INIT where the press begins
+const edgeWhisper = document.createElement('div');
+edgeWhisper.style.cssText =
+  'position:fixed;left:50%;top:22%;transform:translateX(-50%);z-index:30;color:#6e86a8;' +
+  'font:12px ui-monospace,Menlo,monospace;letter-spacing:0.3em;text-transform:uppercase;' +
+  'opacity:0;transition:opacity 0.6s;pointer-events:none;text-shadow:0 0 14px #000;';
+edgeWhisper.textContent = 'the darkness here is impenetrable';
+document.body.appendChild(edgeWhisper);
+let edgeWhisperT = 0;
+
+function worldBorder(dt: number): void {
+  const limit = REEK_HALF_INIT - EDGE_SOFT;
+  const ox = Math.abs(orb.pos.x) - limit;
+  const oz = Math.abs(orb.pos.z) - limit;
+  const over = Math.max(ox, oz);
+  if (over > 0) {
+    // Quadratic press back toward the center — firm at the wall, gentle at the
+    // fringe; the dark turns you around, it never bonks you.
+    const t = Math.min(1, over / EDGE_SOFT);
+    const press = 30 * t * t * dt;
+    if (ox > 0) orb.vel.x -= Math.sign(orb.pos.x) * press * (ox >= oz ? 1 : 0.4);
+    if (oz > 0) orb.vel.z -= Math.sign(orb.pos.z) * press * (oz >= ox ? 1 : 0.4);
+    edgeWhisperT = 2.2;
+  }
+  edgeWhisperT = Math.max(0, edgeWhisperT - dt);
+  edgeWhisper.style.opacity = edgeWhisperT > 0 ? '1' : '0';
+}
+
 function frame(): void {
   if (throwNextFrames > 0) {
     throwNextFrames--;
@@ -3377,6 +3408,7 @@ function frame(): void {
   }
   const dt = Math.min(0.05, clock.getDelta());
   input.update(dt); // poll gamepad + decay wheel impulses
+  worldBorder(dt);
 
   // Render distance + frustum culling. The world is dark — beyond the orb's lit
   // bubble everything is black — so we only draw chunks whose nearest point is
