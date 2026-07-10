@@ -40,11 +40,15 @@ export const Survival = {
 /** Orb movement — hover-glide + wave-jump (GDD §5h, SPEC §5). Not flight:
  *  the orb rides a hover spring above the ground; height is earned per-jump. */
 export const Move = {
-  accel: 72, // how hard we chase the target velocity (snappy but not harsh)
-  maxSpeed: 16.5, // horizontal glide speed (John: 25% calmer)
+  // World-scale retune (John, R25): with a multi-km world the orb must feel
+  // SMALL in it — glide dropped to 1/3, sprint to 1/2 of the demo-era values
+  // (16.5/22). Travel time IS the world size. Dash kept at absolute reach —
+  // it reads as a bigger commitment now, which suits its cost.
+  accel: 26, // scaled with maxSpeed so the chase feel (accel/speed) is unchanged
+  maxSpeed: 5.5, // horizontal glide speed (was 16.5)
   damping: 5, // velocity decay when no input (the "glide"/drift tail)
   // Sprint = HOLD to cruise faster, paid per-second in energy.
-  sprintSpeed: 22,
+  sprintSpeed: 11, // (was 22)
   sprintCostPerSec: 6, // energy drain while sprinting — speed stays a spend
   // Dash = a dedicated blink-burst on TAP, distinct from sprint. Works on the
   // ground and in the air; air dashes are limited and refresh on landing.
