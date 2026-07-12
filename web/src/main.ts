@@ -858,6 +858,47 @@ renderer.info.autoReset = false; // we reset per frame so counts span ALL passes
 let fpsEma = 60;
 let metricsTimer = 0;
 
+// --- Full debug overlay (John): per-system frame timings + world counters.
+// Toggle by TAPPING the metrics bar (phone) or F4 (desktop).
+const perfEma: Record<string, number> = {};
+let lastFrameMs = 0;
+function perfMark(name: string, ms: number): void {
+  perfEma[name] = (perfEma[name] ?? ms) * 0.9 + ms * 0.1;
+}
+const perfDiv = document.createElement('div');
+perfDiv.style.cssText =
+  'position:fixed;left:8px;bottom:8px;z-index:60;display:none;color:#9fd6ff;font:10px/1.5 ui-monospace,Menlo,monospace;' +
+  'background:#060a10d8;padding:8px 10px;border-radius:8px;pointer-events:none;white-space:pre;max-width:92vw;';
+document.body.appendChild(perfDiv);
+let perfOn = false;
+function togglePerf(): void {
+  perfOn = !perfOn;
+  perfDiv.style.display = perfOn ? 'block' : 'none';
+}
+metricsBar.style.pointerEvents = 'auto';
+metricsBar.addEventListener('click', togglePerf);
+window.addEventListener('keydown', (e) => {
+  if (e.code === 'F4') togglePerf();
+});
+let perfDivTimer = 0;
+function updatePerfDiv(dt: number): void {
+  perfDivTimer += dt;
+  if (!perfOn || perfDivTimer < 0.33) return;
+  perfDivTimer = 0;
+  const f = (k: string): string => (perfEma[k] ?? 0).toFixed(1).padStart(5);
+  const known =
+    (perfEma.stream ?? 0) + (perfEma.mesh ?? 0) + (perfEma.flora ?? 0) + (perfEma.folk ?? 0) + (perfEma.sway ?? 0) + (perfEma.render ?? 0);
+  const heap = (performance as unknown as { memory?: { usedJSHeapSize: number } }).memory;
+  perfDiv.textContent =
+    `frame ${lastFrameMs.toFixed(1)}ms  (${(1000 / Math.max(lastFrameMs, 0.01)).toFixed(0)}fps)\n` +
+    `stream ${f('stream')}  mesh ${f('mesh')}  flora ${f('flora')}\n` +
+    `folk   ${f('folk')}  sway ${f('sway')}  render ${f('render')}\n` +
+    `other  ${(Math.max(0, lastFrameMs - known)).toFixed(1).padStart(5)}  draws ${renderer.info.render.calls}  tris ${(renderer.info.render.triangles / 1000).toFixed(0)}k\n` +
+    `chunks ${world.chunks.size}  meshes ${chunkMeshes.size}  flora ${importedFlora.length}  sway ${swayProps.length}\n` +
+    `groveQ ${pendingGroves.length}  treeQ ${pendingTrees.length}  fogL ${fogLightRegistry.length}` +
+    (heap ? `  heap ${(heap.usedJSHeapSize / 1048576).toFixed(0)}MB` : '');
+}
+
 // --- Dynamic resolution scaling (DRS) ---------------------------------------
 // The S24 is powerful: it should look AMAZING and never cliff to a blurry mess.
 // So instead of a one-way "drop to potato" ratchet, we continuously scale the
@@ -2095,6 +2136,7 @@ const MAP_MODE = new URLSearchParams(location.search).get('world') === 'map';
 let worldGen: WorldGen | null = null;
 let worldStream: WorldStream | null = null;
 let streamTick = 0;
+let floraCullIdx = 0;
 /** MAP_MODE ocean: one translucent plane at sea level following the orb (the
  *  demo's WaterZone is testbed-specific; the real sea shader comes later). */
 let seaPlane: THREE.Mesh | null = null;
@@ -3575,6 +3617,7 @@ function worldBorder(dt: number): void {
 }
 
 function frame(): void {
+  updatePerfDiv(1 / 60);
   if (throwNextFrames > 0) {
     throwNextFrames--;
     throw new Error('waiver.throwTest(): synthetic frame error');
@@ -3587,13 +3630,33 @@ function frame(): void {
   // ready (1 chunk/frame keeps the hitch under the frame), and periodically
   // drop far columns (disposing their meshes).
   if (worldStream) {
-    worldStream.update(orb.pos.x, orb.pos.z, 4);
-    remeshDirtyChunks(1);
+    let t0 = performance.now();
+    worldStream.update(orb.pos.x, orb.pos.z, 3);
+    perfMark('stream', performance.now() - t0);
+    // MESH THROTTLE: one chunk costs ~8-15ms on the phone — meshing every
+    // frame was the 21ms-frame crawl. Mesh only when the last frame had
+    // headroom, or on every 4th frame so the world never stops appearing.
+    t0 = performance.now();
+    if (lastFrameMs < 15 || (streamTick & 3) === 0) remeshDirtyChunks(1);
+    perfMark('mesh', performance.now() - t0);
     // live flora: streamed columns queue groves/trees — build a few per frame
-    if (floraReady) {
-      for (let i = 0; i < 2 && pendingTrees.length; i++) buildTreeAt(pendingTrees.pop()!);
-      for (let i = 0; i < 3 && pendingGroves.length; i++) buildGroveAt(pendingGroves.pop()!);
+    // (also headroom-gated: tree clusters are the priciest single build)
+    t0 = performance.now();
+    if (floraReady && (lastFrameMs < 15 || (streamTick & 7) === 0)) {
+      if (pendingTrees.length) buildTreeAt(pendingTrees.pop()!);
+      for (let i = 0; i < 2 && pendingGroves.length; i++) buildGroveAt(pendingGroves.pop()!);
     }
+    // FLORA DISTANCE CULLING: imported props are individual scene meshes and
+    // grow forever while roaming — stagger-cull a slice per frame so far
+    // groves stop drawing (and stop swaying: updateSwayProps skips invisible).
+    for (let i = 0; i < 48 && importedFlora.length > 0; i++) {
+      floraCullIdx = (floraCullIdx + 1) % importedFlora.length;
+      const g = importedFlora[floraCullIdx];
+      const fdx = g.position.x - orb.pos.x;
+      const fdz = g.position.z - orb.pos.z;
+      g.visible = fdx * fdx + fdz * fdz < RENDER_RADIUS2;
+    }
+    perfMark('flora', performance.now() - t0);
     if ((streamTick++ & 63) === 0) {
       for (const c of worldStream.unload(orb.pos.x, orb.pos.z)) {
         const m = chunkMeshes.get(c);
@@ -3710,7 +3773,11 @@ function frame(): void {
   }
   // The folk live in the same frame: animation, combat, projectiles. The dash
   // flags make the orb's blink-burst a weapon against them.
-  folk.update(dt, camera, { paused, dashing: orb.dashing, dashStarted: orb.dashStarted });
+  {
+    const _t = performance.now();
+    folk.update(dt, camera, { paused, dashing: orb.dashing, dashStarted: orb.dashStarted });
+    perfMark('folk', performance.now() - _t);
+  }
   // Landing: a quick squash — weight without weight.
   if (!wasGrounded && orb.grounded) landSquash = 1;
   wasGrounded = orb.grounded;
@@ -4657,7 +4724,11 @@ function frame(): void {
     }
   }
   updateFloraCulling();
-  updateSwayProps(dt); // imported trees lean from the orb + shudder on the pulse
+  {
+    const _t = performance.now();
+    updateSwayProps(dt); // imported trees lean from the orb + shudder on the pulse
+    perfMark('sway', performance.now() - _t);
+  }
   // (dynamic light-volume re-flood removed — it repacked the whole atlas ~3×/s
   //  and spiked frames = the stutter. Solidity for shadows is static, built once
   //  at load; dynamic sources come back as real shader lights, not a repack.)
@@ -4679,7 +4750,11 @@ function frame(): void {
   // non-terrain objects live on higher layers — the prepass narrows to layer 0
   // and this restores it, so it must run whether or not the prepass did).
   camera.layers.enableAll();
-  composer.render();
+  {
+    const _t = performance.now();
+    composer.render();
+    perfMark('render', performance.now() - _t);
+  }
 
   // Metrics strip (throttled to 4 Hz so it doesn't churn the DOM).
   fpsEma += (1 / Math.max(dt, 1e-4) - fpsEma) * 0.06;
@@ -4732,7 +4807,11 @@ let frameErrors = 0;
 function frameLoop(): void {
   if (loopHalted) return;
   try {
+    const _f0 = performance.now();
     frame();
+    // TRUE CPU frame cost (excludes the vsync wait) — drives the perf overlay
+    // and the streaming/mesh headroom throttle.
+    lastFrameMs = lastFrameMs * 0.85 + (performance.now() - _f0) * 0.15;
     frameErrors = 0; // a clean frame clears the streak
   } catch (err) {
     frameErrors++;
