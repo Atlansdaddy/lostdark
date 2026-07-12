@@ -908,7 +908,8 @@ function updatePerfDiv(dt: number): void {
     `other  ${(Math.max(0, lastFrameMs - known)).toFixed(1).padStart(5)}  draws ${renderer.info.render.calls}  tris ${(renderer.info.render.triangles / 1000).toFixed(0)}k\n` +
     `chunks ${world.chunks.size}  meshes ${chunkMeshes.size}  flora ${importedFlora.length}  sway ${swayProps.length}\n` +
     `groveQ ${pendingGroves.length}  treeQ ${pendingTrees.length}  fogL ${fogLightRegistry.length}` +
-    (heap ? `  heap ${(heap.usedJSHeapSize / 1048576).toFixed(0)}MB` : '');
+    (heap ? `  heap ${(heap.usedJSHeapSize / 1048576).toFixed(0)}MB` : '') +
+    `\ngeo ${renderer.info.memory.geometries}  tex ${renderer.info.memory.textures}  progs ${renderer.info.programs?.length ?? 0}`;
 }
 
 // --- Dynamic resolution scaling (DRS) ---------------------------------------
@@ -3654,9 +3655,22 @@ function frame(): void {
     // live flora: streamed columns queue groves/trees — build a few per frame
     // (also headroom-gated: tree clusters are the priciest single build)
     t0 = performance.now();
-    if (floraReady && (lastFrameMs < 15 || (streamTick & 7) === 0)) {
+    if (floraReady && (lastFrameMs < 17 || (streamTick & 7) === 0)) {
       if (pendingTrees.length) buildTreeAt(pendingTrees.pop()!);
       for (let i = 0; i < 2 && pendingGroves.length; i++) buildGroveAt(pendingGroves.pop()!);
+    }
+    // cap the queues: entries >120m streamed away — their columns re-decorate
+    // (and re-queue) when revisited, so building them now is pure waste
+    if ((streamTick & 31) === 0) {
+      const near = (q: { x: number; z: number }[]): void => {
+        for (let i = q.length - 1; i >= 0; i--) {
+          const dx = q[i].x - orb.pos.x;
+          const dz = q[i].z - orb.pos.z;
+          if (dx * dx + dz * dz > 120 * 120) q.splice(i, 1);
+        }
+      };
+      near(pendingGroves);
+      near(pendingTrees);
     }
     // FLORA DISTANCE CULLING: imported props are individual scene meshes and
     // grow forever while roaming — stagger-cull a slice per frame so far
@@ -3666,7 +3680,9 @@ function frame(): void {
       const g = importedFlora[floraCullIdx];
       const fdx = g.position.x - orb.pos.x;
       const fdz = g.position.z - orb.pos.z;
-      g.visible = fdx * fdx + fdz * fdz < RENDER_RADIUS2;
+      // 55m: beyond this the dark hides flora anyway — halves submissions vs
+      // sharing the 80m terrain radius (each object draws in prepass + main).
+      g.visible = fdx * fdx + fdz * fdz < 55 * 55;
     }
     perfMark('flora', performance.now() - t0);
     if ((streamTick++ & 63) === 0) {
@@ -3677,6 +3693,37 @@ function frame(): void {
           m.geometry.dispose();
           chunkMeshes.delete(c);
         }
+      }
+      // Lifecycle pruning — flora/colliders/fog lights grew without bound
+      // while roaming (overlay: flora 3678, fogL 1482). Geometry + materials
+      // are SHARED with the library — far clones are dropped, not disposed.
+      if (importedFlora.length > 700) {
+        const keep: THREE.Group[] = [];
+        const dead = new Set<THREE.Group>();
+        for (const g of importedFlora) {
+          const dx = g.position.x - orb.pos.x;
+          const dz = g.position.z - orb.pos.z;
+          if (dx * dx + dz * dz > 130 * 130) {
+            scene.remove(g);
+            dead.add(g);
+          } else keep.push(g);
+        }
+        importedFlora.length = 0;
+        for (const g of keep) importedFlora.push(g);
+        for (let i = swayProps.length - 1; i >= 0; i--) if (dead.has(swayProps[i].group)) swayProps.splice(i, 1);
+        if (floraCullIdx >= importedFlora.length) floraCullIdx = 0;
+      }
+      for (const key of [...floraColliders.keys()]) {
+        const [bx, bz] = key.split(',').map(Number);
+        if ((bx - orb.pos.x) ** 2 + (bz - orb.pos.z) ** 2 > 160 * 160) floraColliders.delete(key);
+      }
+      // fog lights: slot 0 = the orb; map mode has no fireFogIdx consumer, so
+      // distant crystal registrations can be dropped safely.
+      for (let i = fogLightRegistry.length - 1; i >= 1; i--) {
+        const L = fogLightRegistry[i];
+        const dx = L.pos.x - orb.pos.x;
+        const dz = L.pos.z - orb.pos.z;
+        if (dx * dx + dz * dz > 180 * 180) fogLightRegistry.splice(i, 1);
       }
     }
     seaPlane?.position.set(orb.pos.x, SEA_LEVEL + 0.42, orb.pos.z);
