@@ -61,11 +61,28 @@
   .gcell .cap{font-size:10px;color:var(--dim);margin-top:6px}
   .gcell .cap b{color:var(--ink)}
   #busy{position:absolute;top:10px;right:10px;color:var(--warn);font-size:11px;display:none}
+
+  /* --- mobile shell: the map owns the screen; the panel is a drawer --- */
+  #menuBtn{position:absolute;top:10px;left:10px;z-index:20;display:none;padding:9px 12px;font-size:14px}
+  #zoomBtns{position:absolute;right:10px;bottom:10px;z-index:6;display:flex;flex-direction:column;gap:8px}
+  #zoomBtns button{width:46px;height:46px;font-size:20px;border-radius:8px;background:rgba(14,13,22,.92)}
+  #legend.min{max-height:18px;overflow:hidden;opacity:.75}
+  #legend{cursor:pointer;max-height:60vh;transition:max-height .2s}
+  #closeSide{display:none;width:100%;margin-bottom:10px}
+  @media (max-width: 900px), (pointer: coarse) {
+    #menuBtn{display:block}
+    #closeSide{display:block}
+    #side{position:fixed;left:0;top:0;bottom:0;z-index:15;width:min(300px,84vw);
+          transform:translateX(-105%);transition:transform .22s ease;box-shadow:4px 0 24px rgba(0,0,0,.6)}
+    #side.open{transform:none}
+    #hud{max-width:60vw;font-size:10px;top:10px;left:auto;right:64px}
+  }
 </style>
 </head>
 <body>
 
 <div id="side">
+  <button id="closeSide">✕ close panel — show the map</button>
   <h1>MAPLAB</h1>
   <div class="sub">macro-skeleton · 1 cell = 32 m · permanent night</div>
 
@@ -127,6 +144,11 @@
 
 <div id="main">
   <canvas id="view"></canvas>
+  <button id="menuBtn">☰ maplab</button>
+  <div id="zoomBtns">
+    <button id="zin">+</button>
+    <button id="zout">−</button>
+  </div>
   <div id="hud"><span class="k">tap a cell to inspect · drag to pan · wheel to zoom</span></div>
   <div id="legend"></div>
   <div id="busy">generating…</div>
@@ -1355,8 +1377,27 @@ function drawLegend(){
   $('legend').innerHTML=h;
 }
 
+/* ---------- mobile shell: drawer, zoom buttons, pinch ---------- */
+const isCoarse=matchMedia('(pointer: coarse)').matches||innerWidth<=900;
+const side=document.getElementById('side');
+document.getElementById('menuBtn').addEventListener('click',()=>side.classList.add('open'));
+document.getElementById('closeSide').addEventListener('click',()=>side.classList.remove('open'));
+if(isCoarse){ /* phones boot with the MAP, not the panel */ side.classList.remove('open'); }
+else { side.classList.add('open'); }
+function zoomAt(f){ zoom=Math.max(0.5,Math.min(40,zoom*f)); applyCam(); }
+document.getElementById('zin').addEventListener('click',()=>zoomAt(1.45));
+document.getElementById('zout').addEventListener('click',()=>zoomAt(1/1.45));
+/* generating from the drawer? show the result: auto-close on regen (mobile) */
+const _origGenerate=generate;
+if(isCoarse){ document.getElementById('regen').addEventListener('click',()=>side.classList.remove('open')); }
+/* legend: tap to collapse/expand; starts minimized on phones */
+const legendEl=document.getElementById('legend');
+legendEl.addEventListener('click',()=>legendEl.classList.toggle('min'));
+if(isCoarse) legendEl.classList.add('min');
+
 /* ---------- pan / zoom / inspect ---------- */
 let dragging=false, moved=false, lx=0, ly=0;
+let pinch=null; // {d0, zoom0, cx, cy}
 canvas.addEventListener('mousedown',e=>{ dragging=true; moved=false; lx=e.clientX; ly=e.clientY; canvas.classList.add('dragging'); });
 window.addEventListener('mouseup',e=>{
   canvas.classList.remove('dragging');
@@ -1379,8 +1420,21 @@ canvas.addEventListener('wheel',e=>{
   zoom=Math.max(0.5,Math.min(40,zoom));
   applyCam();
 },{passive:false});
-canvas.addEventListener('touchstart',e=>{ if(e.touches.length===1){ dragging=true; moved=false; lx=e.touches[0].clientX; ly=e.touches[0].clientY; } },{passive:true});
+canvas.addEventListener('touchstart',e=>{
+  if(e.touches.length===2){
+    dragging=false;
+    const dx=e.touches[0].clientX-e.touches[1].clientX, dy=e.touches[0].clientY-e.touches[1].clientY;
+    pinch={ d0:Math.hypot(dx,dy)||1, zoom0:zoom };
+  } else if(e.touches.length===1){ dragging=true; moved=false; lx=e.touches[0].clientX; ly=e.touches[0].clientY; }
+},{passive:true});
 canvas.addEventListener('touchmove',e=>{
+  if(pinch&&e.touches.length===2){
+    const dx=e.touches[0].clientX-e.touches[1].clientX, dy=e.touches[0].clientY-e.touches[1].clientY;
+    const d=Math.hypot(dx,dy)||1;
+    zoom=Math.max(0.5,Math.min(40,pinch.zoom0*(d/pinch.d0)));
+    applyCam();
+    return;
+  }
   if(!dragging||e.touches.length!==1) return;
   const dx=e.touches[0].clientX-lx, dy=e.touches[0].clientY-ly;
   if(Math.abs(dx)+Math.abs(dy)>4) moved=true;
@@ -1389,7 +1443,11 @@ canvas.addEventListener('touchmove',e=>{
   panY+=dy/renderer.domElement.clientHeight*(cam.top-cam.bottom);
   applyCam();
 },{passive:true});
-canvas.addEventListener('touchend',e=>{ if(dragging&&!moved&&e.changedTouches.length===1) inspect(e.changedTouches[0]); dragging=false; },{passive:true});
+canvas.addEventListener('touchend',e=>{
+  if(e.touches.length<2) pinch=null;
+  if(dragging&&!moved&&e.changedTouches.length===1) inspect(e.changedTouches[0]);
+  dragging=false;
+},{passive:true});
 
 const ray=new THREE.Raycaster(), ndc=new THREE.Vector2();
 function inspect(e){
