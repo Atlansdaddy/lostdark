@@ -19,6 +19,7 @@ import { logger } from '../core/log';
 import { buildChunkGeometry } from '../render/VoxelMesher';
 import { buildSmoothChunkGeometry } from '../render/SmoothMesher';
 import { HeightfieldGen, WATER_Y } from './HeightfieldGen';
+import { WorldGen } from './WorldGen';
 import { ChunkManager, ColState } from './ChunkManager';
 import { InstancedProps, createPropMaterial } from './Props';
 
@@ -123,7 +124,14 @@ const terrainMat = new THREE.ShaderMaterial({
 
 // --- World ------------------------------------------------------------------
 
-const gen = new HeightfieldGen(SEED);
+// THE INTEGRATION: the maplab skeleton drives the streamed world by default.
+// ?gen=height brings back the standalone biome heightfield testbed.
+const useMap = params.get('gen') !== 'height';
+const gen = useMap ? new WorldGen(SEED, Number(params.get('wr') ?? 6000)) : new HeightfieldGen(SEED);
+if (gen instanceof WorldGen) {
+  const n = gen.map.names;
+  log.info(`world "${n.continents[0]}" · ${n.ocean} · map ${gen.map.genMs.toFixed(0)}ms · #${gen.map.checksum}`);
+}
 const props = new InstancedProps(createPropMaterial(uniforms));
 scene.add(props.group);
 const manager = new ChunkManager(gen, terrainMat, RADIUS, props);
@@ -518,7 +526,7 @@ function updateHud(stats: ReturnType<ChunkManager['update']>): void {
   const ok = sceneMeshes === stats.meshesTracked;
   const heap = (performance as unknown as { memory?: { usedJSHeapSize: number } }).memory;
   hud.textContent =
-    `WORLDLAB s1.5·regions  seed ${SEED}  R=${manager.radius}\n` +
+    `WORLDLAB ${gen instanceof WorldGen ? '·' + gen.map.names.continents[0] : 's1.5·regions'}  seed ${SEED}  R=${manager.radius}\n` +
     `${fps.toFixed(0)} fps   pos ${fmtPos()}   ${gen.biomeAt(camera.position.x, camera.position.z)}\n` +
     `cols  gen ${stats.byState[0]} · deco ${stats.byState[1]} · lit ${stats.byState[2]} · meshed ${stats.byState[3]}\n` +
     `chunks ${stats.chunksLoaded}   meshes scene ${sceneMeshes} / tracked ${stats.meshesTracked} ${ok ? '✓' : '✗ MISMATCH'}\n` +
