@@ -2111,6 +2111,103 @@ const pendingTrees: { x: number; y: number; z: number; h: number }[] = [];
 // asset caps once the GLTFs land (procedural makeGlowcap is the fallback).
 const pendingGroves: { x: number; y: number; z: number; h: number }[] = [];
 
+/** Uniform hash — ReekGen's recipe (map-mode decoration must be seeded and
+ *  position-deterministic exactly like the demo's worldgen). */
+function mapHash(x: number, y: number, seed: number): number {
+  let h = (x * 374761393 + y * 668265263 + seed * 1442695041) | 0;
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967295;
+}
+
+/**
+ * MAP_MODE: the demo's Reek surface decoration (ReekGen §surface, ported
+ * per-column) driving the SAME reekHooks — glowcap groves, crystal nodes,
+ * button clumps, spore-trees, reek-grass, pickups, Keeper beacons. The Reek
+ * in the world map is FULL demo detail (John); other biomes keep stand-ins.
+ */
+function decorateMapColumn(ccx: number, ccz: number): void {
+  if (!worldGen) return;
+  const REEK = 1;
+  const x0 = ccx * 32;
+  const z0 = ccz * 32;
+  // reek-grass per voxel column (sparser than the demo arena — world scale)
+  for (let dz = 0; dz < 32; dz++) {
+    for (let dx = 0; dx < 32; dx++) {
+      const x = x0 + dx;
+      const z = z0 + dz;
+      if (worldGen.biomeId(x, z) !== REEK) continue;
+      if (mapHash(x, z, REEK_SEED + 131) <= 0.8) continue;
+      const h = worldGen.height(x, z);
+      if (h > SEA_LEVEL) reekHooks.grass(x, h + 1, z);
+    }
+  }
+  // POI lattice (STEP 16): each jittered point is built by the column that
+  // contains it, so cross-border POIs are never doubled or dropped.
+  const STEP = 16;
+  for (let gz = Math.floor((z0 - STEP) / STEP) * STEP; gz < z0 + 32 + STEP; gz += STEP) {
+    for (let gx = Math.floor((x0 - STEP) / STEP) * STEP; gx < x0 + 32 + STEP; gx += STEP) {
+      const jx = gx + Math.floor((mapHash(gx, gz, REEK_SEED + 53) - 0.5) * 10);
+      const jz = gz + Math.floor((mapHash(gz, gx, REEK_SEED + 59) - 0.5) * 10);
+      if (jx < x0 || jx >= x0 + 32 || jz < z0 || jz >= z0 + 32) continue;
+      if (worldGen.biomeId(jx, jz) !== REEK) continue;
+      const fy = worldGen.height(jx, jz) + 1;
+      if (fy <= SEA_LEVEL + 1) continue;
+      const r = mapHash(gx / STEP, gz / STEP, REEK_SEED + 47);
+      if (r < 0.42) {
+        // glowcap grove + pickups + button fringe (demo probabilities)
+        const count = 2 + Math.floor(mapHash(jx, jz, REEK_SEED + 61) * 3);
+        for (let m = 0; m < count; m++) {
+          const mx = jx + Math.floor((mapHash(jx + m, jz, REEK_SEED + 67) - 0.5) * 7);
+          const mz = jz + Math.floor((mapHash(jz + m, jx, REEK_SEED + 71) - 0.5) * 7);
+          const my = worldGen.height(mx, mz) + 1;
+          const gh = 2.5 + mapHash(mx, mz, REEK_SEED + 73) * 3;
+          reekHooks.grove(mx, my, mz, gh);
+          world.set(mx, Math.round(my + gh + 1), mz, Mat.GlowAir);
+        }
+        if (mapHash(jx, jz, REEK_SEED + 79) > 0.35) reekHooks.pickup(jx + 1, fy + 1.4, jz - 1);
+        if (mapHash(jz, jx, REEK_SEED + 83) > 0.6) reekHooks.pickup(jx - 2, fy + 1.6, jz + 2);
+        for (let b = 0; b < 2; b++) {
+          if (mapHash(jx + b * 7, jz - b * 5, REEK_SEED + 157) > 0.4) {
+            const bx = jx + Math.floor((mapHash(jx, b, REEK_SEED + 163) - 0.5) * 12);
+            const bz = jz + Math.floor((mapHash(jz, b, REEK_SEED + 167) - 0.5) * 12);
+            reekHooks.buttons(bx, worldGen.height(bx, bz) + 1, bz);
+          }
+        }
+      } else if (r < 0.56) {
+        // crystal node — cold light + the fog registry
+        for (let c = 0; c < 5; c++) {
+          const cx = jx + (c % 3) - 1;
+          const cz = jz + Math.floor(mapHash(c, jx, REEK_SEED + 89) * 3) - 1;
+          const chh = 1 + Math.floor(mapHash(cx, cz, REEK_SEED + 97) * 3);
+          const cy = worldGen.height(cx, cz) + 1;
+          for (let y = cy; y < cy + chh; y++) world.set(cx, y, cz, Mat.Crystal);
+        }
+        reekHooks.crystalLight(jx, fy + 2, jz);
+      } else if (r < 0.68) {
+        reekHooks.buttons(jx, fy, jz);
+        if (mapHash(jz, jx, REEK_SEED + 171) > 0.5) {
+          reekHooks.buttons(jx + 5, worldGen.height(jx + 5, jz - 3) + 1, jz - 3);
+        }
+      } else if (r >= 0.72 && r < 0.9) {
+        // spore-tree stand
+        const count = 1 + Math.floor(mapHash(jx, jz, REEK_SEED + 137) * 2);
+        for (let t = 0; t < count; t++) {
+          const tx = jx + Math.floor((mapHash(jx + t, jz, REEK_SEED + 139) - 0.5) * 8);
+          const tz = jz + Math.floor((mapHash(jz + t, jx, REEK_SEED + 149) - 0.5) * 8);
+          const ty = worldGen.height(tx, tz) + 1;
+          const th = 7 + mapHash(tx, tz, REEK_SEED + 151) * 4;
+          reekHooks.tree(tx, ty, tz, th);
+          world.set(tx, Math.round(ty + th + 1), tz, Mat.GlowAir);
+        }
+      } else if (r > 0.93) {
+        // dead Keeper beacon — the worldbuilding whisper
+        for (let y = fy; y < fy + 7; y++) world.set(jx, y, jz, Mat.Metal);
+        world.set(jx, fy + 7, jz, Mat.Glass);
+      }
+    }
+  }
+}
+
 const reekHooks = {
   grove: (x: number, y: number, z: number, h: number) => pendingGroves.push({ x, y, z, h }),
   crystalLight: (x: number, y: number, z: number) =>
@@ -2139,7 +2236,8 @@ let testbeds: ReturnType<typeof carveTestbeds> | null = null;
 if (MAP_MODE) {
   await bootStatus('reading the world map…');
   worldGen = new WorldGen(REEK_SEED, Number(new URLSearchParams(location.search).get('wr') ?? 6000));
-  worldStream = new WorldStream(world, worldGen, 5);
+  worldGen.labReekFlora = false; // the demo pipeline (below) dresses the Reek
+  worldStream = new WorldStream(world, worldGen, 5, decorateMapColumn);
   logger('world').info(
     `map world "${worldGen.map.names.continents[0]}" · ${worldGen.map.names.ocean} · #${worldGen.map.checksum}`,
   );
@@ -2793,16 +2891,79 @@ function placeTreeCluster(x: number, z: number, h: number, seed: number): void {
   }
 }
 
+// --- LIVE flora builders (map-mode streaming needs groves/trees to build
+// FOREVER, not once at boot — pending queues drain every frame once loaded).
+let floraReady = false;
+let treesLoaded = false;
+let capPool: FloraName[] = [];
+let clusterLoaded = false;
+const placedCaps: { x: number; z: number; r: number }[] = [];
+
+function buildTreeAt(t: { x: number; y: number; z: number; h: number }): void {
+  if (treesLoaded) placeTreeCluster(t.x, t.z, t.h, t.x * 31.1 + t.z * 17.7);
+  else makeSporeTree(t.x, smoothSurfaceY(t.x, t.z, t.y) - 0.15, t.z, t.h);
+}
+
+function buildGroveAt(gp: { x: number; y: number; z: number; h: number }): void {
+  const seed = gp.x * 41.3 + gp.z * 7.7;
+  if (capPool.length === 0) {
+    makeGlowcap(gp.x, smoothSurfaceY(gp.x, gp.z, gp.y) - 0.08, gp.z, gp.h);
+    return;
+  }
+  if (frand(seed + 1) < 0.45) return; // thin ~45% — worldgen packs groves too dense
+  const name = capPool[Math.floor(frand(seed) * capPool.length)];
+  const height = 1.3 + frand(seed + 7) * 1.4; // smaller caps, various sizes
+  const capR = 0.7 + height * 0.35; // spacing footprint
+  // Keep the spacing set bounded on long expeditions: prune far entries.
+  if (placedCaps.length > 480) {
+    for (let i = placedCaps.length - 1; i >= 0; i--) {
+      const b = placedCaps[i];
+      if ((b.x - gp.x) ** 2 + (b.z - gp.z) ** 2 > 220 * 220) placedCaps.splice(i, 1);
+    }
+  }
+  let px = gp.x;
+  let pz = gp.z;
+  for (let it = 0; it < 8; it++) {
+    let moved = false;
+    for (const b of placedCaps) {
+      const dx = px - b.x;
+      const dz = pz - b.z;
+      const min = capR + b.r;
+      const d2 = dx * dx + dz * dz;
+      if (d2 < min * min) {
+        const d = Math.sqrt(d2) || 1e-3;
+        const push = (min - d) * 0.5 + 0.05;
+        px += (dx / d) * push;
+        pz += (dz / d) * push;
+        moved = true;
+      }
+    }
+    if (!moved) break;
+  }
+  if ((px - gp.x) ** 2 + (pz - gp.z) ** 2 > 9) return; // drifted too far → thin out
+  placedCaps.push({ x: px, z: pz, r: capR });
+  placeImported(name, px, pz, { height, brushR: 2, collide: true });
+  // Sparingly: a sunk meshy cluster peeking out of the ground beside a grove.
+  if (clusterLoaded && frand(seed + 11) < 0.06) {
+    placeImported('meshy_glowshroom_02', px + 1.5, pz + 1.5, {
+      height: 1.2 + frand(seed + 13) * 0.5, // current size and smaller
+      sink: 1.1 + frand(seed + 17) * 0.6, // base under the voxel — only caps pop
+    });
+  }
+}
+
 void floraLib.preload().then(() => {
   // If the tree GLTFs failed to load, fall back to the native procedural
   // spore-trees so the world is never treeless (assets are best-effort).
-  const treesLoaded = floraLib.has('tree_01') || floraLib.has('tree_02');
-  // Build every tree collected during worldgen (deferred: the GLTF is async),
-  // each with its clustered foliage.
-  for (const t of pendingTrees) {
-    if (treesLoaded) placeTreeCluster(t.x, t.z, t.h, t.x * 31.1 + t.z * 17.7);
-    else makeSporeTree(t.x, smoothSurfaceY(t.x, t.z, t.y) - 0.15, t.z, t.h);
-  }
+  treesLoaded = floraLib.has('tree_01') || floraLib.has('tree_02');
+  capPool = (['meshy_glowshroom', 'meshy_glowshroom_03', 'meshy_flatshroom', 'mushroom_01'] as FloraName[]).filter((n) =>
+    floraLib.has(n),
+  );
+  clusterLoaded = floraLib.has('meshy_glowshroom_02');
+  floraReady = true;
+  // Build everything collected during worldgen (deferred: the GLTF is async).
+  for (const t of pendingTrees.splice(0)) buildTreeAt(t);
+  for (const gp of pendingGroves.splice(0)) buildGroveAt(gp);
   if (!treesLoaded) {
     logger('flora-assets').warn('tree GLTFs unavailable — fell back to procedural spore-trees');
     return;
@@ -2815,57 +2976,8 @@ void floraLib.preload().then(() => {
     const rad = 12 + (i % 2) * 4;
     placeTreeCluster(sx + Math.cos(ang) * rad, sz + Math.sin(ang) * rad, 8 + i, sx + sz + i * 11);
   }
-  // --- Groves: imported asset caps replace the procedural glowcaps. Each GLOWS
-  // its OWN texture colour (no albedo tint — the tint looked wrong on the tall
-  // ones). Caps are SPACED apart + hitboxed so they read as separate plants, and
-  // THINNED where worldgen would pile them up. Fallback to makeGlowcap if unloaded.
-  const capPool = (['meshy_glowshroom', 'meshy_glowshroom_03', 'meshy_flatshroom', 'mushroom_01'] as FloraName[]).filter(
-    (n) => floraLib.has(n),
-  );
-  const clusterLoaded = floraLib.has('meshy_glowshroom_02');
-  const placedCaps: { x: number; z: number; r: number }[] = [];
-  for (const gp of pendingGroves) {
-    const seed = gp.x * 41.3 + gp.z * 7.7;
-    if (capPool.length === 0) {
-      makeGlowcap(gp.x, smoothSurfaceY(gp.x, gp.z, gp.y) - 0.08, gp.z, gp.h);
-      continue;
-    }
-    if (frand(seed + 1) < 0.45) continue; // thin ~45% — worldgen packs groves too dense
-    const name = capPool[Math.floor(frand(seed) * capPool.length)];
-    const height = 1.3 + frand(seed + 7) * 1.4; // smaller caps, various sizes
-    const capR = 0.7 + height * 0.35; // spacing footprint
-    // Nudge off nearby caps; if it still can't fit its footprint, the area is
-    // packed → drop it (this is what thins the over-dense clusters).
-    let px = gp.x;
-    let pz = gp.z;
-    for (let it = 0; it < 8; it++) {
-      let moved = false;
-      for (const b of placedCaps) {
-        const dx = px - b.x;
-        const dz = pz - b.z;
-        const min = capR + b.r;
-        const d2 = dx * dx + dz * dz;
-        if (d2 < min * min) {
-          const d = Math.sqrt(d2) || 1e-3;
-          const push = (min - d) * 0.5 + 0.05;
-          px += (dx / d) * push;
-          pz += (dz / d) * push;
-          moved = true;
-        }
-      }
-      if (!moved) break;
-    }
-    if ((px - gp.x) ** 2 + (pz - gp.z) ** 2 > 9) continue; // drifted too far → thin out
-    placedCaps.push({ x: px, z: pz, r: capR });
-    placeImported(name, px, pz, { height, brushR: 2, collide: true });
-    // Sparingly: a sunk meshy cluster peeking out of the ground beside a grove.
-    if (clusterLoaded && frand(seed + 11) < 0.06) {
-      placeImported('meshy_glowshroom_02', px + 1.5, pz + 1.5, {
-        height: 1.2 + frand(seed + 13) * 0.5, // current size and smaller
-        sink: 1.1 + frand(seed + 17) * 0.6, // base under the voxel — only caps pop
-      });
-    }
-  }
+  // (Grove construction now lives in buildGroveAt above — shared by the boot
+  // drain and the per-frame streaming drain.)
   // Showcase row by spawn so the new meshes are easy to eyeball (the cluster is
   // excluded — it now appears sparsely + sunk in the groves).
   const heroShrooms: FloraName[] = ['meshy_glowshroom', 'meshy_glowshroom_03', 'meshy_flatshroom'];
@@ -3477,6 +3589,11 @@ function frame(): void {
   if (worldStream) {
     worldStream.update(orb.pos.x, orb.pos.z, 4);
     remeshDirtyChunks(1);
+    // live flora: streamed columns queue groves/trees — build a few per frame
+    if (floraReady) {
+      for (let i = 0; i < 2 && pendingTrees.length; i++) buildTreeAt(pendingTrees.pop()!);
+      for (let i = 0; i < 3 && pendingGroves.length; i++) buildGroveAt(pendingGroves.pop()!);
+    }
     if ((streamTick++ & 63) === 0) {
       for (const c of worldStream.unload(orb.pos.x, orb.pos.z)) {
         const m = chunkMeshes.get(c);

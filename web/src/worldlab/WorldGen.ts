@@ -48,6 +48,9 @@ export class WorldGen implements ColumnGenerator {
   readonly cyMax = 2; //  y < 96 (inland highlands ≈ 60)
 
   readonly map: WorldMapData;
+  /** The GAME's Reek pipeline supplies demo-grade trees/groves — it turns
+   *  these lab-grade voxel trees + shroom markers off to avoid doubles. */
+  labReekFlora = true;
   /** Smoothed per-cell height field (same layout as map grids). */
   private readonly cellH: Float32Array;
   /** Anchor beacon lookup: map cell index → anchor type. */
@@ -262,6 +265,7 @@ export class WorldGen implements ColumnGenerator {
       }
     }
 
+    if (!this.labReekFlora) return;
     // Glowshroom light markers (the registration lesson: the light must land
     // where the prop stands — marker height computed at the MARKER's column).
     for (const pr of this.props(ccx, ccz)) {

@@ -34,6 +34,8 @@ export class WorldStream {
     private readonly world: VoxelWorld,
     private readonly gen: WorldGen,
     public radius = 5,
+    /** Game-side extra decoration (the demo's Reek POIs/flora hooks). */
+    private readonly extraDecorate?: (cx: number, cz: number) => void,
   ) {}
 
   /** The game's remesh loop asks per chunk: is this column's data final? */
@@ -75,6 +77,7 @@ export class WorldStream {
         this.cols.set(`${t.cx},${t.cz}`, St.Generated);
       } else if (t.stage === St.Decorated) {
         this.gen.decorateColumn(this.world, t.cx, t.cz);
+        this.extraDecorate?.(t.cx, t.cz);
         this.cols.set(`${t.cx},${t.cz}`, St.Decorated);
       } else {
         lightColumn(this.world, t.cx, t.cz, this.gen.cyMin, this.gen.cyMax);
