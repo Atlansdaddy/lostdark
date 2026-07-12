@@ -877,6 +877,18 @@ function togglePerf(): void {
 }
 metricsBar.style.pointerEvents = 'auto';
 metricsBar.addEventListener('click', togglePerf);
+// Unmissable toggle (John couldn't find the thin metrics strip — it can hide
+// under the Android status bar in fullscreen): a floating 📊 button.
+const perfBtn = document.createElement('button');
+perfBtn.textContent = '📊';
+perfBtn.style.cssText =
+  'position:fixed;left:8px;top:40%;z-index:61;width:40px;height:40px;border-radius:50%;' +
+  'background:#0d1622aa;border:1px solid #2a3c52;color:#9fd6ff;font-size:16px;touch-action:manipulation;';
+perfBtn.addEventListener('click', () => {
+  togglePerf();
+  perfBtn.style.background = perfOn ? '#3a6ea5cc' : '#0d1622aa';
+});
+document.body.appendChild(perfBtn);
 window.addEventListener('keydown', (e) => {
   if (e.code === 'F4') togglePerf();
 });
