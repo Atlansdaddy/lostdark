@@ -45,6 +45,8 @@ import { Mat } from './world/Materials';
 import { Chunk, VoxelWorld } from './world/VoxelWorld';
 import { generateReek } from './world/ReekGen';
 import { carveTestbeds } from './world/Testbeds';
+import { WorldStream } from './world/WorldStream';
+import { WorldGen, SEA_LEVEL } from './worldlab/WorldGen';
 import { WaterZone } from './render/WaterZone';
 import { FireZone } from './render/FireZone';
 import { BuildSandbox } from './world/BuildSandbox';
@@ -2086,6 +2088,16 @@ function smoothSurfaceY(x: number, z: number, yHint: number): number {
 
 // --- Initialize infinite streaming world ---
 const REEK_SEED = 20250703;
+/** ?world=map boots the game INTO the generated world map (Phase-5 bridge):
+ *  the orb + all its verbs, streaming across the real continent. Default
+ *  stays the demo arena. ?wr=4000 shrinks the world. */
+const MAP_MODE = new URLSearchParams(location.search).get('world') === 'map';
+let worldGen: WorldGen | null = null;
+let worldStream: WorldStream | null = null;
+let streamTick = 0;
+/** MAP_MODE ocean: one translucent plane at sea level following the orb (the
+ *  demo's WaterZone is testbed-specific; the real sea shader comes later). */
+let seaPlane: THREE.Mesh | null = null;
 // Optimized for performance: reduce initial generation, stream the rest.
 // 256×256 = 512²; was causing 30fps. Scale back, rely on streaming for expansion.
 const REEK_HALF_INIT = 128; // 256×256 voxel initial area (was 512×512 = too much upfront)
@@ -2120,21 +2132,48 @@ const reekHooks = {
     makeShelf(x, y, z, dx, dz),
 };
 
-// Generate the large initial area with full POI placement.
-logger('world').info(`generating initial ${REEK_HALF_INIT * 2}×${REEK_HALF_INIT * 2} voxel area…`);
-await bootStatus('growing the reek…');
-const reek = generateReek(world, REEK_SEED, REEK_HALF_INIT, reekHooks);
-logger('world').info(`initial area loaded — ${world.chunks.size} chunks`);
+// Generate the initial area: the demo arena, or (MAP_MODE) the world map's
+// spawn region streamed through the ring ladder.
+let reek: { spawn: [number, number, number]; beacons: [number, number, number][]; entrances: [number, number][] };
+let testbeds: ReturnType<typeof carveTestbeds> | null = null;
+if (MAP_MODE) {
+  await bootStatus('reading the world map…');
+  worldGen = new WorldGen(REEK_SEED, Number(new URLSearchParams(location.search).get('wr') ?? 6000));
+  worldStream = new WorldStream(world, worldGen, 5);
+  logger('world').info(
+    `map world "${worldGen.map.names.continents[0]}" · ${worldGen.map.names.ocean} · #${worldGen.map.checksum}`,
+  );
+  await bootStatus('waking the near dark…');
+  let guard = 0;
+  while (worldStream.busy(0, 0) && guard++ < 4000) {
+    worldStream.update(0, 0, 40);
+    if (guard % 6 === 0) await bootStatus(`waking the near dark…`);
+  }
+  reek = { spawn: [0.5, worldGen.height(0, 0) + 2.5, 0.5], beacons: [], entrances: [] };
+  seaPlane = new THREE.Mesh(
+    new THREE.PlaneGeometry(2400, 2400),
+    new THREE.MeshBasicMaterial({ color: 0x0e2f3e, transparent: true, opacity: 0.72, depthWrite: false }),
+  );
+  seaPlane.rotation.x = -Math.PI / 2;
+  seaPlane.position.y = SEA_LEVEL + 0.42;
+  scene.add(seaPlane);
+} else {
+  logger('world').info(`generating initial ${REEK_HALF_INIT * 2}×${REEK_HALF_INIT * 2} voxel area…`);
+  await bootStatus('growing the reek…');
+  reek = generateReek(world, REEK_SEED, REEK_HALF_INIT, reekHooks);
+  logger('world').info(`initial area loaded — ${world.chunks.size} chunks`);
 
-// Elemental testbeds — carve the water / forge / build-sandbox stages into three
-// map corners BEFORE the light flood so their emissives (Water, Ember) light and
-// mesh with everything else. The visual systems are built from `testbeds` below.
-await bootStatus('carving the testbeds…');
-const testbeds = carveTestbeds(world);
-logger('world').info('testbeds carved (water NW · forge NE · sandbox SW)');
+  // Elemental testbeds — carve the water / forge / build-sandbox stages into
+  // three map corners BEFORE the light flood so their emissives light and mesh
+  // with everything else. Skipped in MAP_MODE (they'd blast craters into the
+  // real terrain — they return as proper POIs later).
+  await bootStatus('carving the testbeds…');
+  testbeds = carveTestbeds(world);
+  logger('world').info('testbeds carved (water NW · forge NE · sandbox SW)');
 
-await bootStatus('first light…');
-lightGrid.update();
+  await bootStatus('first light…');
+  lightGrid.update();
+}
 // Meshing is the long block (~600 chunks) — do it in slices with a live
 // percentage so the loading screen moves instead of freezing.
 {
@@ -2178,53 +2217,60 @@ logger('lightvol').info(
 // each corner to life. All are driven per-frame in frame().
 // Fish share the flora's pulse-reveal patch: black shadows in the water until
 // the orb's bubble or the echo pulse paints them.
-const waterZone = new WaterZone(testbeds.water.pools, moteTexture, addPulseReveal);
+const waterZone = testbeds ? new WaterZone(testbeds.water.pools, moteTexture, addPulseReveal) : null;
 // One lighting engine: the water shadow-marches the SAME light-volume the
 // terrain/flora shaders hold — shared uniform OBJECTS, so it's always current.
-waterZone.wireLightVolume({
+waterZone?.wireLightVolume({
   uLightAtlas: uniforms.uLightAtlas,
   uLightMin: uniforms.uLightMin,
   uLightStep: uniforms.uLightStep,
   uLightDim: uniforms.uLightDim,
   uLightTiles: uniforms.uLightTiles,
 });
-scene.add(waterZone.group);
+if (waterZone) scene.add(waterZone.group);
 // John's rigged fish (public/assets/fish). Async — a simple placeholder school
 // swims until these land, then the rigged bodies take over. If a nose points
 // the wrong way, waiver.waterZone.flipFish() spins them 180°.
 waterZone
-  .loadFishModels('assets/fish/bigfish.glb', 'assets/fish/littlefish.glb')
+  ?.loadFishModels('assets/fish/bigfish.glb', 'assets/fish/littlefish.glb')
   .catch((err) => logger('water').warn('fish models failed', err));
 
-const fireZone = new FireZone(testbeds.forge.hearths, testbeds.forge.bed, moteTexture);
-scene.add(fireZone.group);
-// The hearth throws real, flickering light — register it so the orb's reflected
-// sheen (and future fog) picks it up. Intensity is refreshed each frame.
+const fireZone = testbeds ? new FireZone(testbeds.forge.hearths, testbeds.forge.bed, moteTexture) : null;
 const fireFogIdx = fogLightRegistry.length;
-fogLightRegistry.push({
-  pos: fireZone.light.position.clone(),
-  color: new THREE.Color(1.0, 0.5, 0.18),
-  intensity: 1.4,
-});
+if (fireZone) {
+  scene.add(fireZone.group);
+  // The hearth throws real, flickering light — register it so the orb's
+  // reflected sheen (and future fog) picks it up. Refreshed each frame.
+  fogLightRegistry.push({
+    pos: fireZone.light.position.clone(),
+    color: new THREE.Color(1.0, 0.5, 0.18),
+    intensity: 1.4,
+  });
+}
 
 // --- Discovery minimap: dark until explored, with the zones marked so the
 // corners are findable (John: "I can't find the lake"). Settings live in
 // Menu → Settings → Map. Baked AFTER the carve so the lake shows as water.
 const minimap = new Minimap(world, REEK_HALF_INIT, (bx, bz) => {
+  if (MAP_MODE && worldGen) return worldGen.biomeAt(bx, bz);
   // Zone stages were pushed in carve order: water, forge, sandbox.
   const inRect = (s: { x0: number; z0: number; x1: number; z1: number } | undefined) =>
     !!s && bx >= s.x0 && bx < s.x1 && bz >= s.z0 && bz < s.z1;
-  if (inRect(testbeds.stages[0])) return 'The Reek — The Lake';
-  if (inRect(testbeds.stages[1])) return 'The Reek — The Forge';
-  if (inRect(testbeds.stages[2])) return 'The Reek — The Sandbox';
+  if (inRect(testbeds?.stages[0])) return 'The Reek — The Lake';
+  if (inRect(testbeds?.stages[1])) return 'The Reek — The Forge';
+  if (inRect(testbeds?.stages[2])) return 'The Reek — The Sandbox';
   return orbRoofed ? 'The Reek — The Deeps' : 'The Reek';
 });
-minimap.setMarkers([
-  { x: testbeds.water.center.x, z: testbeds.water.center.z, icon: '◈', label: 'Lake', color: '#54c8ff' },
-  { x: testbeds.forge.center.x, z: testbeds.forge.center.z, icon: '◆', label: 'Forge', color: '#ff9a4a' },
-  { x: testbeds.sandbox.center.x, z: testbeds.sandbox.center.z, icon: '▣', label: 'Sandbox', color: '#9fe8ff' },
-  { x: reek.spawn[0], z: reek.spawn[2], icon: '✦', label: 'Spawn', color: '#7fffd1' },
-]);
+minimap.setMarkers(
+  testbeds
+    ? [
+        { x: testbeds.water.center.x, z: testbeds.water.center.z, icon: '◈', label: 'Lake', color: '#54c8ff' },
+        { x: testbeds.forge.center.x, z: testbeds.forge.center.z, icon: '◆', label: 'Forge', color: '#ff9a4a' },
+        { x: testbeds.sandbox.center.x, z: testbeds.sandbox.center.z, icon: '▣', label: 'Sandbox', color: '#9fe8ff' },
+        { x: reek.spawn[0], z: reek.spawn[2], icon: '✦', label: 'Spawn', color: '#7fffd1' },
+      ]
+    : [{ x: reek.spawn[0], z: reek.spawn[2], icon: '✦', label: 'Spawn', color: '#7fffd1' }],
+);
 
 // --- Mushroom folk: the Reek's own people. Meshy-rigged GLBs (assets/folk)
 // driven by the channel rig in entity/ — spawned in an arc at the spawn point
@@ -2254,11 +2300,11 @@ void folk.load().then(() => {
   );
 });
 
-const buildSandbox = new BuildSandbox({
+const buildSandbox = !testbeds ? null : new BuildSandbox({
   scene,
   world,
   moteTexture,
-  deck: testbeds.sandbox.deck, // building/destruction is gated to this footprint
+  deck: testbeds!.sandbox.deck, // building/destruction is gated to this footprint
   // world.set() already marks the touched chunk (+boundary neighbours) dirty, so
   // we ONLY remesh those. We deliberately skip the full-world lightGrid.update()
   // here — that global flood-fill was the per-edit stutter. Baked light on the
@@ -2269,7 +2315,7 @@ const buildSandbox = new BuildSandbox({
     remeshDirtyChunks();
   },
   onForceWave: (origin) => {
-    waterZone.splash(origin);
+    waterZone?.splash(origin);
     folk.applyForceWave(origin); // the wave shoves + hurts the mushroom folk
   },
 });
@@ -2318,7 +2364,7 @@ for (const f of floraCull) {
 for (const spot of grassSpots) {
   const vx = Math.floor(spot[0]);
   const vz = Math.floor(spot[2]);
-  if (!testbeds.stages.some((s) => vx >= s.x0 && vx < s.x1 && vz >= s.z0 && vz < s.z1)) continue;
+  if (!testbeds || !testbeds.stages.some((s) => vx >= s.x0 && vx < s.x1 && vz >= s.z0 && vz < s.z1)) continue;
   for (let y = 22; y > -8; y--) {
     if (world.solid(vx, y, vz)) {
       spot[1] = y + 1 - 0.06;
@@ -2329,7 +2375,7 @@ for (const spot of grassSpots) {
 // Plant the lakebed itself: a deterministic scatter of extra tufts across the
 // wet columns — kelp-like growth swaying under the surface (same wind/orb
 // shader as land grass; lit only when light reaches down to it).
-{
+if (testbeds) {
   const lake = testbeds.water.pools[0];
   const surfY = Math.floor(lake.surfaceY);
   for (let vx = Math.ceil(lake.cx - lake.halfX); vx < lake.cx + lake.halfX; vx += 2) {
@@ -3313,6 +3359,7 @@ function remeshDirtyChunks(maxChunks = Infinity): void {
   let meshed = 0;
   for (const c of world.chunks.values()) {
     if (!c.dirty) continue;
+    if (worldStream && !worldStream.canMesh(c.cx, c.cz)) continue; // ladder gate: data not final yet
     if (meshed >= maxChunks) break;
 
     const old = chunkMeshes.get(c);
@@ -3384,6 +3431,20 @@ document.body.appendChild(edgeWhisper);
 let edgeWhisperT = 0;
 
 function worldBorder(dt: number): void {
+  if (MAP_MODE && worldGen) {
+    // At world scale the border IS the Nothing: reaching the rim biome (on
+    // land or at sea) presses the orb back toward the world's heart.
+    const b = worldGen.biomeId(orb.pos.x, orb.pos.z);
+    if (b === 8 /* NOTHING */ || b === 0 /* outside the disc */) {
+      const r = Math.hypot(orb.pos.x, orb.pos.z) || 1;
+      orb.vel.x -= (orb.pos.x / r) * 26 * dt;
+      orb.vel.z -= (orb.pos.z / r) * 26 * dt;
+      edgeWhisperT = 2.2;
+    }
+    edgeWhisperT = Math.max(0, edgeWhisperT - dt);
+    edgeWhisper.style.opacity = edgeWhisperT > 0 ? '1' : '0';
+    return;
+  }
   const limit = REEK_HALF_INIT - EDGE_SOFT;
   const ox = Math.abs(orb.pos.x) - limit;
   const oz = Math.abs(orb.pos.z) - limit;
@@ -3409,6 +3470,25 @@ function frame(): void {
   const dt = Math.min(0.05, clock.getDelta());
   input.update(dt); // poll gamepad + decay wheel impulses
   worldBorder(dt);
+
+  // MAP_MODE: advance the streaming ladder around the orb, mesh what became
+  // ready (1 chunk/frame keeps the hitch under the frame), and periodically
+  // drop far columns (disposing their meshes).
+  if (worldStream) {
+    worldStream.update(orb.pos.x, orb.pos.z, 4);
+    remeshDirtyChunks(1);
+    if ((streamTick++ & 63) === 0) {
+      for (const c of worldStream.unload(orb.pos.x, orb.pos.z)) {
+        const m = chunkMeshes.get(c);
+        if (m) {
+          scene.remove(m);
+          m.geometry.dispose();
+          chunkMeshes.delete(c);
+        }
+      }
+    }
+    seaPlane?.position.set(orb.pos.x, SEA_LEVEL + 0.42, orb.pos.z);
+  }
 
   // Render distance + frustum culling. The world is dark — beyond the orb's lit
   // bubble everything is black — so we only draw chunks whose nearest point is
@@ -3901,7 +3981,7 @@ function frame(): void {
   const waterLights: { pos: THREE.Vector3; color: THREE.Color; intensity: number }[] = [
     { pos: orb.pos, color: mood.color, intensity: 1.6 * orb.breathGlow },
   ];
-  {
+  if (testbeds) {
     const wc = testbeds.water.center;
     for (const l of fogLightRegistry) {
       if (waterLights.length >= 8) break;
@@ -3911,7 +3991,7 @@ function frame(): void {
       if (dxl * dxl + dzl * dzl < 60 * 60) waterLights.push(l);
     }
   }
-  waterZone.update({
+  waterZone?.update({
     t: clock.elapsedTime,
     orbPos: orb.pos,
     orbColor: mood.color,
@@ -3928,21 +4008,23 @@ function frame(): void {
   // The orb interacts with the water: crossing the surface hard splashes;
   // swimming drags a wake of expanding ripple rings behind it.
   if (orb.splashed) {
-    waterZone.splash(orb.pos);
-    waterZone.disturb(orb.pos.x, orb.pos.z, 1.3);
+    waterZone?.splash(orb.pos);
+    waterZone?.disturb(orb.pos.x, orb.pos.z, 1.3);
     mood.event('effort');
   }
   if (orb.inWater) {
     waterWakeTimer -= dt;
     const swimSpeed = Math.hypot(orb.vel.x, orb.vel.z);
     if (waterWakeTimer <= 0 && swimSpeed > 2) {
-      waterZone.disturb(orb.pos.x, orb.pos.z, 0.22 + swimSpeed * 0.03);
+      waterZone?.disturb(orb.pos.x, orb.pos.z, 0.22 + swimSpeed * 0.03);
       waterWakeTimer = 0.16;
     }
   }
-  fireZone.update(dt, clock.elapsedTime, camera.position, qualityTier);
-  fogLightRegistry[fireFogIdx].intensity = 1.0 + 0.6 * (fireZone.light.intensity / 3);
-  if (!paused) buildSandbox.update(dt, orb.pos, yaw, camera.position);
+  if (fireZone) {
+    fireZone.update(dt, clock.elapsedTime, camera.position, qualityTier);
+    fogLightRegistry[fireFogIdx].intensity = 1.0 + 0.6 * (fireZone.light.intensity / 3);
+  }
+  if (!paused) buildSandbox?.update(dt, orb.pos, yaw, camera.position);
   // The grass field: wind + parts around the orb + ripples with the pulse.
   grassField.update(
     clock.elapsedTime,
@@ -4727,14 +4809,14 @@ frameLoop();
   // These MUST live on THIS object — it's the final `waiver` assignment; an
   // earlier duplicate assignment gets clobbered (that's why toWater() didn't
   // exist and the lake was unfindable).
-  toWater: () => orb.pos.copy(testbeds.water.teleport),
-  toForge: () => orb.pos.copy(testbeds.forge.teleport),
-  toSandbox: () => orb.pos.copy(testbeds.sandbox.teleport),
+  toWater: () => testbeds && orb.pos.copy(testbeds.water.teleport),
+  toForge: () => testbeds && orb.pos.copy(testbeds.forge.teleport),
+  toSandbox: () => testbeds && orb.pos.copy(testbeds.sandbox.teleport),
   build: {
-    place: () => buildSandbox.place(),
-    remove: () => buildSandbox.remove(),
-    cycle: () => buildSandbox.cycleMat(),
-    force: () => buildSandbox.forceWave(orb.pos.clone()),
+    place: () => buildSandbox?.place(),
+    remove: () => buildSandbox?.remove(),
+    cycle: () => buildSandbox?.cycleMat(),
+    force: () => buildSandbox?.forceWave(orb.pos.clone()),
   },
   testbeds, // dev: inspect carved zone metadata
   waterZone, // dev: live-tune the water shader uniforms + flipFish()
@@ -4815,16 +4897,16 @@ window.addEventListener('keydown', (e) => {
   if (paused || e.repeat) return;
   switch (e.code) {
     case 'KeyG':
-      buildSandbox.forceWave(orb.pos.clone());
+      buildSandbox?.forceWave(orb.pos.clone());
       break;
     case 'KeyE':
-      buildSandbox.place();
+      buildSandbox?.place();
       break;
     case 'KeyR':
-      buildSandbox.remove();
+      buildSandbox?.remove();
       break;
     case 'KeyC':
-      logger('build').info(`material → ${buildSandbox.cycleMat()}`);
+      if (buildSandbox) logger('build').info(`material → ${buildSandbox.cycleMat()}`);
       break;
   }
 });
