@@ -44,7 +44,7 @@ export const Move = {
   // slow in the streamed world — "dash feels better but a touch too fast for
   // base". Split the difference: ~half the demo-era 16.5/22 instead of a
   // third. Travel time still IS the world size; dash keeps absolute reach.
-  accel: 40, // scaled with maxSpeed so the chase feel (accel/speed) is unchanged
+  accel: 70, // deliberately OVER maxSpeed*damping — hits top speed in ~0.2s (John: spool-up felt sluggish)
   maxSpeed: 8.5, // horizontal glide speed (demo era 16.5; first retune 5.5)
   damping: 5, // velocity decay when no input (the "glide"/drift tail)
   // Sprint = HOLD to cruise faster, paid per-second in energy.

@@ -2948,11 +2948,13 @@ function placeImported(
   z: number,
   opts: PlaceOpts = {},
 ): { height: number; radius: number; gy: number } | null {
+  const _t0 = performance.now();
   const isShroom = MUSHROOM_KINDS.has(name) || /shroom|mushroom|fungus|fungi/i.test(name);
   // Per-instance size variation — a grove is never uniform (0.72–1.57×).
   const jitter = 0.72 + frand(x * 2.3 + z * 4.1) * 0.85;
   const inst = floraLib.make(name, opts.height, jitter);
   if (!inst) return null;
+  const _tMake = performance.now();
   const gy = groundYAt(x, z) - (opts.sink ?? 0); // sink → only the top pokes out
   const g = inst.group;
   g.position.set(x, gy, z);
@@ -2976,6 +2978,7 @@ function placeImported(
   if (opts.sway) {
     swayProps.push({ group: g, x, z, brushR: opts.brushR ?? inst.radius + 2, lx: 0, lz: 0, lvx: 0, lvz: 0 });
   }
+  const _tReg = performance.now();
   // Fungi (known or named like one) join the phosphorescence automatically.
   if (isShroom) {
     registerImportedPhosphor(g, x, z, gy + inst.height * 0.65, opts.tint);
@@ -3005,6 +3008,14 @@ function placeImported(
       }
     }
   }
+  // Spike forensics: a single placement was measured at 25-50ms — name the
+  // phase (make = GLTF clone, reg = scene/collider/sway, shr = phosphor+rig).
+  const _tEnd = performance.now();
+  if (_tEnd - _t0 > 8) {
+    spikeEvent(
+      `place[${name}] make${(_tMake - _t0).toFixed(0)} reg${(_tReg - _tMake).toFixed(0)} shr${(_tEnd - _tReg).toFixed(0)}`,
+    );
+  }
   return { height: inst.height, radius: inst.radius, gy };
 }
 
@@ -3026,11 +3037,13 @@ function placeTreeCluster(x: number, z: number, h: number, seed: number): void {
       const sa = frand(seed + 31 + s * 7.7) * Math.PI * 2;
       const sr = 0.6 + frand(seed + 43 + s * 11.3) * Math.max(tree.radius * 0.7, 1.6);
       const sy = tree.gy + h * (0.58 + frand(seed + 53 + s * 13.9) * 0.22);
-      makeStrandAt(
-        x + Math.cos(sa) * sr,
-        sy,
-        z + Math.sin(sa) * sr,
-        1.4 + frand(seed + 61 + s * 17.1) * 2.2,
+      microJobs.push(() =>
+        makeStrandAt(
+          x + Math.cos(sa) * sr,
+          sy,
+          z + Math.sin(sa) * sr,
+          1.4 + frand(seed + 61 + s * 17.1) * 2.2,
+        ),
       );
     }
   }
@@ -3044,7 +3057,9 @@ function placeTreeCluster(x: number, z: number, h: number, seed: number): void {
     const rad = 1.6 + frand(seed + i * 13.1) * 3.4;
     const kind = kinds[Math.floor(frand(seed + i * 5.7) * kinds.length)];
     const collide = kind.startsWith('rock') || kind.startsWith('bush');
-    placeImported(kind, x + Math.cos(ang) * rad, z + Math.sin(ang) * rad, { collide });
+    // One placeImported per FRAME, not per cluster — inline these made a
+    // "tree" a 3-5-placement 100ms task (the spike log's repeat offender).
+    microJobs.push(() => void placeImported(kind, x + Math.cos(ang) * rad, z + Math.sin(ang) * rad, { collide }));
   }
 }
 
@@ -3055,6 +3070,9 @@ let treesLoaded = false;
 let capPool: FloraName[] = [];
 let clusterLoaded = false;
 const placedCaps: { x: number; z: number; r: number }[] = [];
+/** Deferred sub-steps of larger builds (tree strands/base props) — the frame
+ *  loop drains ONE per frame so no single build stacks placements. */
+const microJobs: (() => void)[] = [];
 
 function buildTreeAt(t: { x: number; y: number; z: number; h: number }): void {
   if (treesLoaded) placeTreeCluster(t.x, t.z, t.h, t.x * 31.1 + t.z * 17.7);
@@ -3761,14 +3779,18 @@ function frame(): void {
     // (also headroom-gated: tree clusters are the priciest single build)
     t0 = performance.now();
     if (floraReady) {
-      // Trees are single 30-100ms tasks — the "movement feels delayed" spikes.
-      // They ONLY build with real headroom; groves are cheap and keep a floor.
-      if (pendingTrees.length && lastFrameMs < 13) {
-        spikeEvent('tree');
-        buildTreeAt(pendingTrees.pop()!);
-      }
-      if (lastFrameMs < 17 || (streamTick & 7) === 0) {
-        for (let i = 0; i < 2 && pendingGroves.length; i++) {
+      // ONE placement per frame, ever — the spike log showed 'grove,grove'
+      // 60-110ms frames (a single placeImported is 25-50ms; stacking them was
+      // the moving stutter). Headroom-gated with a slow cadence floor so the
+      // queues still drain when frames are busy.
+      if (lastFrameMs < 13 || (streamTick & 15) === 0) {
+        if (microJobs.length) {
+          spikeEvent('micro');
+          microJobs.pop()!();
+        } else if (pendingTrees.length) {
+          spikeEvent('tree');
+          buildTreeAt(pendingTrees.pop()!);
+        } else if (pendingGroves.length) {
           spikeEvent('grove');
           buildGroveAt(pendingGroves.pop()!);
         }
