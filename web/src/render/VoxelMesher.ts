@@ -91,15 +91,47 @@ const FACES: Face[] = [
 // AO curve per open-neighbour count (0 = fully occluded corner).
 const AO_CURVE = [0.42, 0.62, 0.82, 1.0];
 
-export function buildChunkGeometry(
-  world: VoxelWorld,
-  light: LightGrid,
-  chunk: Chunk,
-): THREE.BufferGeometry | null {
-  // Light values are read from the same chunk.light arrays the LightGrid
-  // samples — via the slab copy below, not per-sample calls.
-  void light;
+/** Raw geometry arrays — what the mesher core produces; the caller (main
+ *  thread or worker bridge) wraps them in a THREE.BufferGeometry. */
+export interface MeshArrays {
+  positions: Float32Array;
+  normals: Float32Array;
+  colors: Float32Array;
+  alight: Float32Array;
+  aao: Float32Array;
+  amat: Float32Array;
+  indices: Uint32Array;
+}
+
+/** Copy a chunk's slab neighbourhood into FRESH arrays (transferable to a
+ *  worker). ~0.3ms — the cheap main-thread half of worker meshing. */
+export function copySlabsFor(world: VoxelWorld, chunk: Chunk): { mats: Uint8Array; light: Uint8Array } {
   fillSlabs(world, chunk);
+  return { mats: slabMats.slice(), light: slabLight.slice() };
+}
+
+/** Wrap mesher-core output arrays in a BufferGeometry (cheap — no copies). */
+export function geometryFromArrays(a: MeshArrays): THREE.BufferGeometry {
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(a.positions, 3));
+  geo.setAttribute('normal', new THREE.BufferAttribute(a.normals, 3));
+  geo.setAttribute('color', new THREE.BufferAttribute(a.colors, 3));
+  geo.setAttribute('alight', new THREE.BufferAttribute(a.alight, 1));
+  geo.setAttribute('aao', new THREE.BufferAttribute(a.aao, 1));
+  geo.setAttribute('amat', new THREE.BufferAttribute(a.amat, 1));
+  geo.setIndex(new THREE.BufferAttribute(a.indices, 1));
+  return geo;
+}
+
+/** PURE mesher core over slab arrays — runs identically on the main thread
+ *  (module slabs) and in the mesh worker (transferred copies). */
+export function meshSlabs(
+  sMats: Uint8Array,
+  sLight: Uint8Array,
+  baseX: number,
+  baseY: number,
+  baseZ: number,
+): MeshArrays | null {
   const positions: number[] = [];
   const normals: number[] = [];
   const colors: number[] = [];
@@ -109,14 +141,10 @@ export function buildChunkGeometry(
   const indices: number[] = [];
   let vcount = 0;
 
-  const baseX = chunk.cx * CS;
-  const baseY = chunk.cy * CS;
-  const baseZ = chunk.cz * CS;
-
   for (let ly = 0; ly < CS; ly++) {
     for (let lz = 0; lz < CS; lz++) {
       for (let lx = 0; lx < CS; lx++) {
-        const m = chunk.voxels[Chunk.index(lx, ly, lz)] as Mat;
+        const m = sMats[sIdx(lx, ly, lz)] as Mat;
         if (!isSolid(m)) continue;
         const mat = MATERIALS[m];
         const emissive = mat.emission > 0;
@@ -129,7 +157,7 @@ export function buildChunkGeometry(
           const ax = lx + f.n[0];
           const ay = ly + f.n[1];
           const az = lz + f.n[2];
-          const nm = slabMats[sIdx(ax, ay, az)] as Mat;
+          const nm = sMats[sIdx(ax, ay, az)] as Mat;
           if (isSolid(nm) && !(nm === Mat.Glass && m !== Mat.Glass)) continue;
 
           // Tangent axes of this face (the two axes that aren't the normal).
@@ -159,13 +187,13 @@ export function buildChunkGeometry(
             const i1 = sIdx(ax + o1[0], ay + o1[1], az + o1[2]);
             const i2 = sIdx(ax + o2[0], ay + o2[1], az + o2[2]);
             const ic = sIdx(ax + o1[0] + o2[0], ay + o1[1] + o2[1], az + o1[2] + o2[2]);
-            const s1 = SOLID_LUT[slabMats[i1]] === 1;
-            const s2 = SOLID_LUT[slabMats[i2]] === 1;
-            const sc = SOLID_LUT[slabMats[ic]] === 1;
+            const s1 = SOLID_LUT[sMats[i1]] === 1;
+            const s2 = SOLID_LUT[sMats[i2]] === 1;
+            const sc = SOLID_LUT[sMats[ic]] === 1;
 
             // Smooth light: average the 4 cells meeting at this corner.
-            const l0 = slabLight[sIdx(ax, ay, az)];
-            cornerLight.push(LightGrid.normalize((l0 + slabLight[i1] + slabLight[i2] + slabLight[ic]) / 4));
+            const l0 = sLight[sIdx(ax, ay, az)];
+            cornerLight.push(LightGrid.normalize((l0 + sLight[i1] + sLight[i2] + sLight[ic]) / 4));
 
             // AO from corner solidity (fully closed corner = darkest).
             const open = s1 && s2 ? 0 : 3 - ((s1 ? 1 : 0) + (s2 ? 1 : 0) + (sc ? 1 : 0));
@@ -199,29 +227,43 @@ export function buildChunkGeometry(
   }
 
   if (vcount === 0) return null;
+  void 0;
 
   if (import.meta.env.DEV) {
     for (let i = 0; i < positions.length; i++) {
       if (Number.isNaN(positions[i])) {
-        meshLog.once('nan-pos', 'warn', `NaN position in chunk ${chunk.cx},${chunk.cy},${chunk.cz} at ${i}`);
+        meshLog.once('nan-pos', 'warn', `NaN position in chunk @${baseX},${baseY},${baseZ} at ${i}`);
         break;
       }
     }
     for (let i = 0; i < alight.length; i++) {
       if (Number.isNaN(alight[i]) || Number.isNaN(aao[i])) {
-        meshLog.once('nan-light', 'warn', `NaN light/ao in chunk ${chunk.cx},${chunk.cy},${chunk.cz} at ${i}`);
+        meshLog.once('nan-light', 'warn', `NaN light/ao in chunk @${baseX},${baseY},${baseZ} at ${i}`);
         break;
       }
     }
   }
 
-  const geo = new THREE.BufferGeometry();
-  geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
-  geo.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
-  geo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
-  geo.setAttribute('alight', new THREE.Float32BufferAttribute(alight, 1));
-  geo.setAttribute('aao', new THREE.Float32BufferAttribute(aao, 1));
-  geo.setAttribute('amat', new THREE.Float32BufferAttribute(amat, 1));
-  geo.setIndex(indices);
-  return geo;
+  return {
+    positions: new Float32Array(positions),
+    normals: new Float32Array(normals),
+    colors: new Float32Array(colors),
+    alight: new Float32Array(alight),
+    aao: new Float32Array(aao),
+    amat: new Float32Array(amat),
+    indices: new Uint32Array(indices),
+  };
+}
+
+/** The classic synchronous API — unchanged signature for every existing
+ *  caller (game remesh, worldlab, tests). Same slabs, same core. */
+export function buildChunkGeometry(
+  world: VoxelWorld,
+  light: LightGrid,
+  chunk: Chunk,
+): THREE.BufferGeometry | null {
+  void light; // light is read via the slab copy
+  fillSlabs(world, chunk);
+  const arrays = meshSlabs(slabMats, slabLight, chunk.cx * CS, chunk.cy * CS, chunk.cz * CS);
+  return arrays ? geometryFromArrays(arrays) : null;
 }

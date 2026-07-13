@@ -39,7 +39,7 @@ import { Orb } from './orb/Orb';
 import { OrbMood } from './orb/Mood';
 import { createLitMaterial } from './render/litMaterial';
 import { LightVolume } from './render/LightVolume';
-import { buildChunkGeometry } from './render/VoxelMesher';
+import { buildChunkGeometry , copySlabsFor, geometryFromArrays } from './render/VoxelMesher';
 import { buildSmoothChunkGeometry } from './render/SmoothMesher';
 import { Mat } from './world/Materials';
 import { Chunk, VoxelWorld } from './world/VoxelWorld';
@@ -2152,6 +2152,62 @@ let worldGen: WorldGen | null = null;
 let worldStream: WorldStream | null = null;
 let streamTick = 0;
 let floraCullIdx = 0;
+/** MAP_MODE worker meshing: the mesher core runs off-thread; the main thread
+ *  only copies slabs out (~0.3ms) and wraps arriving geometry. Kills the
+ *  smooth-smooth-SPIKE stutter of 8-15ms in-frame chunk meshes. */
+let meshWorker: Worker | null = null;
+const meshInFlight = new Map<string, Chunk>();
+let meshInstallMs = 0; // arrival-side cost, folded into the perf overlay's mesh line
+if (MAP_MODE) {
+  meshWorker = new Worker(new URL('./render/mesherWorker.ts', import.meta.url), { type: 'module' });
+  meshWorker.onmessage = (e: MessageEvent<{ key: string; arrays?: Parameters<typeof geometryFromArrays>[0] }>) => {
+    const t0 = performance.now();
+    const { key, arrays } = e.data;
+    const c = meshInFlight.get(key);
+    meshInFlight.delete(key);
+    // Chunk may have streamed out (or been replaced) while the worker ran.
+    if (!c || world.chunks.get(key) !== c) return;
+    const old = chunkMeshes.get(c);
+    if (old) {
+      scene.remove(old);
+      old.geometry.dispose();
+    }
+    if (arrays) {
+      const CS = World.chunkSize;
+      const mesh = new THREE.Mesh(geometryFromArrays(arrays), worldMaterial);
+      mesh.position.set(0, 0, 0); // world coords are baked into the geometry
+      mesh.userData.aabb = new THREE.Box3(
+        new THREE.Vector3(c.cx * CS - 1, c.cy * CS - 1, c.cz * CS - 1),
+        new THREE.Vector3((c.cx + 1) * CS + 1, (c.cy + 1) * CS + 1, (c.cz + 1) * CS + 1),
+      );
+      chunkMeshes.set(c, mesh);
+      scene.add(mesh);
+    } else {
+      chunkMeshes.delete(c);
+    }
+    meshInstallMs += performance.now() - t0;
+  };
+}
+
+/** Dispatch dirty+ready chunks to the mesh worker (up to 2 in flight). */
+function pumpMeshWorker(): void {
+  if (!meshWorker || !worldStream) return;
+  for (const c of world.chunks.values()) {
+    if (meshInFlight.size >= 2) break;
+    if (!c.dirty) continue;
+    if (!worldStream.canMesh(c.cx, c.cz)) continue;
+    const key = `${c.cx},${c.cy},${c.cz}`;
+    if (meshInFlight.has(key)) continue;
+    const { mats, light } = copySlabsFor(world, c);
+    c.dirty = false;
+    meshInFlight.set(key, c);
+    const CS = World.chunkSize;
+    meshWorker.postMessage(
+      { key, mats, light, bx: c.cx * CS, by: c.cy * CS, bz: c.cz * CS },
+      [mats.buffer, light.buffer],
+    );
+  }
+}
 /** MAP_MODE ocean: one translucent plane at sea level following the orb (the
  *  demo's WaterZone is testbed-specific; the real sea shader comes later). */
 let seaPlane: THREE.Mesh | null = null;
@@ -3648,12 +3704,15 @@ function frame(): void {
     let t0 = performance.now();
     worldStream.update(orb.pos.x, orb.pos.z, 3);
     perfMark('stream', performance.now() - t0);
-    // MESH THROTTLE: one chunk costs ~8-15ms on the phone — meshing every
-    // frame was the 21ms-frame crawl. Mesh only when the last frame had
-    // headroom, or on every 4th frame so the world never stops appearing.
+    // WORKER MESHING: the face loop runs off-thread; here we only dispatch
+    // slab copies (~0.3ms each) and the overlay's mesh line absorbs the
+    // arrival-side geometry installs. (Smooth-terrain toggle falls back to
+    // the old throttled in-frame path — the smooth mesher isn't ported.)
     t0 = performance.now();
-    if (lastFrameMs < 15 || (streamTick & 3) === 0) remeshDirtyChunks(1);
-    perfMark('mesh', performance.now() - t0);
+    if (meshWorker && !smoothTerrain) pumpMeshWorker();
+    else if (lastFrameMs < 15 || (streamTick & 3) === 0) remeshDirtyChunks(1);
+    perfMark('mesh', performance.now() - t0 + meshInstallMs);
+    meshInstallMs = 0;
     // live flora: streamed columns queue groves/trees — build a few per frame
     // (also headroom-gated: tree clusters are the priciest single build)
     t0 = performance.now();
