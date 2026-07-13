@@ -861,9 +861,39 @@ let metricsTimer = 0;
 // --- Full debug overlay (John): per-system frame timings + world counters.
 // Toggle by TAPPING the metrics bar (phone) or F4 (desktop).
 const perfEma: Record<string, number> = {};
+const perfNow: Record<string, number> = {}; // THIS frame's raw values — spikes hide in EMAs
 let lastFrameMs = 0;
 function perfMark(name: string, ms: number): void {
   perfEma[name] = (perfEma[name] ?? ms) * 0.9 + ms * 0.1;
+  perfNow[name] = ms;
+}
+// SPIKE TRACER — the stutter survived two hypotheses, so stop inferring:
+// any frame >25ms records WHICH system ate it and which one-off events fired
+// (tree/grove build, unload sweep, mesh install, shader compile, tex upload).
+const spikeLog: string[] = [];
+let spikeEvents: string[] = [];
+let spikePrevProgs = 0;
+let spikePrevTex = 0;
+function spikeEvent(tag: string): void {
+  if (spikeEvents.length < 8) spikeEvents.push(tag);
+}
+function traceSpike(rawMs: number): void {
+  const progs = renderer.info.programs?.length ?? 0;
+  const tex = renderer.info.memory.textures;
+  if (rawMs > 25) {
+    if (progs !== spikePrevProgs) spikeEvents.push(`prog+${progs - spikePrevProgs}`);
+    if (tex !== spikePrevTex) spikeEvents.push(`tex${tex > spikePrevTex ? '+' : ''}${tex - spikePrevTex}`);
+    const top = Object.entries(perfNow)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 2)
+      .map(([k, v]) => `${k} ${v.toFixed(0)}`)
+      .join(' ');
+    spikeLog.push(`${rawMs.toFixed(0)}ms ${top} | ${spikeEvents.join(',') || '?'}`);
+    if (spikeLog.length > 6) spikeLog.shift();
+  }
+  spikePrevProgs = progs;
+  spikePrevTex = tex;
+  spikeEvents = [];
 }
 const perfDiv = document.createElement('div');
 perfDiv.style.cssText =
@@ -909,7 +939,8 @@ function updatePerfDiv(dt: number): void {
     `chunks ${world.chunks.size}  meshes ${chunkMeshes.size}  flora ${importedFlora.length}  sway ${swayProps.length}\n` +
     `groveQ ${pendingGroves.length}  treeQ ${pendingTrees.length}  fogL ${fogLightRegistry.length}  scale ${renderScale.toFixed(2)}/${drsCeiling.toFixed(2)}` +
     (heap ? `  heap ${(heap.usedJSHeapSize / 1048576).toFixed(0)}MB` : '') +
-    `\ngeo ${renderer.info.memory.geometries}  tex ${renderer.info.memory.textures}  progs ${renderer.info.programs?.length ?? 0}`;
+    `\ngeo ${renderer.info.memory.geometries}  tex ${renderer.info.memory.textures}  progs ${renderer.info.programs?.length ?? 0}` +
+    (spikeLog.length ? `\n-- spikes (>25ms) --\n${spikeLog.join('\n')}` : '');
 }
 
 // --- Dynamic resolution scaling (DRS) ---------------------------------------
@@ -940,6 +971,7 @@ const qualityTier = 0;
 
 function applyRenderScale(scale: number): void {
   renderScale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, scale));
+  spikeEvent('rescale');
   renderer.setPixelRatio(renderScale);
   const ratio = renderer.getPixelRatio();
   const w = window.innerWidth;
@@ -2167,6 +2199,7 @@ let floraCullIdx = 0;
  *  smooth-smooth-SPIKE stutter of 8-15ms in-frame chunk meshes. */
 let meshWorker: Worker | null = null;
 const meshInFlight = new Map<string, Chunk>();
+const disposalQueue: THREE.Mesh[] = [];
 let meshInstallMs = 0; // arrival-side cost, folded into the perf overlay's mesh line
 if (MAP_MODE) {
   meshWorker = new Worker(new URL('./render/mesherWorker.ts', import.meta.url), { type: 'module' });
@@ -2196,6 +2229,7 @@ if (MAP_MODE) {
       chunkMeshes.delete(c);
     }
     meshInstallMs += performance.now() - t0;
+    spikeEvent('inst');
   };
 }
 
@@ -3729,9 +3763,15 @@ function frame(): void {
     if (floraReady) {
       // Trees are single 30-100ms tasks — the "movement feels delayed" spikes.
       // They ONLY build with real headroom; groves are cheap and keep a floor.
-      if (pendingTrees.length && lastFrameMs < 13) buildTreeAt(pendingTrees.pop()!);
+      if (pendingTrees.length && lastFrameMs < 13) {
+        spikeEvent('tree');
+        buildTreeAt(pendingTrees.pop()!);
+      }
       if (lastFrameMs < 17 || (streamTick & 7) === 0) {
-        for (let i = 0; i < 2 && pendingGroves.length; i++) buildGroveAt(pendingGroves.pop()!);
+        for (let i = 0; i < 2 && pendingGroves.length; i++) {
+          spikeEvent('grove');
+          buildGroveAt(pendingGroves.pop()!);
+        }
       }
     }
     // cap the queues: entries >120m streamed away — their columns re-decorate
@@ -3760,12 +3800,16 @@ function frame(): void {
       g.visible = fdx * fdx + fdz * fdz < 55 * 55;
     }
     perfMark('flora', performance.now() - t0);
+    // Disposal is deferred and metered: freeing dozens of GPU buffers in one
+    // frame is itself a stutter — the unload sweep queues, frames drain.
+    for (let i = 0; i < 6 && disposalQueue.length; i++) disposalQueue.pop()!.geometry.dispose();
     if ((streamTick++ & 63) === 0) {
+      spikeEvent('unload');
       for (const c of worldStream.unload(orb.pos.x, orb.pos.z)) {
         const m = chunkMeshes.get(c);
         if (m) {
           scene.remove(m);
-          m.geometry.dispose();
+          disposalQueue.push(m);
           chunkMeshes.delete(c);
         }
       }
@@ -3778,7 +3822,9 @@ function frame(): void {
         for (const g of importedFlora) {
           const dx = g.position.x - orb.pos.x;
           const dz = g.position.z - orb.pos.z;
-          if (dx * dx + dz * dz > 130 * 130) {
+          // scene.remove is an O(children) splice — 1000s at once is a burst;
+          // 80/sweep converges in a few seconds without one giant frame.
+          if (dead.size < 80 && dx * dx + dz * dz > 130 * 130) {
             scene.remove(g);
             dead.add(g);
           } else keep.push(g);
@@ -4963,7 +5009,9 @@ function frameLoop(): void {
     frame();
     // TRUE CPU frame cost (excludes the vsync wait) — drives the perf overlay
     // and the streaming/mesh headroom throttle.
-    lastFrameMs = lastFrameMs * 0.85 + (performance.now() - _f0) * 0.15;
+    const _raw = performance.now() - _f0;
+    lastFrameMs = lastFrameMs * 0.85 + _raw * 0.15;
+    traceSpike(_raw);
     frameErrors = 0; // a clean frame clears the streak
   } catch (err) {
     frameErrors++;
