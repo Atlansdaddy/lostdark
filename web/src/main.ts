@@ -920,9 +920,17 @@ function updatePerfDiv(dt: number): void {
 // the effects that make it beautiful. Bloom/grass/glow stay full; only pixel
 // density flexes, BOTH directions, so it self-corrects the instant load eases.
 const deviceDpr = Math.max(1, window.devicePixelRatio || 1);
-const MIN_SCALE = Math.min(deviceDpr, 1.25); // floor that still looks good — never potato
-const MAX_SCALE = Math.min(deviceDpr, 2.5); //  ceiling — crisp headroom above the old hard 2×
-let renderScale = Math.min(deviceDpr, 1.5); // matches the conservative initial setPixelRatio; DRS climbs
+// Resolution floor is a PIXEL guarantee, not a ratio: never render under
+// ~1080 rows on the short axis (John: resolution beats framerate — if the
+// GPU can't hold 1080p at 60, fps gives, not sharpness). Ceiling is native.
+const TARGET_MIN_ROWS = 1080;
+function computeMinScale(): number {
+  const shortCss = Math.min(window.innerWidth, window.innerHeight);
+  return Math.min(deviceDpr, Math.max(1, TARGET_MIN_ROWS / shortCss));
+}
+let MIN_SCALE = computeMinScale();
+const MAX_SCALE = deviceDpr; // native density — 1440p-class on the S24 Ultra
+let renderScale = MIN_SCALE; // start at the guaranteed floor; DRS climbs from here
 let drsCeiling = MAX_SCALE; // highest scale believed playable; sags lower it, time forgives it
 let drsForgive = 0;
 let drsTimer = 0;
@@ -5117,6 +5125,8 @@ function updateCamera(dt: number): void {
 window.addEventListener('resize', () => {
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
+  MIN_SCALE = computeMinScale(); // fullscreen/rotation changes the CSS short axis
+  drsCeiling = Math.max(drsCeiling, MIN_SCALE);
   applyRenderScale(renderScale); // keep the current DRS density; just re-fit the buffers
 });
 
