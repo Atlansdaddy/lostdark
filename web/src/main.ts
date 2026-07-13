@@ -907,7 +907,7 @@ function updatePerfDiv(dt: number): void {
     `folk   ${f('folk')}  sway ${f('sway')}  render ${f('render')}\n` +
     `other  ${(Math.max(0, lastFrameMs - known)).toFixed(1).padStart(5)}  draws ${renderer.info.render.calls}  tris ${(renderer.info.render.triangles / 1000).toFixed(0)}k\n` +
     `chunks ${world.chunks.size}  meshes ${chunkMeshes.size}  flora ${importedFlora.length}  sway ${swayProps.length}\n` +
-    `groveQ ${pendingGroves.length}  treeQ ${pendingTrees.length}  fogL ${fogLightRegistry.length}` +
+    `groveQ ${pendingGroves.length}  treeQ ${pendingTrees.length}  fogL ${fogLightRegistry.length}  scale ${renderScale.toFixed(2)}/${drsCeiling.toFixed(2)}` +
     (heap ? `  heap ${(heap.usedJSHeapSize / 1048576).toFixed(0)}MB` : '') +
     `\ngeo ${renderer.info.memory.geometries}  tex ${renderer.info.memory.textures}  progs ${renderer.info.programs?.length ?? 0}`;
 }
@@ -923,6 +923,8 @@ const deviceDpr = Math.max(1, window.devicePixelRatio || 1);
 const MIN_SCALE = Math.min(deviceDpr, 1.25); // floor that still looks good — never potato
 const MAX_SCALE = Math.min(deviceDpr, 2.5); //  ceiling — crisp headroom above the old hard 2×
 let renderScale = Math.min(deviceDpr, 1.5); // matches the conservative initial setPixelRatio; DRS climbs
+let drsCeiling = MAX_SCALE; // highest scale believed playable; sags lower it, time forgives it
+let drsForgive = 0;
 let drsTimer = 0;
 // Kept only because the world/fire LOD readers still take a tier; pinned to 0
 // (full effects) because DRS — not effect-culling — governs sharpness now.
@@ -4908,15 +4910,33 @@ function frame(): void {
   // the viewport jump when fullscreen reclaims the bars) gets a BIG immediate
   // cut checked faster, so it never sits stuck at a vsync-quantised 30; mild
   // moves use a 58–74fps dead-band + small steps so it settles, not hunts.
+  // Every scale change is a setPixelRatio buffer REALLOCATION — a stutter and
+  // often a one-frame black flash. So changes must be RARE: climbs happen on a
+  // slow cadence, never while the menu is up (cheap menu frames read as 100fps
+  // and used to send the scale to a ceiling play can't hold — the "3s after
+  // New Game" freeze), and a sag REMEMBERS the scale that failed (drsCeiling)
+  // instead of hunting back up to it every dead-band excursion.
   drsTimer += dt;
-  const drsInterval = fpsEma < 50 ? 0.25 : 0.55; // react faster while badly sagging
+  drsForgive += dt;
+  if (drsForgive > 45) {
+    // the tipping point drifts (chunk count, flora) — retry one notch per 45s
+    drsForgive = 0;
+    drsCeiling = Math.min(MAX_SCALE, drsCeiling + 0.05);
+  }
+  const drsInterval = fpsEma < 50 ? 0.25 : fpsEma < 58 ? 0.55 : 3.0;
   if (drsTimer > drsInterval) {
     drsTimer = 0;
     let next = renderScale;
-    if (fpsEma < 45) next = renderScale * 0.8; //                     hard sag → big cut, recover in ~1s
-    else if (fpsEma < 58) next = renderScale - 0.1; //               mild sag → ease density down
-    else if (fpsEma > 74 && renderScale < MAX_SCALE) next = renderScale + 0.08; // spare GPU → sharpen up
-    next = Math.round(Math.max(MIN_SCALE, Math.min(MAX_SCALE, next)) * 20) / 20;
+    if (fpsEma < 45) {
+      next = renderScale * 0.8; // hard sag → big cut, recover in ~1s
+      drsCeiling = Math.max(MIN_SCALE, Math.min(drsCeiling, renderScale - 0.05));
+    } else if (fpsEma < 58) {
+      next = renderScale - 0.1; // mild sag → ease density down
+      drsCeiling = Math.max(MIN_SCALE, Math.min(drsCeiling, renderScale - 0.05));
+    } else if (!paused && fpsEma > 74 && renderScale < Math.min(MAX_SCALE, drsCeiling)) {
+      next = renderScale + 0.08; // spare GPU → sharpen up (slow cadence)
+    }
+    next = Math.round(Math.max(MIN_SCALE, Math.min(next, MAX_SCALE, drsCeiling)) * 20) / 20;
     if (Math.abs(next - renderScale) > 0.001) applyRenderScale(next);
   }
 }
