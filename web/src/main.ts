@@ -1294,7 +1294,9 @@ interface Shroom {
   pos: THREE.Vector3;
   capMat: THREE.MeshStandardMaterial;
   gillMat: THREE.MeshStandardMaterial;
-  fogIdx: number;
+  /** The shroom's own registry entry (a reference, never an index — the
+   *  registry is pruned while roaming and indices shift). */
+  fogEntry: { pos: THREE.Vector3; color: THREE.Color; intensity: number };
   charge: number;
 }
 const shrooms: Shroom[] = [];
@@ -1541,17 +1543,17 @@ function makeGlowcap(x: number, y: number, z: number, h: number): void {
     cvz: 0,
     neighbors: null,
   });
-  const fogIdx =
-    fogLightRegistry.push({
-      pos: new THREE.Vector3(px, y + h + 0.8, pz),
-      color: glow.clone().multiplyScalar(1 / Math.max(glow.r, glow.g, glow.b)),
-      intensity: 0.04, // dark until charged
-    }) - 1;
+  const fogEntry = {
+    pos: new THREE.Vector3(px, y + h + 0.8, pz),
+    color: glow.clone().multiplyScalar(1 / Math.max(glow.r, glow.g, glow.b)),
+    intensity: 0.04, // dark until charged
+  };
+  fogLightRegistry.push(fogEntry);
   shrooms.push({
     pos: new THREE.Vector3(px, y + h, pz),
     capMat,
     gillMat,
-    fogIdx,
+    fogEntry,
     charge: 0.15, // a faint residual charge at world-start
   });
   // Hitboxes, SEPARATE so the head and stalk read as different things: the stem
@@ -2824,17 +2826,17 @@ function registerImportedPhosphor(group: THREE.Group, x: number, z: number, capY
   const texCol = primaryMap ? dominantTextureColor(primaryMap) : null;
   const emitColor =
     tint?.clone() ?? texCol ?? glow.clone().multiplyScalar(1 / Math.max(glow.r, glow.g, glow.b, 1e-3));
-  const fogIdx =
-    fogLightRegistry.push({
-      pos: new THREE.Vector3(x, capY + 0.4, z),
-      color: emitColor,
-      intensity: 0.04,
-    }) - 1;
+  const fogEntry = {
+    pos: new THREE.Vector3(x, capY + 0.4, z),
+    color: emitColor,
+    intensity: 0.04,
+  };
+  fogLightRegistry.push(fogEntry);
   const s: Shroom = {
     pos: new THREE.Vector3(x, capY, z),
     capMat: mats[0],
     gillMat: mats[1] ?? mats[0],
-    fogIdx,
+    fogEntry,
     charge: 0.15, // a faint residual charge at world-start, like native caps
   };
   shrooms.push(s);
@@ -3655,9 +3657,13 @@ function frame(): void {
     // live flora: streamed columns queue groves/trees — build a few per frame
     // (also headroom-gated: tree clusters are the priciest single build)
     t0 = performance.now();
-    if (floraReady && (lastFrameMs < 17 || (streamTick & 7) === 0)) {
-      if (pendingTrees.length) buildTreeAt(pendingTrees.pop()!);
-      for (let i = 0; i < 2 && pendingGroves.length; i++) buildGroveAt(pendingGroves.pop()!);
+    if (floraReady) {
+      // Trees are single 30-100ms tasks — the "movement feels delayed" spikes.
+      // They ONLY build with real headroom; groves are cheap and keep a floor.
+      if (pendingTrees.length && lastFrameMs < 13) buildTreeAt(pendingTrees.pop()!);
+      if (lastFrameMs < 17 || (streamTick & 7) === 0) {
+        for (let i = 0; i < 2 && pendingGroves.length; i++) buildGroveAt(pendingGroves.pop()!);
+      }
     }
     // cap the queues: entries >120m streamed away — their columns re-decorate
     // (and re-queue) when revisited, so building them now is pure waste
@@ -4010,7 +4016,7 @@ function frame(): void {
     s.charge *= Math.exp((-dt / 30) * leech); // ~30s afterglow, like phosphor paint
     s.capMat.emissiveIntensity = s.charge * 0.95; // BLACK uncharged; glows only when a light charges it
     s.gillMat.emissiveIntensity = s.charge * 0.65;
-    fogLightRegistry[s.fogIdx].intensity = 0.04 + s.charge * 0.65;
+    s.fogEntry.intensity = 0.04 + s.charge * 0.65;
   }
 
   // Micro phosphor caps (buttons + shelf fungi): the SAME charge law as the big
@@ -4060,7 +4066,7 @@ function frame(): void {
     const s = litShrooms[i];
     if (s && s.charge > 0.12) {
       L.position.copy(s.pos);
-      L.color.copy(fogLightRegistry[s.fogIdx].color);
+      L.color.copy(s.fogEntry.color);
       L.intensity = s.charge * 11; // physical 1/d² — higher base, dies naturally (no distance window)
     } else {
       L.intensity = 0;
