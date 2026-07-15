@@ -200,7 +200,14 @@ export class FolkManager {
       if (!mesh.isMesh) return;
       mesh.castShadow = false;
       mesh.receiveShadow = false;
-      mesh.frustumCulled = false; // skinned bounds lie once animated
+      // Skinned bounds lie once animated, but frustumCulled=false meant every
+      // folk was DRAWN EVERY FRAME even behind the camera (~19k tris each).
+      // A generous hand-set bounding sphere keeps culling on without limbs
+      // popping: radius = the model's whole span ×2 covers any pose.
+      mesh.frustumCulled = true;
+      const g = mesh.geometry;
+      if (!g.boundingSphere) g.computeBoundingSphere();
+      if (g.boundingSphere) g.boundingSphere.radius *= 2;
       const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
       for (const raw of mats) {
         const m = raw as THREE.MeshStandardMaterial;
@@ -254,6 +261,7 @@ export class FolkManager {
     folk.spawnAt(pos, yaw);
     folk.mode = this.mode;
     folk.bindCombat(() => this.ctx);
+    folk.group.name = 'folk'; // bucket tag for the tri-budget profiler
     this.deps.scene.add(folk.group);
     this.folk.push(folk);
     return folk;

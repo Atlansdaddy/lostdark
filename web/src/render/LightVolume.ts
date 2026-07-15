@@ -74,8 +74,24 @@ export class LightVolume {
     sampleLevel: (x: number, y: number, z: number) => number,
     sampleSolid?: (x: number, y: number, z: number) => boolean,
   ): void {
+    this.rebuildLayers(0, this.ny, sampleLevel, sampleSolid);
+    this.texture.needsUpdate = true;
+  }
+
+  /**
+   * Repopulate only Y-layers [jStart, jEnd) — the budgeted slice a moving
+   * window rebuilds per frame while the world streams. Does NOT flag the
+   * texture for upload; the caller commits once the full sweep completes so
+   * the shader swaps min + data atomically (no mixed-window frames).
+   */
+  rebuildLayers(
+    jStart: number,
+    jEnd: number,
+    sampleLevel: (x: number, y: number, z: number) => number,
+    sampleSolid?: (x: number, y: number, z: number) => boolean,
+  ): void {
     const { nx, ny, nz, tx, aw, min, step, data } = this;
-    for (let j = 0; j < ny; j++) {
+    for (let j = Math.max(0, jStart); j < Math.min(ny, jEnd); j++) {
       const wy = Math.round(min.y + (j + 0.5) * step);
       const baseX = (j % tx) * nx;
       const baseY = Math.floor(j / tx) * nz;
@@ -93,6 +109,5 @@ export class LightVolume {
         }
       }
     }
-    this.texture.needsUpdate = true;
   }
 }

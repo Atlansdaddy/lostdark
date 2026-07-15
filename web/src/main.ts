@@ -41,7 +41,7 @@ import { createLitMaterial } from './render/litMaterial';
 import { LightVolume } from './render/LightVolume';
 import { buildChunkGeometry , copySlabsFor, geometryFromArrays } from './render/VoxelMesher';
 import { buildSmoothChunkGeometry } from './render/SmoothMesher';
-import { Mat } from './world/Materials';
+import { isSolid, Mat } from './world/Materials';
 import { Chunk, VoxelWorld } from './world/VoxelWorld';
 import { generateReek } from './world/ReekGen';
 import { carveTestbeds } from './world/Testbeds';
@@ -420,18 +420,23 @@ function addPulseReveal(mat: THREE.MeshStandardMaterial): void {
        float marchJitter(vec3 p) {
          return fract(sin(dot(p, vec3(12.9898, 78.233, 37.719))) * 43758.5453);
        }
+       // Continuous transmittance march (matches litMaterial): binary hit tests
+       // made the jitter read as grain at light-pool edges; smooth accumulated
+       // occlusion doesn't.
        float ptShadow(vec3 p, vec3 lp) {
          vec3 d = lp - p; float dist = length(d);
          if (dist < 1.5) return 1.0;
          vec3 dir = d / dist;
          float march = min(dist - 1.0, 14.0);
          float j = marchJitter(p);
+         float trans = 1.0;
          for (int i = 1; i <= 14; i++) {
            float s = float(i) + j;
            if (s >= march) break;
-           if (sampleSolid(p + dir * s) > 0.5) return 0.0;
+           trans *= 1.0 - smoothstep(0.25, 0.75, sampleSolid(p + dir * s));
+           if (trans < 0.03) return 0.0;
          }
-         return 1.0;
+         return trans;
        }
        // Organic point light on foliage. WRAP (half-Lambert) so shaded sides keep
        // a value floor (never black) — used by ALL flora. TRANSMISSION (light
@@ -922,8 +927,88 @@ document.body.appendChild(perfBtn);
 window.addEventListener('keydown', (e) => {
   if (e.code === 'F4') togglePerf();
 });
+// --- Tri-budget profiler: attributes DRAWN tris to their owner so a tri
+// regression names its bucket instead of hiding inside one total. Honors
+// .visible and the renderer's own bounding-sphere frustum test, so the bucket
+// sum tracks the overlay's tris number (Points/Lines carry no triangles).
+// Walks only while the overlay is open, every 2s — zero cost in normal play.
+const triFrustum = new THREE.Frustum();
+const triMatrix = new THREE.Matrix4();
+const triSphere = new THREE.Sphere();
+let triBudgetLine = '';
+let triBudgetTimer = 9; // fires on the first overlay refresh
+function updateTriBudget(dt: number): void {
+  triBudgetTimer += dt;
+  if (triBudgetTimer < 2) return;
+  triBudgetTimer = 0;
+  triMatrix.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+  triFrustum.setFromProjectionMatrix(triMatrix);
+  const chunkSet = new Set<THREE.Object3D>(chunkMeshes.values());
+  const buckets: Record<string, number> = { chunk: 0, flora: 0, grass: 0, folk: 0, water: 0, other: 0 };
+  const kinds = new Map<string, number>();
+  const others = new Map<string, number>(); // untagged tris, named — no hiding
+  const walk = (o: THREE.Object3D, tag: string, kind: string): void => {
+    if (!o.visible) return;
+    if (o.name === 'grass' || o.name === 'folk' || o.name === 'water') tag = o.name;
+    else if (o.name.startsWith('flora:')) {
+      tag = 'flora';
+      kind = o.name.slice(6);
+    }
+    const mesh = o as THREE.Mesh;
+    if (mesh.isMesh) {
+      const g = mesh.geometry;
+      let drawn = true;
+      if (mesh.frustumCulled) {
+        if (!g.boundingSphere) g.computeBoundingSphere();
+        if (g.boundingSphere) {
+          triSphere.copy(g.boundingSphere).applyMatrix4(mesh.matrixWorld);
+          drawn = triFrustum.intersectsSphere(triSphere);
+        }
+      }
+      if (drawn) {
+        const idx = g.getIndex();
+        const per = (idx ? idx.count : (g.getAttribute('position')?.count ?? 0)) / 3;
+        const inst = (mesh as THREE.InstancedMesh).isInstancedMesh
+          ? (mesh as THREE.InstancedMesh).count
+          : 1;
+        const n = per * inst;
+        if (chunkSet.has(mesh)) buckets.chunk += n;
+        else if (tag === 'flora') {
+          buckets.flora += n;
+          kinds.set(kind, (kinds.get(kind) ?? 0) + n);
+        } else {
+          buckets[tag] = (buckets[tag] ?? 0) + n;
+          if (tag === 'other') {
+            const label = mesh.name || mesh.parent?.name || mesh.geometry.type || mesh.type;
+            others.set(label, (others.get(label) ?? 0) + n);
+          }
+        }
+      }
+    }
+    for (const c of o.children) walk(c, tag, kind);
+  };
+  walk(scene, 'other', '');
+  const k = (n: number): string => `${(n / 1000).toFixed(0)}k`;
+  const top = [...kinds.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 3)
+    .map(([name, t]) => `${name} ${k(t)}`)
+    .join('  ');
+  const topOther = [...others.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 3)
+    .map(([name, t]) => `${name} ${k(t)}`)
+    .join('  ');
+  triBudgetLine =
+    `tri: chunk ${k(buckets.chunk)}  flora ${k(buckets.flora)}  grass ${k(buckets.grass)}` +
+    `  folk ${k(buckets.folk)}  water ${k(buckets.water)}  other ${k(buckets.other)}` +
+    (top ? `\n     top flora: ${top}` : '') +
+    (topOther ? `\n     top other: ${topOther}` : '');
+}
+
 let perfDivTimer = 0;
 function updatePerfDiv(dt: number): void {
+  if (perfOn) updateTriBudget(dt);
   perfDivTimer += dt;
   if (!perfOn || perfDivTimer < 0.33) return;
   perfDivTimer = 0;
@@ -932,7 +1017,11 @@ function updatePerfDiv(dt: number): void {
     (perfEma.stream ?? 0) + (perfEma.mesh ?? 0) + (perfEma.flora ?? 0) + (perfEma.folk ?? 0) + (perfEma.sway ?? 0) + (perfEma.render ?? 0);
   const heap = (performance as unknown as { memory?: { usedJSHeapSize: number } }).memory;
   perfDiv.textContent =
-    `frame ${lastFrameMs.toFixed(1)}ms  (${(1000 / Math.max(lastFrameMs, 0.01)).toFixed(0)}fps)\n` +
+    // cpu = frame() cost only; wall = real frame-to-frame time (what you FEEL,
+    // same number as the metrics strip). wall >> cpu = GPU/vsync-bound: the
+    // work is in pixels, not JS. The old label derived a fake "fps" from cpu —
+    // the two meters could never agree (John caught it).
+    `cpu ${lastFrameMs.toFixed(1)}ms | wall ${(1000 / Math.max(fpsEma, 1)).toFixed(1)}ms (${fpsEma.toFixed(0)}fps)\n` +
     `stream ${f('stream')}  mesh ${f('mesh')}  flora ${f('flora')}\n` +
     `folk   ${f('folk')}  sway ${f('sway')}  render ${f('render')}\n` +
     `other  ${(Math.max(0, lastFrameMs - known)).toFixed(1).padStart(5)}  draws ${renderer.info.render.calls}  tris ${(renderer.info.render.triangles / 1000).toFixed(0)}k\n` +
@@ -940,6 +1029,7 @@ function updatePerfDiv(dt: number): void {
     `groveQ ${pendingGroves.length}  treeQ ${pendingTrees.length}  fogL ${fogLightRegistry.length}  scale ${renderScale.toFixed(2)}/${drsCeiling.toFixed(2)}` +
     (heap ? `  heap ${(heap.usedJSHeapSize / 1048576).toFixed(0)}MB` : '') +
     `\ngeo ${renderer.info.memory.geometries}  tex ${renderer.info.memory.textures}  progs ${renderer.info.programs?.length ?? 0}` +
+    (triBudgetLine ? `\n${triBudgetLine}` : '') +
     (spikeLog.length ? `\n-- spikes (>25ms) --\n${spikeLog.join('\n')}` : '');
 }
 
@@ -1459,6 +1549,9 @@ function registerFlora(group: THREE.Group): void {
       addPulseReveal(m);
     }
   });
+  // Procedural flora (glowcaps, crystals, strands) have no asset name — tag
+  // them so the tri-budget profiler buckets them as flora, not "other".
+  if (!group.name) group.name = 'flora:native';
   floraCull.push({ group, x: group.position.x, y: group.position.y, z: group.position.z });
 }
 
@@ -2446,13 +2539,23 @@ if (MAP_MODE) {
 // can read per-fragment. Wired but OFF by default (uLightVolMix = 0) — flip it
 // on with waiver.lightVol(1) to A/B it against the baked light before we rely
 // on it for dynamic (charge-driven) lighting.
-const lightVol = new LightVolume(
-  // Reaches down to bedrock (caves now run to y≈-40) so the charge-driven
-  // volume covers the full underdark, not just the surface band.
-  new THREE.Vector3(-REEK_HALF_INIT, -42, -REEK_HALF_INIT),
-  new THREE.Vector3(REEK_HALF_INIT, 20, REEK_HALF_INIT),
-  2,
-);
+const lightVol = MAP_MODE && worldGen
+  ? // MAP_MODE: a MOVING WINDOW that follows the orb (see updateLightVolume).
+    // Full generated vertical range — the old fixed -42..20 band clipped every
+    // mesa/mountain top, so surfaces above y=20 shadow-marched against clamped
+    // edge texels: the "impenetrable" black + per-pixel grain away from spawn.
+    new LightVolume(
+      new THREE.Vector3(-128, worldGen.cyMin * World.chunkSize, -128),
+      new THREE.Vector3(128, (worldGen.cyMax + 1) * World.chunkSize, 128),
+      2,
+    )
+  : new LightVolume(
+      // Reaches down to bedrock (caves now run to y≈-40) so the charge-driven
+      // volume covers the full underdark, not just the surface band.
+      new THREE.Vector3(-REEK_HALF_INIT, -42, -REEK_HALF_INIT),
+      new THREE.Vector3(REEK_HALF_INIT, 20, REEK_HALF_INIT),
+      2,
+    );
 lightVol.rebuild(
   (x, y, z) => lightGrid.sample(x, y, z),
   (x, y, z) => world.solid(x, y, z), // solidity → alpha, for ray-marched shadows
@@ -2466,6 +2569,87 @@ logger('lightvol').info(
   `${lightVol.texture.image.width}x${lightVol.texture.image.height} atlas` +
     ` (${lightVol.dim.x}x${lightVol.dim.y}x${lightVol.dim.z} voxels)`,
 );
+
+// --- MAP_MODE: the light volume is a MOVING WINDOW -------------------------
+// The demo's world fits inside one static volume; the map world streams
+// forever, so a boot-time snapshot goes stale (new terrain/light never enter
+// it) and goes garbage outside its box (the shader clamps to edge texels —
+// black held light + shadow-march noise). Instead the window follows the orb:
+// when it strays LV_RECENTER m from the window centre the whole volume is
+// rebuilt around it, LV_LAYERS Y-slices per frame (bounded cost). The shader
+// keeps the OLD min + OLD texture until the sweep finishes, then both swap in
+// the same frame — no mixed-window flicker. A slow periodic refresh picks up
+// newly streamed terrain and ward light (LightGrid.addLight writes chunk.light,
+// which lightGrid.sample reads) without waiting for a recenter.
+const LV_LAYERS = 5; // Y-slices rebuilt per frame while a sweep runs
+const LV_RECENTER = 24; // m from window centre that triggers a recenter
+const LV_REFRESH_S = 4; // idle refresh cadence (wards, fresh terrain)
+let lvCenterX = lightVol.min.x + (lightVol.dim.x * lightVol.step) / 2;
+let lvCenterZ = lightVol.min.z + (lightVol.dim.z * lightVol.step) / 2;
+let lvJob = -1; // next Y-layer to rebuild; -1 = idle
+let lvPendingMin: THREE.Vector3 | null = null; // published when the sweep ends
+let lvRefreshTimer = 0;
+/** Wards call this so their glow enters the held-light volume promptly. */
+function requestLightVolRefresh(): void {
+  lvRefreshTimer = LV_REFRESH_S;
+}
+// One cached-chunk read serves BOTH channels: the sweep visits texels in
+// x-order inside one chunk, so a chunk-map lookup per texel (world.solid was
+// one) would dominate the slice budget. sampleLevel runs first per texel and
+// stashes the solidity; sampleSolid just returns the stash.
+let lvChunk: Chunk | null = null;
+let lvGX = NaN;
+let lvGY = NaN;
+let lvGZ = NaN;
+let lvStashSolid = false;
+const CSv = World.chunkSize;
+function lvLevelAt(x: number, y: number, z: number): number {
+  const gx = Math.floor(x / CSv);
+  const gy = Math.floor(y / CSv);
+  const gz = Math.floor(z / CSv);
+  if (gx !== lvGX || gy !== lvGY || gz !== lvGZ) {
+    lvChunk = world.getChunk(gx, gy, gz) ?? null;
+    lvGX = gx;
+    lvGY = gy;
+    lvGZ = gz;
+  }
+  if (!lvChunk) {
+    lvStashSolid = false;
+    return 0;
+  }
+  const i = Chunk.index(((x % CSv) + CSv) % CSv, ((y % CSv) + CSv) % CSv, ((z % CSv) + CSv) % CSv);
+  lvStashSolid = isSolid(lvChunk.voxels[i] as Mat); // same semantics as world.solid()
+  return lvChunk.light[i];
+}
+function updateLightVolume(dt: number): void {
+  if (!MAP_MODE) return;
+  if (lvJob >= 0) {
+    lightVol.rebuildLayers(lvJob, lvJob + LV_LAYERS, lvLevelAt, () => lvStashSolid);
+    lvJob += LV_LAYERS;
+    if (lvJob >= lightVol.dim.y) {
+      lvJob = -1;
+      lightVol.texture.needsUpdate = true;
+      if (lvPendingMin) {
+        uniforms.uLightMin.value.copy(lvPendingMin);
+        lvPendingMin = null;
+      }
+    }
+    return;
+  }
+  lvRefreshTimer += dt;
+  const strayed =
+    Math.abs(orb.pos.x - lvCenterX) > LV_RECENTER || Math.abs(orb.pos.z - lvCenterZ) > LV_RECENTER;
+  if (!strayed && lvRefreshTimer < LV_REFRESH_S) return;
+  lvRefreshTimer = 0;
+  if (strayed) {
+    lvCenterX = Math.round(orb.pos.x / lightVol.step) * lightVol.step;
+    lvCenterZ = Math.round(orb.pos.z / lightVol.step) * lightVol.step;
+    lightVol.min.x = lvCenterX - (lightVol.dim.x * lightVol.step) / 2;
+    lightVol.min.z = lvCenterZ - (lightVol.dim.z * lightVol.step) / 2;
+    lvPendingMin = lightVol.min.clone();
+  }
+  lvJob = 0;
+}
 
 // --- Elemental testbed visual systems (water surface · fire · build editor) ---
 // Carved geometry lives in the world; these own the meshes/particles that bring
@@ -2482,7 +2666,10 @@ waterZone?.wireLightVolume({
   uLightDim: uniforms.uLightDim,
   uLightTiles: uniforms.uLightTiles,
 });
-if (waterZone) scene.add(waterZone.group);
+if (waterZone) {
+  waterZone.group.name = 'water'; // bucket tag for the tri-budget profiler
+  scene.add(waterZone.group);
+}
 // John's rigged fish (public/assets/fish). Async — a simple placeholder school
 // swims until these land, then the rigged bodies take over. If a nose points
 // the wrong way, waiver.waterZone.flipFish() spins them 180°.
@@ -3380,6 +3567,7 @@ function spawnWard(vx: number, vz: number, floorY: number): void {
     for (let dx = -1; dx <= 1; dx++) wardSeeds.push({ x: vx + dx, y: floorY, z: vz + dz });
   }
   lightGrid.addLight(wardSeeds);
+  requestLightVolRefresh(); // the ward's glow enters the held-light volume now
   for (const c of world.chunks.values()) c.lightDirty = false; // no stray flags
   remeshDirtyChunks(); // only the light-touched chunks are dirty now
 
@@ -4359,6 +4547,7 @@ function frame(): void {
 
   updateTrail(dt);
   updateSpores(dt, clock.elapsedTime);
+  updateLightVolume(dt); // MAP_MODE: keep the held-light window on the orb
 
   // --- Elemental testbeds: water surface, fire, build editor ---
   // The water is DARK until lit: it only answers to the orb plus whatever live

@@ -240,6 +240,9 @@ export class WaterZone {
       float marchJitter(vec3 p) {
         return fract(sin(dot(p, vec3(12.9898, 78.233, 37.719))) * 43758.5453);
       }
+      // Continuous transmittance march (matches litMaterial): binary hit tests
+      // made the jitter read as grain at light-pool edges; smooth accumulated
+      // occlusion doesn't.
       float ptShadow(vec3 p, vec3 lp) {
         vec3 d = lp - p;
         float dist = length(d);
@@ -247,12 +250,14 @@ export class WaterZone {
         vec3 dir = d / dist;
         float march = min(dist - 1.0, 12.0);
         float j = marchJitter(p);
+        float trans = 1.0;
         for (int i = 1; i <= 12; i++) {
           float s = float(i) + j;
           if (s >= march) break;
-          if (sampleSolid(p + dir * s) > 0.5) return 0.0;
+          trans *= 1.0 - smoothstep(0.25, 0.75, sampleSolid(p + dir * s));
+          if (trans < 0.03) return 0.0;
         }
-        return 1.0;
+        return trans;
       }
 
       void main() {

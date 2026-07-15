@@ -224,6 +224,13 @@ export function createLitMaterial(): { material: THREE.ShaderMaterial; uniforms:
       // Same reach as always (walls are 1 voxel thick — stopping short of the
       // light leaks light straight through an adjacent wall); ONLY the sample
       // offsets are jittered, which is what dissolves the ring banding.
+      // Continuous transmittance, NOT a binary hit test: a binary march made
+      // neighbouring pixels flip fully-lit/fully-dark on the jitter — the grain
+      // at every light-pool edge, where rays graze the ground. sampleSolid is
+      // bilinear in X/Z, so accumulating (1 - smoothstep(alpha)) per step gives
+      // adjacent pixels nearly identical values — smooth penumbra. No new
+      // leaks: a solid voxel (alpha 1) multiplies transmittance to 0, and
+      // attenuation STARTS at alpha .25 — earlier than the old >.5 threshold.
       float orbShadow(vec3 p) {
         vec3 d = uOrbPos - p;
         float dist = length(d);
@@ -231,12 +238,14 @@ export function createLitMaterial(): { material: THREE.ShaderMaterial; uniforms:
         vec3 dir = d / dist;
         float march = min(dist - 1.0, 16.0);
         float j = marchJitter(p);
+        float trans = 1.0;
         for (int i = 1; i <= 16; i++) {
           float s = float(i) + j;
           if (s >= march) break;
-          if (sampleSolid(p + dir * s) > 0.5) return 0.0;
+          trans *= 1.0 - smoothstep(0.25, 0.75, sampleSolid(p + dir * s));
+          if (trans < 0.03) return 0.0;
         }
-        return 1.0;
+        return trans;
       }
 
       // Same march, but toward an ARBITRARY point light (charged shrooms). Solid
@@ -249,12 +258,14 @@ export function createLitMaterial(): { material: THREE.ShaderMaterial; uniforms:
         vec3 dir = d / dist;
         float march = min(dist - 1.0, 14.0);
         float j = marchJitter(p);
+        float trans = 1.0;
         for (int i = 1; i <= 14; i++) {
           float s = float(i) + j;
           if (s >= march) break;
-          if (sampleSolid(p + dir * s) > 0.5) return 0.0;
+          trans *= 1.0 - smoothstep(0.25, 0.75, sampleSolid(p + dir * s));
+          if (trans < 0.03) return 0.0;
         }
-        return 1.0;
+        return trans;
       }
 
       // --- procedural texture helpers ---

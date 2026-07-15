@@ -216,9 +216,13 @@ export class WorldGen implements ColumnGenerator {
         const roll = hash2(x, z, this.seed + 71);
         let topMat: Mat = top;
         if (h >= SEA_LEVEL) {
-          if (b === BIOME.REEK && roll < 0.045) topMat = Mat.Glowcap;
-          else if (b === BIOME.SEAR && roll < 0.02) topMat = Mat.Ember;
-          else if (b === BIOME.GLARE && roll < 0.03) topMat = Mat.Crystal;
+          // NO Reek ground sparkle — the demo Reek floor is DARK and that's
+          // the reference (John). The old 4.5% Glowcap top-voxels flood-lit
+          // the whole surface once the light volume exposed streamed light.
+          // Reek light comes from glowcap props/GlowAir pools only. Sear/Glare
+          // keep strong emitters at pool-rarity so the dark stays a pressure.
+          if (b === BIOME.SEAR && roll < 0.004) topMat = Mat.Ember;
+          else if (b === BIOME.GLARE && roll < 0.006) topMat = Mat.Crystal;
           else if (b === BIOME.FADE && roll < 0.02) topMat = Mat.Metal;
         }
 

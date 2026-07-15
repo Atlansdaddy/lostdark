@@ -80,6 +80,8 @@ export class GrassField {
         varying float vPhase;
         varying float vRipple;
         varying vec3 vWorld;
+        varying vec3 vBase;
+        varying float vWide;
 
         uniform float uTime;
         uniform vec3 uOrbPos;
@@ -92,9 +94,21 @@ export class GrassField {
           vLight = aLight;
           vPhase = aPhase;
 
+          // Anti-grain (John: "light should be nice and smooth"): a blade
+          // thinner than a pixel renders as a flickering dot, and the lit
+          // field reads as stipple. Widen blades with camera distance so
+          // they never go subpixel; the fragment divides brightness by the
+          // same factor so the field's total light is unchanged.
+          vec3 base0 = (instanceMatrix * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+          float camD = distance(cameraPosition, base0);
+          vWide = clamp(camD * 0.06, 1.0, 2.6);
+          vec3 lpos = position;
+          lpos.x *= vWide;
+
           // Blade-local position through the instance transform.
-          vec4 wp = instanceMatrix * vec4(position, 1.0);
-          vec3 base = (instanceMatrix * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+          vec4 wp = instanceMatrix * vec4(lpos, 1.0);
+          vec3 base = base0;
+          vBase = base0;
 
           // Bend weight: tips move, roots stay planted.
           float bendW = vH * vH;
@@ -136,6 +150,8 @@ export class GrassField {
         varying float vPhase;
         varying float vRipple;
         varying vec3 vWorld;
+        varying vec3 vBase;
+        varying float vWide;
 
         uniform vec3 uOrbPos;
         uniform vec3 uOrbColor;
@@ -146,6 +162,29 @@ export class GrassField {
         uniform float uLightStep;
         uniform vec3 uLightDim;
         uniform vec2 uLightTiles;
+
+        // Flood-fill light level from the shared atlas (red) — the SAME smooth
+        // per-fragment read the terrain uses. Grass used to bake ONE light value
+        // per blade at spawn (aLight), so around a charged shroom neighbouring
+        // blades held different quantized levels — the grainy shroom pools. The
+        // orb bubble was analytic (smooth); this makes held/grove light match.
+        float sampleLightVol(vec3 wp) {
+          vec3 v = (wp - uLightMin) / uLightStep;
+          float nx = uLightDim.x, ny = uLightDim.y, nz = uLightDim.z;
+          float tX = uLightTiles.x, tY = uLightTiles.y;
+          float aw = tX * nx, ah = tY * nz;
+          float cx = clamp(v.x, 0.5, nx - 0.5);
+          float cz = clamp(v.z, 0.5, nz - 0.5);
+          float fy = v.y - 0.5;
+          float s0 = clamp(floor(fy), 0.0, ny - 1.0);
+          float s1 = clamp(s0 + 1.0, 0.0, ny - 1.0);
+          float wy = clamp(fy - s0, 0.0, 1.0);
+          vec2 t0 = vec2(mod(s0, tX), floor(s0 / tX));
+          vec2 t1 = vec2(mod(s1, tX), floor(s1 / tX));
+          vec2 uv0 = vec2(t0.x * nx + cx, t0.y * nz + cz) / vec2(aw, ah);
+          vec2 uv1 = vec2(t1.x * nx + cx, t1.y * nz + cz) / vec2(aw, ah);
+          return mix(texture2D(uLightAtlas, uv0).r, texture2D(uLightAtlas, uv1).r, wy);
+        }
 
         // World solidity from the shared light-volume atlas (alpha) — the same
         // data the terrain/flora shadow-march. Nearest Y-slice, crisp walls.
@@ -171,6 +210,9 @@ export class GrassField {
         float marchJitter(vec3 p) {
           return fract(sin(dot(p, vec3(12.9898, 78.233, 37.719))) * 43758.5453);
         }
+        // Continuous transmittance march (matches litMaterial): binary hit tests
+        // made the jitter read as grain at light-pool edges; smooth accumulated
+        // occlusion doesn't.
         float orbShadow(vec3 p) {
           vec3 d = uOrbPos - p;
           float dist = length(d);
@@ -178,12 +220,14 @@ export class GrassField {
           vec3 dir = d / dist;
           float march = min(dist - 1.0, 10.0);
           float j = marchJitter(p);
+          float trans = 1.0;
           for (int i = 1; i <= 10; i++) {
             float s = float(i) + j;
             if (s >= march) break;
-            if (sampleSolid(p + dir * s) > 0.5) return 0.0;
+            trans *= 1.0 - smoothstep(0.25, 0.75, sampleSolid(p + dir * s));
+            if (trans < 0.03) return 0.0;
           }
-          return 1.0;
+          return trans;
         }
 
         void main() {
@@ -193,15 +237,23 @@ export class GrassField {
           vec3 tipCol = mix(vec3(0.16, 0.5, 0.3), vec3(0.14, 0.45, 0.42), t);
           vec3 albedo = mix(rootCol, tipCol, vH);
 
-          // Light: ambient whisper + baked held light + the orb's bubble —
-          // radius matches the engine's orbRadius (9), and the bubble is
-          // OCCLUDED like every other light in the game.
-          float od = distance(vWorld, uOrbPos);
+          // Shading LOD: near blades light per-pixel; far blades light ONCE at
+          // their base, so a distant blade is a soft uniform stroke instead of
+          // a bright tip-dot (the other half of the grain).
+          float lodT = smoothstep(12.0, 30.0, distance(cameraPosition, vWorld));
+          vec3 lightP = mix(vWorld, vBase + vec3(0.0, 0.5, 0.0), lodT);
+
+          // Light: ambient whisper + held flood-fill light (per-fragment, same
+          // smooth atlas read as the terrain) + the orb's bubble — radius
+          // matches the engine's orbRadius (9), and the bubble is OCCLUDED
+          // like every other light in the game.
+          float od = distance(lightP, uOrbPos);
           float bubble = 1.0 - clamp(od / 9.0, 0.0, 1.0);
           bubble = bubble * bubble * 0.9;
-          if (bubble > 0.004) bubble *= orbShadow(vWorld + vec3(0.0, 0.4, 0.0));
+          if (bubble > 0.004) bubble *= orbShadow(lightP + vec3(0.0, 0.4, 0.0));
 
-          float held = vLight * vLight * 1.6;
+          float volL = sampleLightVol(lightP);
+          float held = volL * volL * 1.6;
           vec3 lit = albedo * (0.05 + held) * uHeldColor
                    + albedo * bubble * uOrbColor;
 
@@ -213,6 +265,10 @@ export class GrassField {
 
           // Moonlight silvers the blade tips when the clouds part.
           lit += albedo * uMoonI * vec3(0.55, 0.65, 0.95) * vH * 0.8;
+
+          // Widened blades give back the brightness the widening added — the
+          // field's total light stays constant, the flicker doesn't.
+          lit /= vWide;
 
           // Darkness is the draw distance, for grass too — moonlight opens it.
           lit *= exp(-distance(cameraPosition, vWorld) * 0.016 / (1.0 + uMoonI * 2.5));
@@ -311,6 +367,7 @@ export class GrassField {
       mesh.geometry.setAttribute('aLight', new THREE.InstancedBufferAttribute(lights, 1));
       bounds.expandByScalar(2.5); // wind/bend slack
       mesh.geometry.boundingSphere = bounds.getBoundingSphere(new THREE.Sphere());
+      mesh.name = 'grass'; // bucket tag for the tri-budget profiler
       mesh.frustumCulled = true;
       mesh.layers.set(1); // skipped by the depth prepass (fog needn't see grass)
       scene.add(mesh);
