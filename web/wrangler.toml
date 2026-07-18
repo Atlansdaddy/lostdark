@@ -1,0 +1,9 @@
+# waiver-labs — the umbrella deploy: every testbed + the game demo, one URL.
+#   https://waiver-labs.john-d70.workers.dev
+# Deploy with `npm run deploy:labs` (builds, roots the hub, deploys).
+# Multi-page site: no SPA fallback — a bad URL should 404, not load the game.
+name = "waiver-labs"
+compatibility_date = "2026-06-05"
+
+[assets]
+directory = "./dist"

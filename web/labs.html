@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#020205" />
+    <title>wAIver — labs</title>
+    <style>
+      :root { color-scheme: dark; }
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      body {
+        min-height: 100%;
+        background: radial-gradient(ellipse at 50% -20%, #0a1420 0%, #020205 55%);
+        color: #cfe3f5;
+        font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+        padding: 28px 16px 60px;
+      }
+      .wrap { max-width: 680px; margin: 0 auto; }
+      h1 { font-size: 22px; letter-spacing: 0.06em; color: #8defff; }
+      h1 .dim { color: #3d5a72; }
+      p.sub { margin: 6px 0 26px; color: #6d8aa5; font-size: 12px; }
+      h2 {
+        font-size: 11px; letter-spacing: 0.2em; text-transform: uppercase;
+        color: #4a6a86; margin: 26px 0 10px; border-bottom: 1px solid #12202e;
+        padding-bottom: 6px;
+      }
+      a.card {
+        display: block; text-decoration: none; color: inherit;
+        background: #070d14cc; border: 1px solid #16273a; border-radius: 10px;
+        padding: 12px 14px; margin-bottom: 8px;
+        transition: border-color 0.15s;
+      }
+      a.card:active, a.card:hover { border-color: #2e577a; }
+      a.card b { color: #9fd6ff; font-size: 14px; }
+      a.card span { display: block; margin-top: 3px; color: #5f7d99; font-size: 11.5px; line-height: 1.5; }
+      footer { margin-top: 34px; color: #35506a; font-size: 10.5px; letter-spacing: 0.04em; }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <h1>wAIver <span class="dim">/</span> labs</h1>
+      <p class="sub">the umbrella — every testbed, one URL, survives everything</p>
+
+      <h2>Game</h2>
+      <a class="card" href="/index.html"><b>play — demo box</b>
+        <span>the game itself: orb verbs, wards, folk, living light</span></a>
+      <a class="card" href="/index.html?world=map"><b>play — map world</b>
+        <span>the maplab world inside the game (streamed chunks, moving light volume)</span></a>
+
+      <h2>Engine testbeds</h2>
+      <a class="card" href="/waterlab.html"><b>waterlab</b>
+        <span>water physics: heightfield sim, splash + displacement, true reflections, Snell's window, two-way coupling</span></a>
+      <a class="card" href="/worldlab.html"><b>worldlab</b>
+        <span>streaming world: ring-ladder chunks, biomes, baked light, props, caves (?gen=height = plain heightfield)</span></a>
+      <a class="card" href="/maplab.html"><b>maplab</b>
+        <span>macro world map generator — the map IS the world (1 cell = 1 chunk column)</span></a>
+
+      <h2>Dungeon builders</h2>
+      <a class="card" href="/dungeonlab.html"><b>dungeonlab hub</b>
+        <span>layout-first generation index</span></a>
+      <a class="card" href="/cavelab.html"><b>cavelab</b>
+        <span>cave layouts: chambers → Delaunay/MST → semantics → A*-wander tunnels, chasms, dark-run budget</span></a>
+      <a class="card" href="/towerlab.html"><b>towerlab</b>
+        <span>remnant office towers: blueprint-reuse BSP, decay, vertical multigraph, forced improvisation</span></a>
+
+      <h2>Tools</h2>
+      <a class="card" href="/arenalab.html"><b>arenalab</b>
+        <span>combat testbed</span></a>
+      <a class="card" href="/studio.html"><b>animator studio</b>
+        <span>MushroomFolk pose/clip tool</span></a>
+
+      <footer>build %BUILD%</footer>
+    </div>
+  </body>
+</html>

@@ -24,9 +24,18 @@ export default defineConfig({
     sourcemap: true,
     rollupOptions: {
       input: {
-        // Two separate apps: the game, and the Animator Studio tool page.
+        // Every page the waiver-labs umbrella deploys: game + tools + labs.
+        // New testbed = add its .html here + a card in labs.html.
         main: fileURLToPath(new URL('./index.html', import.meta.url)),
         studio: fileURLToPath(new URL('./studio.html', import.meta.url)),
+        labs: fileURLToPath(new URL('./labs.html', import.meta.url)),
+        waterlab: fileURLToPath(new URL('./waterlab.html', import.meta.url)),
+        worldlab: fileURLToPath(new URL('./worldlab.html', import.meta.url)),
+        maplab: fileURLToPath(new URL('./maplab.html', import.meta.url)),
+        dungeonlab: fileURLToPath(new URL('./dungeonlab.html', import.meta.url)),
+        cavelab: fileURLToPath(new URL('./cavelab.html', import.meta.url)),
+        towerlab: fileURLToPath(new URL('./towerlab.html', import.meta.url)),
+        arenalab: fileURLToPath(new URL('./arenalab.html', import.meta.url)),
       },
     },
   },

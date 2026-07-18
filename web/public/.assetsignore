@@ -1,0 +1,3 @@
+# wrangler upload excludes (waiver-labs deploy). The heavy source-asset
+# originals live only on dev machines + git history — never on the CDN.
+assets/originals/
